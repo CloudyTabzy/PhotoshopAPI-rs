@@ -175,8 +175,28 @@ complete row, reconstructs that row **in place, behind the cursor**:
 - stop at `height * (1 + row_bytes)` — the last filter byte — never reconstruct from
   `OUTPUT_SLACK` (`src/inflate.rs:27`).
 
-Invariants: the cursor never moves backwards; reconstruction writes strictly behind it; a row is
-only touched when its bytes are final. All three hold by construction.
+**The lag condition (mandatory, added during implementation):** inflate's match copies read
+the output buffer at `pos - distance`, and the format caps `distance` at exactly 32768
+(RFC 1951: largest distance code 24577 + 13 extra bits). A row — or a two-row `Paeth` pair —
+may therefore be reconstructed only when
+
+```text
+cursor >= (r + take) * (1 + row_bytes) + 32768
+```
+
+which places everything the reconstruction writes at least one match window behind the
+cursor, outside every future match's reach. The original text said "strictly behind the
+write cursor"; that is necessary but not sufficient, and an implementation following it
+corrupts any stream whose matches reach into recently-reconstructed rows. The final
+`<= 32768/(1+row_bytes)`-ish rows are drained after inflation ends (at that point no match
+can read anything, so the lag drops to zero), keeping `decode()` byte-identical to
+`unfilter_image`. Streams no larger than one window plus one row can never trigger
+mid-inflation reconstruction and take the plain two-pass path unchanged, so small decodes
+pay nothing for the machinery.
+
+Invariants: the cursor never moves backwards; reconstruction writes strictly behind it, by
+at least the 32768-byte match window; a row is only touched when its bytes are final. All
+three hold by construction.
 
 **Cost:** one predictable branch per batch. The hook only does work when a row boundary has been
 crossed, so the check is O(rows) — 2,400 calls for a 4K image — not O(symbols). The per-symbol
@@ -328,10 +348,25 @@ from a faster Huffman decoder.
    `cursor >= (row + 1) * (1 + row_bytes)`, compact + reconstruct row `row`, `row += 1`.
 3. Stop at `height * (1 + row_bytes)`; never reconstruct from `OUTPUT_SLACK`. Keep the existing
    `deinterlace` path for Adam7.
-4. **Gates:** `cargo test` (74 tests); byte-exact output on the generated 180-file corpus, the
-   PngSuite interlaced samples, and the port's 14 fixtures; Miri; all three fuzz targets; A/B with
+4. **Gates (extended during implementation):** `cargo test` (74 tests); byte-exact output on the
+   generated 180-file corpus, the PngSuite interlaced samples, and the port's 14 fixtures; Miri;
+   all three fuzz targets; A/B with
    `cargo run --release -p png-spark-bench -- decode` **and** the port's interleaved 3-way harness
    (best-of-N; this machine throttles).
+   **The existing gates are blind to this change.** Every corpus image is smaller than the 32 KiB
+   match window, so a frontier whose lag is wrong passes all of them: mid-inflation reconstruction
+   simply never engages. Worse, png-spark's *own encoder* emits only zero-run (distance-1)
+   matches, so encoder-generated fixtures cannot detect a broken lag either — the fixtures must
+   come from a real match finder. Three additions close the gap:
+   - `tools/gen_large_fixtures.py` generates nine non-interlaced PNGs up to 36.9 MB filtered,
+     compressed by CPython's zlib (full LZ77), each asserted to exceed the window; skipping when
+     absent, matching the corpus tests.
+   - `tests/fused_reconstruction.rs` requires `decode()` to be byte-identical to the legacy
+     two-pass path (inflate everything, then `unfilter_image`) over those fixtures, and asserts
+     the set is large enough to force mid-inflation reconstruction.
+   - unit tests pin frontier == `unfilter_image` across every filter, stride, `Paeth`-run
+     alignment, invalid-filter row reporting, and assert the frontier actually reconstructs rows
+     mid-stream (including the two-row wavefront) once the cursor passes the window.
 
 ### Phase 2 — block-granular resumable inflate + streaming API
 

@@ -225,25 +225,42 @@ impl Decoder {
 
         let data = match info.interlacing {
             Interlacing::None => {
-                // Reverse the scanline filters as inflation writes, behind its match
-                // window, so the second pass walks cache-hot rows instead of the whole
-                // cold image. See `filter::ReconstructionFrontier`.
-                let mut frontier = crate::filter::ReconstructionFrontier::new(
-                    info.row_bytes(),
-                    info.height as usize,
-                    info.filter_stride(),
-                );
-                let written = match parsed.idat {
-                    IdatData::Contiguous(data) => {
-                        self.inflater.zlib_progress(data, &mut buffer, &mut frontier)?
+                let row_bytes = info.row_bytes();
+                let height = info.height as usize;
+
+                // Below one match window plus a row, the frontier's first-row trigger is
+                // past the end of the stream: reconstruction cannot begin before inflation
+                // finishes, so the fused path would be the two-pass path plus its own
+                // polling. Take the plain path, which is then identical to the unfused
+                // decoder.
+                if info.decompressed_size() <= crate::filter::MAX_MATCH_DISTANCE + 1 + row_bytes {
+                    match parsed.idat {
+                        IdatData::Contiguous(data) => self.inflater.zlib(data, &mut buffer)?,
+                        IdatData::Joined(data) => self.inflater.zlib(&data, &mut buffer)?,
+                    };
+                    unfilter_image(&mut buffer, row_bytes, height, info.filter_stride())
+                        .map_err(|row| Error::InvalidFilter { row })?;
+                } else {
+                    // Reverse the scanline filters as inflation writes, behind its match
+                    // window, so the second pass walks cache-hot rows instead of the whole
+                    // cold image. See `filter::ReconstructionFrontier`.
+                    let mut frontier = crate::filter::ReconstructionFrontier::new(
+                        row_bytes,
+                        height,
+                        info.filter_stride(),
+                    );
+                    let written = match parsed.idat {
+                        IdatData::Contiguous(data) => {
+                            self.inflater.zlib_progress(data, &mut buffer, &mut frontier)?
+                        }
+                        IdatData::Joined(data) => {
+                            self.inflater.zlib_progress(&data, &mut buffer, &mut frontier)?
+                        }
+                    };
+                    frontier.finish(&mut buffer, written);
+                    if let Some(row) = frontier.failed_row() {
+                        return Err(Error::InvalidFilter { row });
                     }
-                    IdatData::Joined(data) => {
-                        self.inflater.zlib_progress(&data, &mut buffer, &mut frontier)?
-                    }
-                };
-                frontier.finish(&mut buffer, written);
-                if let Some(row) = frontier.failed_row() {
-                    return Err(Error::InvalidFilter { row });
                 }
                 buffer.truncate(info.output_size());
                 buffer
