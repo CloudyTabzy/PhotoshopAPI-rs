@@ -222,24 +222,39 @@ impl Decoder {
         self.inflater.verify_checksum(self.checks == Checks::Full);
         let request = info.decompressed_size() + OUTPUT_SLACK;
         let mut buffer = zeroed_vec(request).ok_or(Error::OutOfMemory { bytes: request })?;
-        match parsed.idat {
-            IdatData::Contiguous(data) => self.inflater.zlib(data, &mut buffer)?,
-            IdatData::Joined(data) => self.inflater.zlib(&data, &mut buffer)?,
-        };
 
         let data = match info.interlacing {
             Interlacing::None => {
-                unfilter_image(
-                    &mut buffer,
+                // Reverse the scanline filters as inflation writes, behind its match
+                // window, so the second pass walks cache-hot rows instead of the whole
+                // cold image. See `filter::ReconstructionFrontier`.
+                let mut frontier = crate::filter::ReconstructionFrontier::new(
                     info.row_bytes(),
                     info.height as usize,
                     info.filter_stride(),
-                )
-                .map_err(|row| Error::InvalidFilter { row })?;
+                );
+                let written = match parsed.idat {
+                    IdatData::Contiguous(data) => {
+                        self.inflater.zlib_progress(data, &mut buffer, &mut frontier)?
+                    }
+                    IdatData::Joined(data) => {
+                        self.inflater.zlib_progress(&data, &mut buffer, &mut frontier)?
+                    }
+                };
+                frontier.finish(&mut buffer, written);
+                if let Some(row) = frontier.failed_row() {
+                    return Err(Error::InvalidFilter { row });
+                }
                 buffer.truncate(info.output_size());
                 buffer
             }
-            Interlacing::Adam7 => deinterlace(&info, &mut buffer)?,
+            Interlacing::Adam7 => {
+                match parsed.idat {
+                    IdatData::Contiguous(data) => self.inflater.zlib(data, &mut buffer)?,
+                    IdatData::Joined(data) => self.inflater.zlib(&data, &mut buffer)?,
+                };
+                deinterlace(&info, &mut buffer)?
+            }
         };
 
         if info.color_type == ColorType::Indexed {

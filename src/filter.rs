@@ -307,35 +307,50 @@ fn unfilter_image_bpp<const BPP: usize>(
 
     let mut row = 0;
     while row < height {
-        let source = row * (1 + row_bytes) + 1;
-        let dest = row * row_bytes;
-
-        let filter = Filter::from_byte(buffer[source - 1]).ok_or(row)?;
+        let filter = Filter::from_byte(buffer[row * (1 + row_bytes)]).ok_or(row)?;
 
         // Two adjacent `Paeth` rows are worth reconstructing together; see
         // [`unfilter_paeth_pair`]. The first row of the image is excluded because it has no
         // row above it, and a row whose successor uses a different filter falls through to
         // the single-row path, which the next iteration then takes for the successor.
-        if filter == Filter::Paeth && row > 0 && row + 1 < height {
-            let next = (row + 1) * (1 + row_bytes) + 1;
-            if buffer[next - 1] == Filter::Paeth as u8 {
-                // In that order: compacting the second row first would overwrite the tail of
-                // the first row's filtered bytes, which are still where they were written.
-                buffer.copy_within(source..source + row_bytes, dest);
-                buffer.copy_within(next..next + row_bytes, dest + row_bytes);
+        let pair = filter == Filter::Paeth
+            && row > 0
+            && row + 1 < height
+            && buffer[(row + 1) * (1 + row_bytes)] == Filter::Paeth as u8;
 
-                let (above, rest) = buffer.split_at_mut(dest);
-                let (first, second) = rest.split_at_mut(row_bytes);
-                unfilter_paeth_pair::<BPP>(
-                    &above[dest - row_bytes..],
-                    first,
-                    &mut second[..row_bytes],
-                );
-                row += 2;
-                continue;
-            }
-        }
+        reconstruct_rows::<BPP>(buffer, row_bytes, row, pair)?;
+        row += if pair { 2 } else { 1 };
+    }
 
+    Ok(())
+}
+
+/// Reconstructs rows `row..` in place, compacting each over its filter byte: one row, or
+/// the pair `row, row + 1` through the two-row wavefront when `pair` is set. The caller
+/// establishes the pairing conditions; everything else is shared with
+/// [`ReconstructionFrontier`], which reconstructs rows behind a live output cursor.
+fn reconstruct_rows<const BPP: usize>(
+    buffer: &mut [u8],
+    row_bytes: usize,
+    row: usize,
+    pair: bool,
+) -> Result<(), usize> {
+    let source = row * (1 + row_bytes) + 1;
+    let dest = row * row_bytes;
+    let filter = Filter::from_byte(buffer[source - 1]).ok_or(row)?;
+
+    if pair {
+        let next = (row + 1) * (1 + row_bytes) + 1;
+        // In that order: compacting the second row first would overwrite the tail of the
+        // first row's filtered bytes, which are still where they were written.
+        buffer.copy_within(source..source + row_bytes, dest);
+        buffer.copy_within(next..next + row_bytes, dest + row_bytes);
+
+        let (above, rest) = buffer.split_at_mut(dest);
+        let (first, second) = rest.split_at_mut(row_bytes);
+        unfilter_paeth_pair::<BPP>(&above[dest - row_bytes..], first, &mut second[..row_bytes]);
+        Ok(())
+    } else {
         buffer.copy_within(source..source + row_bytes, dest);
 
         if row == 0 {
@@ -344,10 +359,145 @@ fn unfilter_image_bpp<const BPP: usize>(
             let (above, current) = buffer.split_at_mut(dest);
             unfilter_row::<BPP>(filter, &above[dest - row_bytes..], &mut current[..row_bytes]);
         }
-        row += 1;
+        Ok(())
+    }
+}
+
+/// DEFLATE's maximum match distance: the distance alphabet's largest code is 24577 with 13
+/// extra bits (RFC 1951 §3.2.5), so inflate never reads an output position further back
+/// than this, whatever the stream.
+pub(crate) const MAX_MATCH_DISTANCE: usize = 32768;
+
+/// Reverses scanline filters a row at a time as inflation's output cursor advances, fusing
+/// the decoder's second pass into its first.
+///
+/// `buffer` holds the filtered stream exactly as inflation writes it. Each row is
+/// reconstructed in place — compacted over its filter byte, as [`unfilter_image`] does —
+/// as soon as the whole row, plus one match window behind it, has been written, so the row
+/// is still cache-resident when its predictor is undone.
+///
+/// # Soundness
+///
+/// Inflate's match copies read `buffer` at `pos - distance` for any `distance` up to
+/// [`MAX_MATCH_DISTANCE`], so a byte may be rewritten only once no future match can
+/// reference it: when the output cursor has passed it by at least the match window. Row
+/// `r` (or the pair `r, r + 1`) is therefore reconstructed only when
+///
+/// ```text
+/// cursor >= (r + take) * (1 + row_bytes) + MAX_MATCH_DISTANCE
+/// ```
+///
+/// which places everything the reconstruction writes — at or below `(r + take) *
+/// row_bytes`, since compaction only moves rows forward — at least
+/// [`MAX_MATCH_DISTANCE`] bytes behind the cursor, outside every future match's reach. The
+/// pair is taken only under the strictly stronger two-row condition, because it also
+/// writes row `r + 1`'s compacted bytes. The window lag defers the final
+/// `MAX_MATCH_DISTANCE / (1 + row_bytes)`-ish rows; [`finish`](Self::finish) drains them
+/// once inflation has completed, so `decode` returns byte-identical output to
+/// [`unfilter_image`].
+pub(crate) struct ReconstructionFrontier {
+    row_bytes: usize,
+    height: usize,
+    stride: usize,
+    rows_done: usize,
+    failed_row: Option<usize>,
+    /// Output position at which the next row's lag precondition first holds. Reconstructed
+    /// after every landing, so the steady-state check is a single compare.
+    next_trigger: usize,
+}
+
+impl crate::inflate::ProgressHook for ReconstructionFrontier {
+    const ENABLED: bool = true;
+
+    #[inline(always)]
+    fn on_progress(&mut self, output: &mut [u8], pos: usize) {
+        ReconstructionFrontier::on_progress(self, output, pos);
+    }
+}
+
+impl ReconstructionFrontier {
+    pub(crate) fn new(row_bytes: usize, height: usize, stride: usize) -> Self {
+        Self {
+            row_bytes,
+            height,
+            stride,
+            rows_done: 0,
+            failed_row: None,
+            next_trigger: row_bytes.saturating_add(1).saturating_add(MAX_MATCH_DISTANCE),
+        }
     }
 
-    Ok(())
+    /// Rows reconstructed so far. Test-only: production callers track progress through
+    /// `failed_row` and the drained buffer.
+    #[cfg(test)]
+    pub(crate) fn rows_done(&self) -> usize {
+        self.rows_done
+    }
+
+    pub(crate) fn failed_row(&self) -> Option<usize> {
+        self.failed_row
+    }
+
+    /// Reconstructs every row whose lag precondition `pos` — the current output cursor —
+    /// now satisfies.
+    #[inline(always)]
+    pub(crate) fn on_progress(&mut self, buffer: &mut [u8], pos: usize) {
+        if pos >= self.next_trigger && self.failed_row.is_none() {
+            self.advance(buffer, pos, MAX_MATCH_DISTANCE);
+        }
+    }
+
+    /// Drains the rows the window lag deferred, after inflation has finished. `pos` is the
+    /// stream's final length. Inflation being over, no match will read the buffer again
+    /// and the lag is dropped: only whether a row's bytes are present matters.
+    pub(crate) fn finish(&mut self, buffer: &mut [u8], pos: usize) {
+        self.advance(buffer, pos, 0);
+    }
+
+    fn advance(&mut self, buffer: &mut [u8], pos: usize, lag: usize) {
+        match self.stride {
+            1 => self.advance_bpp::<1>(buffer, pos, lag),
+            2 => self.advance_bpp::<2>(buffer, pos, lag),
+            3 => self.advance_bpp::<3>(buffer, pos, lag),
+            4 => self.advance_bpp::<4>(buffer, pos, lag),
+            6 => self.advance_bpp::<6>(buffer, pos, lag),
+            8 => self.advance_bpp::<8>(buffer, pos, lag),
+            _ => unreachable!("PNG pixel strides are 1, 2, 3, 4, 6 or 8 bytes"),
+        }
+    }
+
+    #[inline(never)]
+    fn advance_bpp<const BPP: usize>(&mut self, buffer: &mut [u8], pos: usize, lag: usize) {
+        let pitch = 1 + self.row_bytes;
+        while self.rows_done < self.height {
+            let row = self.rows_done;
+
+            // Single-row precondition; `pair` strengthens it by one row of pitch. The lag
+            // is `MAX_MATCH_DISTANCE` while inflation runs and zero in `finish`.
+            let ready = (row + 1).saturating_mul(pitch).saturating_add(lag) <= pos;
+            if !ready {
+                break;
+            }
+
+            // The pair decision mirrors `unfilter_image_bpp`; an invalid filter byte is
+            // not `Paeth`, so it falls to the single-row path, which reports it.
+            let mut pair = buffer[row * pitch] == Filter::Paeth as u8
+                && row > 0
+                && row + 1 < self.height
+                && buffer[(row + 1) * pitch] == Filter::Paeth as u8;
+            if pair && (row + 2).saturating_mul(pitch).saturating_add(lag) > pos {
+                pair = false;
+            }
+
+            if let Err(bad) = reconstruct_rows::<BPP>(buffer, self.row_bytes, row, pair) {
+                self.failed_row = Some(bad);
+                return;
+            }
+            self.rows_done = row + if pair { 2 } else { 1 };
+        }
+        self.next_trigger =
+            (self.rows_done + 1).saturating_mul(pitch).saturating_add(MAX_MATCH_DISTANCE);
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -562,5 +712,195 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Reconstruction frontier (fused decode)
+    //
+    // The frontier reverses filters row by row as inflation's output cursor advances, lagging
+    // it by at least DEFLATE's 32 KiB match window so no future match can read the bytes a
+    // row is reconstructed into. These tests build filtered streams the way an encoder would,
+    // feed them to the frontier in chunks that imitate a live output cursor, and require the
+    // result to equal `unfilter_image` on the same bytes.
+    // ---------------------------------------------------------------------------------------
+
+    /// Builds the filtered scanline stream for `image` with `filters[row % filters.len()]`.
+    fn filtered_stream<const BPP: usize>(
+        image: &[u8],
+        row_bytes: usize,
+        height: usize,
+        filters: &[Filter],
+    ) -> Vec<u8> {
+        let mut stream = vec![0u8; height * (1 + row_bytes)];
+        let zero_row = vec![0u8; row_bytes];
+        for row in 0..height {
+            let filter = filters[row % filters.len()];
+            let prev = if row == 0 {
+                &zero_row[..]
+            } else {
+                &image[(row - 1) * row_bytes..row * row_bytes]
+            };
+            let base = row * (1 + row_bytes);
+            stream[base] = filter as u8;
+            let (_, after) = stream.split_at_mut(base + 1);
+            filter_row::<BPP>(
+                filter,
+                prev,
+                &image[row * row_bytes..(row + 1) * row_bytes],
+                &mut after[..row_bytes],
+            );
+        }
+        stream
+    }
+
+    /// Feeds a filtered stream to a frontier in chunks of `chunk` bytes, finishes it, and
+    /// requires the reconstructed prefix to equal `unfilter_image`'s.
+    fn frontier_agrees_with_unfilter_image<const BPP: usize>(
+        width_pixels: usize,
+        height: usize,
+        filters: &[Filter],
+        chunk: usize,
+    ) {
+        let row_bytes = width_pixels * BPP;
+        let image: Vec<u8> = (0..row_bytes * height)
+            .map(|i| (i.wrapping_mul(97).wrapping_add(i / row_bytes * 13) % 256) as u8)
+            .collect();
+        let stream = filtered_stream::<BPP>(&image, row_bytes, height, filters);
+
+        let mut reference = stream.clone();
+        unfilter_image(&mut reference, row_bytes, height, BPP).unwrap();
+
+        let mut buffer = stream.clone();
+        let mut frontier = ReconstructionFrontier::new(row_bytes, height, BPP);
+        let mut pos = 0;
+        while pos < stream.len() {
+            pos = (pos + chunk).min(stream.len());
+            frontier.on_progress(&mut buffer, pos);
+        }
+        frontier.finish(&mut buffer, stream.len());
+
+        assert_eq!(frontier.rows_done(), height, "frontier must drain every row");
+        assert_eq!(frontier.failed_row(), None);
+        assert_eq!(&buffer[..row_bytes * height], &reference[..row_bytes * height]);
+    }
+
+    #[test]
+    fn frontier_matches_unfilter_image_every_filter_and_stride() {
+        for filter in Filter::ALL {
+            frontier_agrees_with_unfilter_image::<1>(17, 5, &[filter], 977);
+            frontier_agrees_with_unfilter_image::<2>(13, 4, &[filter], 977);
+            frontier_agrees_with_unfilter_image::<3>(11, 6, &[filter], 977);
+            frontier_agrees_with_unfilter_image::<4>(9, 7, &[filter], 977);
+            frontier_agrees_with_unfilter_image::<6>(5, 3, &[filter], 977);
+            frontier_agrees_with_unfilter_image::<8>(4, 3, &[filter], 977);
+        }
+    }
+
+    /// Every `Paeth` run alignment, fed in chunks, including chunk boundaries that land
+    /// inside a row so the frontier pauses mid-row.
+    #[test]
+    fn frontier_matches_unfilter_image_paeth_run_alignments() {
+        use Filter::{Average as A, None as N, Paeth as P, Sub as S, Up as U};
+
+        let patterns: &[&[Filter]] = &[
+            &[P],
+            &[P, S],
+            &[P, P, S],
+            &[P, P, P, S],
+            &[P, P, P, P, U],
+            &[S, P, P],
+            &[U, U, P],
+            &[N, S, U, A, P, P, P],
+        ];
+
+        for pattern in patterns {
+            for height in 1..=9 {
+                frontier_agrees_with_unfilter_image::<1>(13, height, pattern, 977);
+                frontier_agrees_with_unfilter_image::<3>(11, height, pattern, 977);
+                frontier_agrees_with_unfilter_image::<4>(9, height, pattern, 977);
+                frontier_agrees_with_unfilter_image::<8>(3, height, pattern, 977);
+            }
+        }
+    }
+
+    /// Rows narrow and wide, images one row tall and one pixel wide.
+    #[test]
+    fn frontier_shape_edges() {
+        for filter in Filter::ALL {
+            frontier_agrees_with_unfilter_image::<8>(1, 9, &[filter], 31);
+            frontier_agrees_with_unfilter_image::<4>(1, 1, &[filter], 31);
+            frontier_agrees_with_unfilter_image::<1>(37, 1, &[filter], 31);
+        }
+    }
+
+    /// On a stream wider than the match window, reconstruction must start while inflation
+    /// is still running: after the first row's trigger the frontier has reconstructed row 0
+    /// and stops; a jump large enough for the pair trigger reconstructs two `Paeth` rows at
+    /// once, exercising the wavefront against a live output cursor.
+    #[test]
+    fn frontier_reconstructs_behind_the_match_window() {
+        use Filter::Paeth as P;
+
+        let row_bytes: usize = 4096 * 4;
+        let height: usize = 8;
+        let image: Vec<u8> = (0..row_bytes * height)
+            .map(|i| (i.wrapping_mul(31).wrapping_add(i / row_bytes * 7) % 251) as u8)
+            .collect();
+        let stream = filtered_stream::<4>(&image, row_bytes, height, &[P]);
+
+        let mut reference = stream.clone();
+        unfilter_image(&mut reference, row_bytes, height, 4).unwrap();
+
+        let mut buffer = stream.clone();
+        let mut frontier = ReconstructionFrontier::new(row_bytes, height, 4);
+        let pitch = 1 + row_bytes;
+
+        // First-row trigger: row 0 is never paired (it has no row above), so one row lands.
+        frontier.on_progress(&mut buffer, MAX_MATCH_DISTANCE + pitch);
+        assert_eq!(frontier.rows_done(), 1);
+
+        // The next row's trigger alone is not enough for the pair: row r pairs with r+1 only
+        // once row r+1's bytes are also behind the window.
+        frontier.on_progress(&mut buffer, MAX_MATCH_DISTANCE + 2 * pitch);
+        assert_eq!(frontier.rows_done(), 2);
+
+        // At this cursor a single-row path could only reach row 2; the two-row wavefront
+        // covers rows 2 and 3 in one landing, which only pairing explains.
+        frontier.on_progress(&mut buffer, MAX_MATCH_DISTANCE + 4 * pitch);
+        assert_eq!(frontier.rows_done(), 4);
+
+        frontier.on_progress(&mut buffer, MAX_MATCH_DISTANCE + 6 * pitch);
+        assert_eq!(frontier.rows_done(), 6);
+
+        frontier.finish(&mut buffer, stream.len());
+        assert_eq!(frontier.rows_done(), height);
+        assert_eq!(&buffer[..row_bytes * height], &reference[..row_bytes * height]);
+    }
+
+    /// An invalid filter byte mid-stream freezes the frontier at that row, exactly as
+    /// `unfilter_image` reports it, and later progress calls change nothing.
+    #[test]
+    fn frontier_freezes_on_an_invalid_filter_byte() {
+        let row_bytes: usize = 4096 * 4;
+        let height: usize = 8;
+        let image: Vec<u8> = (0..row_bytes * height)
+            .map(|i| (i.wrapping_mul(13).wrapping_add(i / row_bytes * 5) % 247) as u8)
+            .collect();
+        let mut stream = filtered_stream::<4>(&image, row_bytes, height, &[Filter::Paeth]);
+        stream[5 * (1 + row_bytes)] = 9;
+
+        let mut reference = stream.clone();
+        assert_eq!(unfilter_image(&mut reference, row_bytes, height, 4), Err(5));
+
+        let mut buffer = stream.clone();
+        let mut frontier = ReconstructionFrontier::new(row_bytes, height, 4);
+        frontier.on_progress(&mut buffer, MAX_MATCH_DISTANCE + 7 * (1 + row_bytes));
+        assert_eq!(frontier.rows_done(), 5);
+        assert_eq!(frontier.failed_row(), Some(5));
+
+        frontier.on_progress(&mut buffer, stream.len());
+        frontier.finish(&mut buffer, stream.len());
+        assert_eq!(frontier.rows_done(), 5, "frozen at the bad row");
+        assert_eq!(frontier.failed_row(), Some(5));
     }
 }

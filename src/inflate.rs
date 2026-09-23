@@ -26,6 +26,28 @@ use crate::tables::{
 /// scratch and are never part of the result.
 pub const OUTPUT_SLACK: usize = 16;
 
+/// An observer for inflate's output cursor, used by the PNG decoder to reverse scanline
+/// filters while inflation is still running.
+///
+/// The hook is called once per decode-loop iteration with the output buffer and the
+/// position the cursor has reached. Implementations decide for themselves whether a call
+/// does work; the contract is only that the call happens at iteration boundaries, where no
+/// match copy or literal store is in flight.
+///
+/// `ENABLED` exists so the hot loop can be shared between callers that observe progress
+/// and callers that do not: for [`()`] it is `false`, the calls compile out, and the loop
+/// is byte-for-byte the one a hook-free decompressor would run.
+pub(crate) trait ProgressHook {
+    /// Whether this hook ever does work. `false` removes the call sites entirely.
+    const ENABLED: bool;
+    fn on_progress(&mut self, output: &mut [u8], pos: usize);
+}
+
+impl ProgressHook for () {
+    const ENABLED: bool = false;
+    fn on_progress(&mut self, _: &mut [u8], _: usize) {}
+}
+
 /// Non-exhaustive, for the reason [`Error`](crate::Error) is. Match with a fallback arm.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -548,6 +570,34 @@ impl Inflater {
     /// Nothing beyond the returned length is meaningful: the buffer is handed to the
     /// decoder whole, and the bytes past the data are whatever match copies overwrote.
     pub fn zlib_at_most(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize, InflateError> {
+        self.zlib_at_most_progress::<()>(input, output, &mut ())
+    }
+
+    /// Decompresses a zlib stream into `output`, reporting output-cursor progress to `hook`.
+    ///
+    /// The stream must expand to exactly `output.len() - OUTPUT_SLACK` bytes, as in
+    /// [`zlib`](Self::zlib); the hook observes the buffer as the stream is decoded. See
+    /// [`ProgressHook`]: for [`()`] this is `zlib` under another name, and for the decoder's
+    /// reconstruction frontier it fuses scanline reversal into inflation.
+    pub(crate) fn zlib_progress<H: ProgressHook>(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        hook: &mut H,
+    ) -> Result<usize, InflateError> {
+        let written = self.zlib_at_most_progress(input, output, hook)?;
+        if written != output.len() - OUTPUT_SLACK {
+            return Err(InflateError::OutputUnderflow);
+        }
+        Ok(written)
+    }
+
+    fn zlib_at_most_progress<H: ProgressHook>(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        hook: &mut H,
+    ) -> Result<usize, InflateError> {
         assert!(output.len() >= OUTPUT_SLACK, "output buffer must include OUTPUT_SLACK");
         let limit = output.len() - OUTPUT_SLACK;
 
@@ -563,7 +613,7 @@ impl Inflater {
             return Err(InflateError::PresetDictionary);
         }
 
-        let (written, consumed) = self.inflate(&input[2..], output, limit)?;
+        let (written, consumed) = self.inflate(&input[2..], output, limit, hook)?;
 
         let trailer = &input[2 + consumed..];
         if trailer.len() < 4 {
@@ -582,11 +632,12 @@ impl Inflater {
     }
 
     /// Decodes a raw DEFLATE stream, returning the bytes written and the input bytes read.
-    fn inflate(
+    fn inflate<H: ProgressHook>(
         &mut self,
         input: &[u8],
         output: &mut [u8],
         limit: usize,
+        hook: &mut H,
     ) -> Result<(usize, usize), InflateError> {
         let mut reader = BitReader::new(input);
         let mut out_pos = 0usize;
@@ -618,15 +669,18 @@ impl Inflater {
                     output[out_pos..out_pos + len]
                         .copy_from_slice(&input[data_start..data_start + len]);
                     out_pos += len;
+                    if H::ENABLED {
+                        hook.on_progress(output, out_pos);
+                    }
                     reader.seek(data_start + len);
                 }
                 1 => {
                     self.build_fixed_tables()?;
-                    out_pos = self.decode_block(&mut reader, output, out_pos)?;
+                    out_pos = self.decode_block(&mut reader, output, out_pos, hook)?;
                 }
                 2 => {
                     self.read_dynamic_header(&mut reader)?;
-                    out_pos = self.decode_block(&mut reader, output, out_pos)?;
+                    out_pos = self.decode_block(&mut reader, output, out_pos, hook)?;
                 }
                 _ => return Err(InflateError::InvalidBlockType),
             }
@@ -834,11 +888,16 @@ impl Inflater {
     /// `&mut` it would have to be spilled to memory after every consume, because the
     /// compiler cannot otherwise rule out aliasing with the output buffer; as a local it
     /// stays in registers.
-    fn decode_block(
+    ///
+    /// `hook` observes the output cursor once per loop iteration. For [`()`] the call
+    /// compiles out entirely (see [`ProgressHook`]), leaving the loop identical to a
+    /// hook-free decoder.
+    fn decode_block<H: ProgressHook>(
         &mut self,
         reader: &mut BitReader,
         output: &mut [u8],
         start_pos: usize,
+        hook: &mut H,
     ) -> Result<usize, InflateError> {
         // Binding the tables as fixed-size array references, rather than slices, lets the
         // masked table indices be proven in range and drops the bounds checks from the two
@@ -859,6 +918,9 @@ impl Inflater {
             loop {
                 if pos > limit {
                     break 'block Err(InflateError::OutputOverflow);
+                }
+                if H::ENABLED {
+                    hook.on_progress(output, pos);
                 }
 
                 let mut bits = r.buf;
