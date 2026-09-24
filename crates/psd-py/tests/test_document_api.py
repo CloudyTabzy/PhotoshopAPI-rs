@@ -5,6 +5,7 @@ does not exercise: tree edits, detached groups, per-layer settings, range
 proxies, stream I/O, ``PhotoshopFile``, and group masks.
 """
 
+import inspect
 import io
 import os
 import tempfile
@@ -263,6 +264,59 @@ class IoTest(unittest.TestCase):
         self.assertTrue(all(layer.display_color == psapi.enum.LayerColor.violet for layer in colors.flat_layers))
         fill = psapi.LayeredFile.read(FIXTURES / "documents" / "BlendFill" / "blend_fill.psd")
         self.assertAlmostEqual(fill.layers[0].fill, 0.51, places=2)
+
+
+class ReadMemoryLimitTest(unittest.TestCase):
+    """The decoded-channel memory budget must be reachable from Python.
+
+    Rust callers pass ``ReadOptions``; the bindings previously always used the
+    default 2 GiB budget with no way to raise it or opt out, so a document over
+    that size failed with no recourse.
+    """
+
+    def setUp(self):
+        self.path = str(FIXTURES / "documents" / "BlendFill" / "blend_fill.psd")
+        with open(self.path, "rb") as handle:
+            self.data = handle.read()
+
+    def test_from_bytes_accepts_an_explicit_byte_budget(self):
+        # A budget too small for this document's channels is rejected.
+        with self.assertRaises(ValueError):
+            psapi.LayeredFile_8bit.from_bytes(self.data, memory_limit=1)
+
+    def test_memory_limit_none_keeps_the_default_budget(self):
+        # Omitting the argument must behave exactly as before the option existed.
+        default = psapi.LayeredFile_8bit.from_bytes(self.data)
+        explicit = psapi.LayeredFile_8bit.from_bytes(self.data, memory_limit=None)
+        self.assertEqual(names(default.layers), names(explicit.layers))
+
+    def test_memory_limit_zero_means_unlimited(self):
+        unlimited = psapi.LayeredFile_8bit.from_bytes(self.data, memory_limit=0)
+        self.assertEqual(names(unlimited.layers), names(roundtrip(psapi.LayeredFile_8bit.from_bytes(self.data)).layers))
+
+    def test_generous_budget_reads_normally(self):
+        generous = psapi.LayeredFile_8bit.from_bytes(self.data, memory_limit=64 * 1024 * 1024)
+        self.assertTrue(generous.layers)
+
+    def test_read_path_accepts_the_same_option(self):
+        self.assertTrue(psapi.LayeredFile_8bit.read(self.path, memory_limit=0).layers)
+        with self.assertRaises(ValueError):
+            psapi.LayeredFile_8bit.read(self.path, memory_limit=1)
+
+    def test_module_level_read_accepts_the_same_option(self):
+        self.assertTrue(psapi.LayeredFile.read(self.path, memory_limit=0).layers)
+
+    def test_negative_budget_is_rejected(self):
+        with self.assertRaises(ValueError):
+            psapi.LayeredFile_8bit.from_bytes(self.data, memory_limit=-1)
+
+    def test_every_depth_exposes_the_option(self):
+        # The macro is instantiated once per bit depth, so assert the keyword
+        # exists structurally rather than inferring it from an error message.
+        for document in (psapi.LayeredFile_8bit, psapi.LayeredFile_16bit, psapi.LayeredFile_32bit):
+            self.assertIn("memory_limit", inspect.signature(document.from_bytes).parameters)
+            self.assertIn("memory_limit", inspect.signature(document.read).parameters)
+        self.assertIn("memory_limit", inspect.signature(psapi.read).parameters)
 
 
 if __name__ == "__main__":

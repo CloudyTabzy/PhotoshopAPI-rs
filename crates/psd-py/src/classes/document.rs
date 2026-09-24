@@ -14,12 +14,15 @@ macro_rules! document_class {
                 }
             }
 
-            pub(crate) fn open(source: &Bound<'_, PyAny>) -> PyResult<Self> {
+            pub(crate) fn open(
+                source: &Bound<'_, PyAny>,
+                options: psd::ReadOptions,
+            ) -> PyResult<Self> {
                 match Io::from_py(source)? {
-                    Io::Path(path) => LayeredFile::read(&path)
+                    Io::Path(path) => LayeredFile::read_with_options(&path, options)
                         .map(Self::from_rust)
                         .map_err(psd_error),
-                    stream => LayeredFile::from_bytes(&stream.read_bytes()?)
+                    stream => LayeredFile::from_bytes_with_options(&stream.read_bytes()?, options)
                         .map(Self::from_rust)
                         .map_err(psd_error),
                 }
@@ -76,14 +79,23 @@ macro_rules! document_class {
             }
 
             /// Read a document from a path or a binary file-like object.
+            ///
+            /// `memory_limit` caps the cumulative decoded channel memory:
+            /// `None` (the default) uses the library default, `0` means
+            /// unlimited, and a positive value is a byte budget.
             #[staticmethod]
-            fn read(path: &Bound<'_, PyAny>) -> PyResult<Self> {
-                Self::open(path)
+            #[pyo3(signature = (path, memory_limit=None))]
+            fn read(path: &Bound<'_, PyAny>, memory_limit: Option<i64>) -> PyResult<Self> {
+                Self::open(path, read_options_from_py(memory_limit)?)
             }
 
+            /// Read a document from bytes.
+            ///
+            /// `memory_limit` behaves as in `read`.
             #[staticmethod]
-            fn from_bytes(data: &[u8]) -> PyResult<Self> {
-                LayeredFile::from_bytes(data)
+            #[pyo3(signature = (data, memory_limit=None))]
+            fn from_bytes(data: &[u8], memory_limit: Option<i64>) -> PyResult<Self> {
+                LayeredFile::from_bytes_with_options(data, read_options_from_py(memory_limit)?)
                     .map(Self::from_rust)
                     .map_err(psd_error)
             }

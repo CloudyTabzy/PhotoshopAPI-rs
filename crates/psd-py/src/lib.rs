@@ -25,7 +25,7 @@ mod _native {
     use psd::{Homography, LayeredFile, Point2};
     use pyo3::prelude::*;
 
-    use crate::convert::Io;
+    use crate::convert::{read_options_from_py, Io};
     use crate::depth::{depth16, depth32, depth8};
     use crate::photoshop_file::{header_of, PyPhotoshopFile};
     use crate::smart_warp::PySmartWarp;
@@ -61,8 +61,18 @@ mod _native {
 
     /// Read a PSD/PSB (path or binary file-like object) into the document
     /// class of its bit depth.
+    ///
+    /// `memory_limit` caps the cumulative decoded channel memory: `None` (the
+    /// default) uses the library default, `0` means unlimited, and a positive
+    /// value is a byte budget.
     #[pyfunction]
-    fn read(py: Python<'_>, path: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (path, memory_limit=None))]
+    fn read(
+        py: Python<'_>,
+        path: &Bound<'_, PyAny>,
+        memory_limit: Option<i64>,
+    ) -> PyResult<Py<PyAny>> {
+        let options = read_options_from_py(memory_limit)?;
         let depth = match Io::from_py(path)? {
             Io::Path(file) => header_of(&file)?.depth,
             stream => {
@@ -74,21 +84,24 @@ mod _native {
                     BitDepth::Eight => Py::new(
                         py,
                         depth8::PyDocument::from_rust(
-                            LayeredFile::from_bytes(&bytes).map_err(psd_error)?,
+                            LayeredFile::from_bytes_with_options(&bytes, options)
+                                .map_err(psd_error)?,
                         ),
                     )?
                     .into_any(),
                     BitDepth::Sixteen => Py::new(
                         py,
                         depth16::PyDocument::from_rust(
-                            LayeredFile::from_bytes(&bytes).map_err(psd_error)?,
+                            LayeredFile::from_bytes_with_options(&bytes, options)
+                                .map_err(psd_error)?,
                         ),
                     )?
                     .into_any(),
                     BitDepth::ThirtyTwo => Py::new(
                         py,
                         depth32::PyDocument::from_rust(
-                            LayeredFile::from_bytes(&bytes).map_err(psd_error)?,
+                            LayeredFile::from_bytes_with_options(&bytes, options)
+                                .map_err(psd_error)?,
                         ),
                     )?
                     .into_any(),
@@ -96,9 +109,15 @@ mod _native {
             }
         };
         Ok(match depth {
-            BitDepth::Eight => Py::new(py, depth8::PyDocument::open(path)?)?.into_any(),
-            BitDepth::Sixteen => Py::new(py, depth16::PyDocument::open(path)?)?.into_any(),
-            BitDepth::ThirtyTwo => Py::new(py, depth32::PyDocument::open(path)?)?.into_any(),
+            BitDepth::Eight => {
+                Py::new(py, depth8::PyDocument::open(path, options)?)?.into_any()
+            }
+            BitDepth::Sixteen => {
+                Py::new(py, depth16::PyDocument::open(path, options)?)?.into_any()
+            }
+            BitDepth::ThirtyTwo => {
+                Py::new(py, depth32::PyDocument::open(path, options)?)?.into_any()
+            }
         })
     }
 

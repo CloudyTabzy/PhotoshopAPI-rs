@@ -139,6 +139,24 @@ pub fn linkage_number(storage: psd::LinkedStorage) -> i64 {
     }
 }
 
+/// Cumulative decoded-channel budget for one read.
+///
+/// `None` keeps [`psd::ReadOptions::default`], `0` selects unlimited decoding,
+/// and a positive value is a byte budget. A negative value is a caller bug, not
+/// a request for unlimited decoding, so it is rejected.
+pub fn read_options_from_py(memory_limit: Option<i64>) -> PyResult<psd::ReadOptions> {
+    Ok(match memory_limit {
+        None => psd::ReadOptions::default(),
+        Some(0) => psd::ReadOptions::unlimited(),
+        Some(bytes) => psd::ReadOptions {
+            total_memory_limit: Some(usize::try_from(bytes).map_err(|_| {
+                PyValueError::new_err(format!("memory_limit must not be negative, got {bytes}"))
+            })?),
+            ..psd::ReadOptions::default()
+        },
+    })
+}
+
 /// `photoshopapi.enum.BitDepth` for a sample depth in bits.
 pub fn bit_depth_to_py(py: Python<'_>, depth: u16) -> PyResult<Py<PyAny>> {
     let raw = match depth {

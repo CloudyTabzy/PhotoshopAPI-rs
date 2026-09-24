@@ -22,7 +22,7 @@ use pyo3::types::{PyBytes, PyDict};
 
 use crate::convert::{
     bit_depth_to_py, color_mode_from_py, compression_from_py, enum_value, icc_bytes, index_value,
-    linkage_from_py, linkage_number, py_enum, Io,
+    linkage_from_py, linkage_number, py_enum, read_options_from_py, Io,
 };
 use crate::layer_ops::{self, check_name};
 use crate::smart_warp::PySmartWarp;
