@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/psd-core", "crates/psd-codecs", "crates/psd", "crates/psd-py"]
+
+[workspace.package]
+edition = "2021"
+license = "BSD-3-Clause"
+# The single project version; bump it with every CHANGELOG.md entry.
+version = "0.5.2"
+
+# Dependency versions are centralized here; crates pull them in with
+# `workspace = true`.
+[workspace.dependencies]
+psd-core = { path = "crates/psd-core" }
+psd-codecs = { path = "crates/psd-codecs" }
+psd = { path = "crates/psd" }
+
+thiserror = "2"
+tracing = "0.1"
+rayon = "1"
+memmap2 = "0.9"
+libdeflater = "1"
+nalgebra = { version = "0.34", default-features = false, features = ["std"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", default-features = false, features = ["std"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# No `extension-module` feature: PyO3 0.29 deprecates it, and it breaks
+# `cargo test --workspace` linking on Linux/macOS. maturin sets
+# `PYO3_BUILD_EXTENSION_MODULE` for wheel builds instead.
+pyo3 = "0.29"
+numpy = "0.29"

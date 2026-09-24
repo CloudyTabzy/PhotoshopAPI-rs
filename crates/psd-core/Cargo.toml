@@ -1,0 +1,18 @@
+[package]
+name = "psd-core"
+description = "Raw PSD/PSB on-disk format: sections, tagged blocks, descriptors, enums"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[features]
+# `serde::Serialize` views of descriptors and EngineData (upstream `to_json`).
+serde = ["dep:serde"]
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true

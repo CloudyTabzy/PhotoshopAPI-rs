@@ -1,0 +1,26 @@
+/target
+**/*.rs.bk
+*.pdb
+.idea/
+.vscode/
+
+# Python wheel output (maturin build).
+/dist/
+*.whl
+
+# Python bytecode and tool caches from the psd-py test runs.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Internal working records: the deferred-decision register, benchmark/dependency
+# evaluations, and the implementation audit trail. Kept locally, not published.
+/TODO.md
+/docs/evaluations/
+/evidence/
+
+# Local agent-tooling state (J-Space controller, ledgers, repository maps).
+.jspace*
+jspace*

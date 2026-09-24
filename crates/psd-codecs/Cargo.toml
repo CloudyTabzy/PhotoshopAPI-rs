@@ -1,0 +1,11 @@
+[package]
+name = "psd-codecs"
+description = "Pure byte/slice codecs for the PSD/PSB format: PackBits RLE, ZIP, prediction, endian, interleave"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+rayon.workspace = true
+libdeflater.workspace = true

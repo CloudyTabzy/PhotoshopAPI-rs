@@ -1,0 +1,23 @@
+[package]
+name = "psd"
+description = "User-facing Photoshop document API: LayeredFile, layers, channels, masks"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[features]
+default = ["image"]
+image = ["dep:image"]
+# Forwards `psd-core/serde`: `Serialize` views of descriptors and EngineData.
+serde = ["psd-core/serde"]
+
+[dependencies]
+psd-core.workspace = true
+psd-codecs.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rayon.workspace = true
+memmap2.workspace = true
+nalgebra.workspace = true
+image = { workspace = true, optional = true }
+uuid.workspace = true

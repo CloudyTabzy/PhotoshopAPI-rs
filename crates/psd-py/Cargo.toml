@@ -1,0 +1,15 @@
+[package]
+name = "psd-py"
+description = "Python bindings for the Rust PhotoshopAPI port"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+psd.workspace = true
+pyo3.workspace = true
+numpy.workspace = true
