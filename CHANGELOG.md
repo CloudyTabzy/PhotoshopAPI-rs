@@ -12,6 +12,17 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-24
+
+### Added
+
+- Layers expose read-only typed views of modern `lfx2`/`lmfx`/`lfxs` and legacy
+  `lrFX` effects, including drop shadows, glows, bevels, overlays, satin, and
+  strokes. Multi-effect lists and unknown descriptor fields remain accessible.
+- Legacy effect records expose common settings and retain unknown record payloads.
+  Saving still writes the original tagged-block bytes, including unsupported
+  effect fields.
+
 ## [0.6.0] - 2026-09-24
 
 ### Added

@@ -16,7 +16,7 @@
 //! - [`photoshop_file`]: the five sections read/written in order (`PhotoshopFile/PhotoshopFile.h`)
 //! - [`tagged_blocks`]: 4-char-keyed additional-layer-info registry with raw passthrough (`Core/TaggedBlocks/`)
 //! - [`descriptor`], [`engine_data`]: Photoshop's action-descriptor and text-engine formats (`Core/Struct/`)
-//! - [`text_tool`], [`placed_layer`], [`linked_layer`]: typed `TySh`/`Txt2`, `PlLd`/`SoLd`, and `lnk*` block views
+//! - [`text_tool`], [`placed_layer`], [`linked_layer`], [`layer_effects`]: typed views over text, placed/linked data, and effect blocks
 //! - `serialize` (feature `serde`): `Serialize` views of descriptors and EngineData (upstream `to_json`)
 //!
 //! Codec math lives in `psd-codecs`; the document API lives in `psd`. This crate
@@ -32,6 +32,7 @@ pub mod image_data;
 pub mod image_resources;
 pub mod io;
 pub mod layer_and_mask_info;
+pub mod layer_effects;
 pub mod linked_layer;
 pub mod photoshop_file;
 pub mod placed_layer;
@@ -64,6 +65,10 @@ pub use layer_and_mask_info::{
     BlendingRange, ChannelData, ChannelImageData, ChannelInfo, GlobalLayerMaskInfo,
     LayerAndMaskInformation, LayerBlendingRanges, LayerFlags, LayerInfo, LayerMask, LayerMaskData,
     LayerMaskFlags, LayerRecord, MaskParams, MAX_LAYER_CHANNELS,
+};
+pub use layer_effects::{
+    EffectDescriptor, EffectKind, LayerEffectsBlock, LayerEffectsData, LegacyEffectColor,
+    LegacyEffectRecord, LegacyLayerEffects, ModernLayerEffects,
 };
 pub use linked_layer::{
     Date, LinkedDataKind, LinkedLayer, LinkedLayerTaggedBlock, LinkedLayerView,

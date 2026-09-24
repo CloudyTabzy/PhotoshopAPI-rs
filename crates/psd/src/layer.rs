@@ -12,8 +12,8 @@
 
 use psd_core::{
     AdditionalLayerInfo, BeReader, BlendMode, Compression, LayerBlendingRanges, LayerColor,
-    LayerFlags, LayerMask, LayerMaskData, LayerMaskFlags, PlacedLayer, PlacedLayerData, PsdError,
-    Result, SectionDivider, TaggedBlock, TaggedBlockKey,
+    LayerEffectsBlock, LayerFlags, LayerMask, LayerMaskData, LayerMaskFlags, PlacedLayer,
+    PlacedLayerData, PsdError, Result, SectionDivider, TaggedBlock, TaggedBlockKey,
 };
 
 use crate::bitdepth::BitDepth;
@@ -303,6 +303,21 @@ impl<T: BitDepth> Layer<T> {
             Some(block) => PlacedLayer::read(&mut BeReader::new(&block.data)).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Every layer-effects block in source order, parsed on demand. The raw
+    /// blocks in [`blocks`](Self::blocks) remain the write source, including
+    /// fields that these typed views do not interpret.
+    pub fn effects(&self) -> Result<Vec<LayerEffectsBlock>> {
+        self.blocks
+            .blocks
+            .iter()
+            .filter_map(|block| match LayerEffectsBlock::read(block) {
+                Ok(Some(effects)) => Some(Ok(effects)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
     }
 
     // ------------------------------------------------------------------
