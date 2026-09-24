@@ -1,7 +1,7 @@
 //! Read-only views of layer effects stored in `lfx2`, `lmfx`, `lfxs`, and `lrFX`.
 //!
 //! The four-key dispatch and effect names follow the public `ag-psd-rs` reference
-//! (https://github.com/Vasyanator/ag-psd-rs). Unlike that parser, these views
+//! (<https://github.com/Vasyanator/ag-psd-rs>). Unlike that parser, these views
 //! retain every effect block and unknown legacy record. The original tagged
 //! block remains authoritative for writing, so reading effects changes no bytes.
 
@@ -9,6 +9,7 @@ use crate::descriptor::{Descriptor, DescriptorKey};
 use crate::error::{PsdError, Result};
 use crate::io::BeReader;
 use crate::tagged_blocks::{TaggedBlock, TaggedBlockKey};
+use crate::types::RawColor;
 
 /// One of the standard Photoshop layer effect families or the legacy common state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,11 +171,7 @@ pub struct LegacyLayerEffects {
 }
 
 /// Raw PSD color components. Photoshop uses different interpretations by color space.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LegacyEffectColor {
-    pub color_space: u16,
-    pub components: [u16; 4],
-}
+pub type LegacyEffectColor = RawColor;
 
 /// One legacy effect record. `payload` contains the complete original body,
 /// including its version, and is kept even for unknown types.
@@ -355,10 +352,7 @@ fn fixed_16_16(reader: &mut BeReader) -> Result<f64> {
 }
 
 fn read_color(reader: &mut BeReader) -> Result<LegacyEffectColor> {
-    Ok(LegacyEffectColor {
-        color_space: reader.u16()?,
-        components: [reader.u16()?, reader.u16()?, reader.u16()?, reader.u16()?],
-    })
+    RawColor::read(reader)
 }
 
 fn read_blend_mode(reader: &mut BeReader) -> Result<[u8; 4]> {

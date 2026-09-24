@@ -11,9 +11,10 @@
 //! bits round-trip.
 
 use psd_core::{
-    AdditionalLayerInfo, BeReader, BlendMode, Compression, LayerBlendingRanges, LayerColor,
-    LayerEffectsBlock, LayerFlags, LayerMask, LayerMaskData, LayerMaskFlags, PlacedLayer,
-    PlacedLayerData, PsdError, Result, SectionDivider, TaggedBlock, TaggedBlockKey,
+    AdditionalLayerInfo, AdjustmentBlock, AdjustmentKind, BeReader, BlendMode, Compression,
+    LayerBlendingRanges, LayerColor, LayerEffectsBlock, LayerFlags, LayerMask, LayerMaskData,
+    LayerMaskFlags, PlacedLayer, PlacedLayerData, PsdError, Result, SectionDivider, TaggedBlock,
+    TaggedBlockKey,
 };
 
 use crate::bitdepth::BitDepth;
@@ -317,6 +318,29 @@ impl<T: BitDepth> Layer<T> {
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
             })
+            .collect()
+    }
+
+    /// Whether the layer carries an adjustment or fill-layer settings block
+    /// (`levl`, `curv`, `SoCo`, ...; see [`AdjustmentKind`]). Upstream detects
+    /// the same keys to build its opaque `AdjustmentLayer`. Photoshop also
+    /// stores a shape layer's fill in `SoCo`/`GdFl`/`PtFl`, so shape layers
+    /// report `true` as well.
+    pub fn is_adjustment_layer(&self) -> bool {
+        self.blocks.blocks.iter().any(|block| {
+            AdjustmentKind::from_key(block.key).is_some_and(AdjustmentKind::marks_layer)
+        })
+    }
+
+    /// Every adjustment and fill block in source order, including a `CgEd`
+    /// companion block, parsed on demand. The raw blocks in
+    /// [`blocks`](Self::blocks) remain the write source, so reading these
+    /// views changes no bytes. A malformed or unsupported payload is an error.
+    pub fn adjustments(&self) -> Result<Vec<AdjustmentBlock>> {
+        self.blocks
+            .blocks
+            .iter()
+            .filter_map(|block| AdjustmentBlock::read(block).transpose())
             .collect()
     }
 

@@ -12,6 +12,31 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-24
+
+### Added
+
+- Layers expose read-only typed views of adjustment and fill layer settings:
+  brightness/contrast, levels, curves, exposure, vibrance, hue/saturation
+  (current and Photoshop 4.0 keys), color balance, black & white, photo
+  filter, channel mixer, color lookup, invert, posterize, threshold, gradient
+  map, selective color, and solid, gradient, and pattern fills. The `CgEd`
+  companion data exposes modern brightness/contrast values and preset names.
+  Upstream only detects these layers and round-trips them as opaque data.
+- `Layer::is_adjustment_layer` reports whether a layer carries one of these
+  settings blocks. Shape layers also report `true`, because Photoshop stores
+  their fill in the same blocks.
+- Views keep what they do not interpret: newer descriptor fields, the extra
+  records after the legacy levels and curves sections, and trailing payload
+  bytes. Saving still writes the original tagged-block bytes. A malformed or
+  unsupported payload returns an error only from the view that reads it.
+- `RawColor`, the specification's 10-byte color structure, is shared by
+  adjustment views and legacy effects. `LegacyEffectColor` is now an alias for
+  it.
+- A generated test corpus in `fixtures/generated/Adjustments` covers every
+  adjustment and fill kind except pattern fill, in 8-bit PSD and PSB and 16-bit
+  PSD. `cargo run -p psd --example generate_fixtures` regenerates it.
+
 ## [0.6.1] - 2026-09-24
 
 ### Added

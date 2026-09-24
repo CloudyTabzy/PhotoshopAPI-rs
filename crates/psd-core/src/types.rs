@@ -1,7 +1,30 @@
 //! Small shared numeric types (`Core/Struct/PhotoshopTypes.h`).
 //!
-//! Grows as more of upstream's struct zoo is ported; currently only the
-//! fixed-point resolution type used by the DPI image-resource block.
+//! Grows as more of upstream's struct zoo is ported: the fixed-point
+//! resolution type used by the DPI image-resource block and the 10-byte color
+//! structure shared by legacy effects and adjustment settings.
+
+use crate::error::Result;
+use crate::io::BeReader;
+
+/// The PSD specification's 10-byte color structure: a `u16` color-space id
+/// followed by four `u16` components whose meaning depends on the space
+/// (RGB, HSB, CMYK, Lab, grayscale, ...). Components beyond the space's
+/// channel count are stored but unused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RawColor {
+    pub color_space: u16,
+    pub components: [u16; 4],
+}
+
+impl RawColor {
+    pub fn read(reader: &mut BeReader) -> Result<Self> {
+        Ok(Self {
+            color_space: reader.u16()?,
+            components: [reader.u16()?, reader.u16()?, reader.u16()?, reader.u16()?],
+        })
+    }
+}
 
 /// A 4-byte fixed-point number: `u16` integer part plus `u16` fraction.
 ///

@@ -16,12 +16,13 @@
 //! - [`photoshop_file`]: the five sections read/written in order (`PhotoshopFile/PhotoshopFile.h`)
 //! - [`tagged_blocks`]: 4-char-keyed additional-layer-info registry with raw passthrough (`Core/TaggedBlocks/`)
 //! - [`descriptor`], [`engine_data`]: Photoshop's action-descriptor and text-engine formats (`Core/Struct/`)
-//! - [`text_tool`], [`placed_layer`], [`linked_layer`], [`layer_effects`]: typed views over text, placed/linked data, and effect blocks
+//! - [`text_tool`], [`placed_layer`], [`linked_layer`], [`layer_effects`], [`adjustments`]: typed views over text, placed/linked data, effect blocks, and adjustment/fill settings
 //! - `serialize` (feature `serde`): `Serialize` views of descriptors and EngineData (upstream `to_json`)
 //!
 //! Codec math lives in `psd-codecs`; the document API lives in `psd`. This crate
 //! does no IO of its own — readers consume `&[u8]`, writers produce `Vec<u8>`.
 
+pub mod adjustments;
 mod color_mode_data;
 pub mod descriptor;
 pub mod engine_data;
@@ -43,6 +44,7 @@ pub mod tagged_blocks;
 pub mod text_tool;
 pub mod types;
 
+pub use adjustments::{AdjustmentBlock, AdjustmentData, AdjustmentKind, AdjustmentPreset};
 pub use color_mode_data::ColorModeData;
 pub use descriptor::{
     read_item, write_item, Descriptor, DescriptorIntegerSpan, DescriptorItem, DescriptorKey,
@@ -83,4 +85,4 @@ pub use tagged_blocks::{AdditionalLayerInfo, TaggedBlock, TaggedBlockKey};
 pub use text_tool::{
     parse_text_engine_data, TypeToolDescriptorSpans, TypeToolTaggedBlock, TypeToolTextPayloadSpans,
 };
-pub use types::FixedFloat4;
+pub use types::{FixedFloat4, RawColor};
