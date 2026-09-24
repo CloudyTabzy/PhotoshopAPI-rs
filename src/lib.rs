@@ -171,6 +171,7 @@ pub mod error;
 pub mod filter;
 pub mod huffman;
 pub mod inflate;
+mod simd;
 pub mod tables;
 pub mod transform;
 

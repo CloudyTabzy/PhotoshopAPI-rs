@@ -31,16 +31,26 @@ fn best_of(mut body: impl FnMut() -> usize) -> Duration {
     best
 }
 
+/// Every `.png` under `dir`, recursively, so a nested corpus directory works as an argument.
+fn pngs_under(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(pngs_under(&path));
+        } else if path.extension().and_then(|e| e.to_str()) == Some("png") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: stream_decode <fixtures dir>");
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("fixtures dir")
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            (path.extension().and_then(|e| e.to_str()) == Some("png")).then_some(path)
-        })
-        .collect();
-    files.sort();
+    let files = pngs_under(std::path::Path::new(&dir));
+    assert!(!files.is_empty(), "no PNGs under {dir}");
 
     println!(
         "{:<26} {:>9} {:>9} {:>9} {:>8} {:>8}",

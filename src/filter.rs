@@ -158,6 +158,11 @@ fn unfilter_row<const BPP: usize>(filter: Filter, prev: &[u8], row: &mut [u8]) {
             }
         }
         Filter::Paeth => {
+            // The SIMD kernel takes the whole row when it claims this stride; it declines
+            // otherwise, leaving the row untouched for the scalar path below.
+            if crate::simd::paeth_row(row, prev, BPP) {
+                return;
+            }
             let mut left = [0u8; BPP];
             let mut upper_left = [0u8; BPP];
             for (pixel, above) in
@@ -312,8 +317,11 @@ fn unfilter_image_bpp<const BPP: usize>(
         // Two adjacent `Paeth` rows are worth reconstructing together; see
         // [`unfilter_paeth_pair`]. The first row of the image is excluded because it has no
         // row above it, and a row whose successor uses a different filter falls through to
-        // the single-row path, which the next iteration then takes for the successor.
+        // the single-row path, which the next iteration then takes for the successor. A
+        // stride the SIMD kernel claims does not pair at all: the kernel reconstructs a whole
+        // row on its own, and the two schemes are alternatives rather than a pair.
         let pair = filter == Filter::Paeth
+            && !crate::simd::claims_stride(BPP)
             && row > 0
             && row + 1 < height
             && buffer[(row + 1) * (1 + row_bytes)] == Filter::Paeth as u8;
@@ -526,6 +534,7 @@ impl ReconstructionFrontier {
             // The pair decision mirrors `unfilter_image_bpp`; an invalid filter byte is
             // not `Paeth`, so it falls to the single-row path, which reports it.
             let mut pair = buffer[row * pitch] == Filter::Paeth as u8
+                && !crate::simd::claims_stride(BPP)
                 && row > 0
                 && row + 1 < self.height
                 && buffer[(row + 1) * pitch] == Filter::Paeth as u8;
@@ -662,6 +671,7 @@ impl<'a, E, S: FnMut(usize, &[u8]) -> Result<(), E>> StreamingFrontier<'a, E, S>
             // The pair decision mirrors `unfilter_image_bpp`; an invalid filter byte is
             // not `Paeth`, so it falls to the single-row path, which reports it.
             let mut pair = buffer[row * pitch - self.base] == Filter::Paeth as u8
+                && !crate::simd::claims_stride(BPP)
                 && row > 0
                 && row + 1 < self.height
                 && buffer[(row + 1) * pitch - self.base] == Filter::Paeth as u8;

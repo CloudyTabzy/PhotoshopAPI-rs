@@ -48,6 +48,7 @@ macro_rules! collect {
     };
 }
 
+collect!(rows_rgba8, decode_to_rgba8);
 collect!(rows_rgb8, decode_to_rgb8);
 collect!(rows_rgba16, decode_to_rgba16);
 collect!(rows_rgb16, decode_to_rgb16);
@@ -231,6 +232,16 @@ fn rgb8_and_rgb16_drop_the_alpha_channel() {
         expected.extend_from_slice(&(sample * 257).to_be_bytes());
     }
     assert_eq!(row, expected);
+}
+
+#[test]
+fn a_decoder_can_be_moved_to_another_thread() {
+    // The port decodes smart objects in parallel, so a `Decoder` has to be `Send`. Proving
+    // it by moving one is worth more than a trait assertion: the decode itself runs on the
+    // other thread.
+    let png = one_row_png(info(4, ColorType::Rgba, BitDepth::Eight), &[3u8; 16]);
+    let decoded = std::thread::spawn(move || rows_rgba8(&png)).join().expect("decode off-thread");
+    assert_eq!(decoded, [3u8; 16], "the row crosses the thread boundary intact");
 }
 
 #[test]

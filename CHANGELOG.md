@@ -40,6 +40,16 @@ package is `publish = false` and carries no `repository` URL.
 - Crate documentation, README and CI describe a decoder; the encoder inherited from png-spark
   is retained unchanged for one step and then removed.
 
+### Performance
+
+- `Paeth` scanline reversal has an SSE2 kernel for 3- and 4-byte strides, following libpng's
+  filters: one row at a time, one pixel per 128-bit register, with the four channels of the
+  pixel as independent lanes. It replaces the scalar two-row wavefront where it applies, which
+  remains in use for every other stride. Measured against it with
+  `PSD_PNG_FORCE_SCALAR=1`: 8–22% faster where images have `Paeth` rows (mean 12% on both the
+  large fixtures and the port's own corpus), and unchanged where the filter mix has none. The
+  two paths are byte-identical, and the suite passes with either in force.
+
 ## 0.2.0
 
 - `Encoder::encode_to` writes a PNG to any `io::Write`, filtering and compressing a band at a time. Peak working memory grows with the image's width but not its height, against the whole file plus a filtered copy of every row before.

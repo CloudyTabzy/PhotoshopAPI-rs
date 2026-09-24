@@ -3,13 +3,13 @@
 **Provenance:** written by the PhotoshopAPI-rs port team. This document is **ours**, not upstream
 png-spark; it lives in this working checkout so the implementing agent has everything in one place.
 **Target:** this checkout (`png-spark`, main at `6d256fc`, the 0.2.0-era code).
-**Status:** Phases 1 and 2 implemented on `fused-decode-frontier` with measured evidence (see
-`BENCHMARKS.md`); Phase 3 (fused conversion) not started. **Parked 2026-09-24: no upstream PR is
-planned.** When smart-object PNG decode lands in the port, this becomes a decoder-only vendored
-crate under our own name (`psd-png`, vendored as `crates/psd-png`; `MIT OR Apache-2.0`, png-spark
-copyright retained); Phase 3 and the encoder / interlaced-write surface are dropped rather than
-carried. The crate was renamed to `psd-png` on 2026-09-24; the png-spark names below are what
-was measured and merged, and are left as the historical record.
+**Status:** Phases 1, 2 and 3 implemented on `fused-decode-frontier` with measured evidence
+(see `BENCHMARKS.md`); Phase 4 cancelled. **No upstream PR is planned.** When smart-object PNG
+decode lands in the port, this becomes a decoder-only vendored crate under our own name
+(`psd-png`, vendored as `crates/psd-png`; `MIT OR Apache-2.0`, png-spark copyright retained);
+the encoder is dropped rather than carried. The crate was renamed to `psd-png` on 2026-09-24;
+the png-spark names below are what was measured and merged, and are left as the historical
+record.
 
 ---
 
@@ -400,16 +400,26 @@ See §3.2's implemented revision: shipped as an output-budget mid-block pause (`
 7. **Tests:** streaming roundtrip vs the existing decoder over the whole corpus; a streaming fuzz
    target; a memory-bound test (large header + `max_decompressed_size(None)` decodes in O(width)).
 
-### Phase 3 — fused conversion + callback metadata
+### Phase 3 — fused conversion + callback metadata — DONE, narrowed (`9443e5b`)
 
 8. Row callback carrying native layout (and `(pass, x, y)` for Adam7); `decode_to_rgba8` /
    `decode_to_rgb8` adapters reusing `src/transform.rs` row helpers.
 9. **Consumer validation:** wire the port's `decode_source_raster` to the callback form (one pass
    to planar channels) and measure end-to-end.
 
-### Phase 4 — upstream contact
+Shipped as `decode_to_rgba8` / `_rgb8` / `_rgba16` / `_rgb16`, one `RowConverter` shared with
+`to_rgba8`/`to_rgb8`. The 16-bit variants were added beyond this sketch, because the port's
+`BitDepth` boundary refuses to widen a sample and a downconvert here would be unrecoverable.
+Step 8's Adam7 `(pass, x, y)` metadata was **not** built: interlaced images take the buffered
+fallback and are emitted in file order like every other row, which is what a consumer wants.
+Step 9 is the port's work and has not started — see the crate's `TODO.md` items I1–I6 and V1–V3.
+
+### Phase 4 — upstream contact — CANCELLED 2026-09-24
 
 10. Only after the port team agrees. See §9.
+
+The port team decided against an upstream PR: the crate is a hard fork from here, vendored into
+the port workspace under its own name.
 
 ---
 

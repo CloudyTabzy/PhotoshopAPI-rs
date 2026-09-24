@@ -98,6 +98,7 @@ methodology, tables and caveats are in `BENCHMARKS.md`.
 | A 16384×16384 RGBA image (1.07 GB filtered) | refused by `decode` under the default ceiling; streams through `decode_to` in a ~300 KB stage |
 | Full RGBA8 deliverable vs png-spark 0.2.0 (`decode` + `to_rgba8` there, `decode_to_rgba8` here) | **4.6 % to 25.1 % faster, 9/9, mean 14.7 %** |
 | Cost of the fused conversion on an 8-bit RGBA source | **≤ 1.6 %** — a row copy, no per-pixel work |
+| SIMD `Paeth` vs the scalar two-row wavefront (`PSD_PNG_FORCE_SCALAR=1` vs default) | **8 % to 22 % faster** on `Paeth`-bearing images, unchanged where there is no `Paeth` |
 
 Every PNG in the port's own fixture corpus (12 files, 512×512 and 200×108 RGBA) clears the
 fusion threshold, so the fused path is the one that runs in production rather than a benchmark
@@ -119,6 +120,24 @@ inflation had evicted it. The streaming decoder instead reverses each row in pla
 cursor passes it, held back by DEFLATE's maximum match distance (32 KiB) so that no future match
 can read a byte reconstruction has rewritten. Streams no larger than one window plus one row can
 never trigger this and take the original two-pass path, so small decodes pay nothing.
+
+**`Paeth` is reversed two rows at a time, or one pixel per register.** The serial dependency
+along a row is why `Paeth` is the filter that costs: on its own it reconstructs at around
+800 MB/s, where `Up` manages 28 GB/s. Two schemes fill those idle slots, and this crate has
+both. The scalar one takes two rows offset by a pixel — row *r* pixel *x* and row *r+1* pixel
+*x-1* depend only on values settled before the step, so the two predictions issue together. The
+x86-64 one follows libpng's SSE2 filters and takes the four channels of a single pixel per
+iteration, which is independent of the left neighbour by construction. SIMD was preferred for
+3- and 4-byte strides on measurement (8–22% where `Paeth` rows exist, nothing where they do
+not), and the scalar pair path keeps every other stride. The multi-row and anti-diagonal
+arrangements from Wuffs issue #157 would need several rows in flight at once, which the
+reconstruction frontier and the streaming stage's sizing would both have to grow for; that is
+the next step if the mixed-filter case ever justifies it, not this one. Two details differ from
+libpng, both forced by reconstructing in place: its rows live in padded buffers and may write a
+whole pixel at the last position, where here the bytes after a row are the next row's
+still-filtered data, so this kernel touches only bytes inside its own row; and its stride is a
+runtime value here, so the kernel is chosen per call. `PSD_PNG_FORCE_SCALAR=1` falls back to
+the scalar paths, which is how the two are measured against each other.
 
 **Inflation is pausable, not restartable.** A segment boundary can land mid-block, so resuming
 requires the bit position, the output cursor, and the start of the symbol being processed — a
@@ -149,11 +168,11 @@ without recomputing its checksum.
 
 Safe Rust apart from the inherited narrow places, each with the invariant that justifies it
 written next to it: the literal stores and match reads and copies in the inflate loop, the bit
-writer's eight-byte flush, the SIMD checksum paths, and the fallible zeroed allocation the
-decoder sizes its buffers with. Everything else — chunk parsing, filtering, conversion — is
-bounds-checked. Malformed input is a tested case: the suite feeds truncated files, single-bit
-corruptions at every byte, and thousands of random byte strings through the decoder, and
-requires errors rather than panics.
+writer's eight-byte flush, the SIMD checksum paths, the SIMD `Paeth` filter, and the fallible
+zeroed allocation the decoder sizes its buffers with. Everything else — chunk parsing, filtering,
+conversion — is bounds-checked. Malformed input is a tested case: the suite feeds truncated
+files, single-bit corruptions at every byte, and thousands of random byte strings through the
+decoder, and requires errors rather than panics.
 
 ## Testing
 
@@ -172,9 +191,12 @@ what is new here:
 - `tests/streaming_decode.rs` — row-exact parity with `decode` across large fixtures, corpus
   files and interlaced images; sink-error abort; a 1.07 GB image past the ceiling; corrupt
   streams agreeing between the two paths
-- unit tests in `filter.rs` and `inflate.rs` — the frontier's lag invariant, the slide rule, and
-  segmented-versus-one-shot parity over 224 reference zlib vectors at a stage barely larger than
-  the window
+- unit tests in `filter.rs`, `inflate.rs` and `simd.rs` — the frontier's lag invariant, the slide
+  rule, segmented-versus-one-shot parity over 224 reference zlib vectors at a stage barely larger than
+  the window, and the SIMD `Paeth` kernel against the scalar predictor at every stride it claims
+  and every length including the tails and the extremes where a lane-wise port diverges. The whole
+  suite passes with the kernel in force and with `PSD_PNG_FORCE_SCALAR=1`, so the two paths are
+  held to the same bytes.
 
 The corpus is produced by a reference implementation rather than by this crate, so the tests
 check the format and not just self-consistency. Three fuzz targets (`decode`, `inflate`,

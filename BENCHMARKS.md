@@ -267,16 +267,94 @@ design's remaining ceiling is the codec, not the decode path around it.
 - Segment size targets 256 KiB of new filtered bytes per segment (encoder-band-sized); the stage is
   window + segment + four rows of headroom + slack.
 
-## 7. Reproduce
+## 7. SIMD `Paeth`: measured against the scalar two-row wavefront
+
+### Why this kernel, and not another
+
+`bench/src/bin/stage_split.rs` times inflation alone against a whole decode on the same bytes,
+and counts the filter bytes in between:
+
+| fixture | filter mix (rows) | inflate | decode | ratio | unfilter (cold) |
+|---|---|---:|---:|---:|---:|
+| rgba8_photo_3840x2400 | **2400 Paeth** | 18.0 ms | 48.6 ms | 2.70x | 44.5 ms |
+| rgb8_photo_2048 | **2048 Paeth** | 6.6 ms | 17.2 ms | 2.61x | 14.5 ms |
+| rgba8_gradient_1024 | **1024 Paeth** | 1.8 ms | 5.2 ms | 2.85x | 5.0 ms |
+| rgba8_mixed_1024 | mixed, 438 Paeth | 3.2 ms | 4.2 ms | 1.33x | 2.6 ms |
+| rgba8_noise_1024 | 1024 Up | 2.0 ms | 2.2 ms | 1.08x | 0.3 ms |
+| rgba16_gradient_1024 | 1024 Up | 3.8 ms | 1.9 ms | 0.51x | 0.5 ms |
+
+Reconstruction is **not** hidden inside inflation: the fused frontier runs it inline, between
+decode-loop iterations, so the cost is exposed and the only thing the fusion saves versus the old
+two-pass decoder is cache locality — 44.5 ms cold against roughly 30 ms hot on the 4K fixture,
+which is the −8.9% of §3. And within reconstruction, everything is `Paeth`: at 790 MB/s against
+inflation's ~2000 MB/s it is the whole cost where it appears, and on `Up`/`Sub` images it is
+invisible. That is why the kernel targets `Paeth` and not the other filters, and why the
+expectation is data-dependent rather than uniform.
+
+### The kernel
+
+libpng's SSE2 filters (`intel/filter_sse2_intrinsics.c`, from libpng PR #88), not the multi-row
+or anti-diagonal arrangements in Wuffs issue #157: one row at a time, four bytes per iteration,
+`p - a` and `p - b` reduced to two differences before widening to 16-bit lanes, `packus` against
+a one-lane-shifted copy of itself to narrow back, and the specification's a→b→c tie-break kept
+exactly. Two adaptations, both forced by reconstructing in place rather than into a padded
+per-row buffer: the kernel writes only bytes inside its own row, and the stride is a runtime
+value so the kernel is chosen per call. The scalar two-row wavefront stays for every other
+stride.
+
+### Results
+
+`PSD_PNG_FORCE_SCALAR=1` against the default, `decode_to_rgba8`, interleaved per round with a
+control arm running the default a second time, 6 rounds, per-fixture minimum:
+
+| fixture | scalar ms | SIMD ms | delta | control noise |
+|---|---:|---:|---:|---:|
+| rgba8_photo_3840x2400 (35 MiB, all Paeth) | 50.30 | 39.03 | **−22.4 %** | +2.3 % |
+| rgba8_tall_64x4096 (all Paeth) | 1.30 | 1.05 | −19.2 % | +0.0 % |
+| rgba8_wide_4096x96 (all Paeth) | 2.09 | 1.67 | −20.1 % | −1.2 % |
+| rgba8_gradient_1024 (all Paeth) | 5.39 | 4.27 | −20.8 % | +0.7 % |
+| rgba8_mixed_1024 | 4.38 | 3.89 | −11.2 % | +0.5 % |
+| rgb8_photo_2048 (3-byte stride) | 20.83 | 18.67 | −10.4 % | +0.1 % |
+| rgba8_noise_1024 (all Up) | 2.26 | 2.22 | −1.8 % | +0.9 % |
+| rgba16_gradient_1024 (all Up) | 2.50 | 2.44 | −2.4 % | +0.0 % |
+| gray8_gradient_1600 (all Sub) | 3.54 | 3.54 | +0.0 % | +0.0 % |
+
+Mean −12.0 %, and the three `Up`/`Sub` fixtures sit inside the control noise, which is the shape
+the filter mix predicts. On the port's own twelve PNGs — mixed, about 200–350 `Paeth` rows of
+512, 1 MiB each — the same measurement gives **−8.1 % to −15.9 %, mean −12.4 %**, control noise
+at or below 2.2 % on every file.
+
+For scale: the 4K fixture's `decode_to_rgba8` was 49.48 ms in §6 and is 39.03 ms now, so the
+kernel is worth more than everything §3's fusion and §6's fused conversion gained on that file
+put together.
+
+Two bugs the kernel's own parity tests caught during development, both the kind a SIMD port
+exists to have caught: `packus` against itself interleaves the lanes, so the third channel of
+every pixel was being written as a duplicate of the second; and the load had to be widened
+through `unpacklo_epi8` before the 16-bit arithmetic, since the loaded vector holds four
+adjacent bytes rather than four lanes. The tie-break mutation (swapping the `a` and `b`
+preference) fails three tests, so that property is genuinely pinned.
+
+## 8. Reproduce
 
 ```sh
 python3 tools/gen_testdata.py       # reference corpus
 python3 tools/gen_large_fixtures.py # this document's fixtures
 python3 tools/gen_bomb_fixture.py   # the size-ceiling fixture (§6)
 cargo test -j 2
-cargo run --release -p png-spark-bench --bin profile -- tmp/large
-cargo run --release -p png-spark-bench --bin stream_decode -- tmp/large
+cargo run --release -p psd-png-bench --bin profile -- tmp/large
+cargo run --release -p psd-png-bench --bin stream_decode -- tmp/large
+cargo run --release -p psd-png-bench --bin stage_split -- tmp/large
+
+# the SIMD arm against the scalar one, in the same session (§7)
+PSD_PNG_FORCE_SCALAR=1 cargo run --release -p psd-png-bench --bin stream_decode -- tmp/large
 ```
 
-The A/B harnesses live outside the repo (`%TEMP%\opencode\ab_decode.py`, `ab_small.py`); the
-`main` arm was built from a `git worktree` of `6d256fc` at `..\png-spark-main`.
+The A/B harnesses live outside the repo (`%TEMP%\opencode\ab_decode.py`, `ab_small.py`,
+`ab_convert.py`, `ab_stream3.py`, `ab_simd.py`); the `main` arm was built from a `git worktree`
+of `6d256fc` at `..\png-spark-main`. The `main` arm's `convert_bench` copy is untracked there,
+since that worktree is read-only for our purposes.
+
+`cargo test` is also a two-arm gate: `PSD_PNG_FORCE_SCALAR=1 cargo test -j 2` runs the whole suite
+against the scalar paths, and both must be green, which is what holds the two implementations to
+the same bytes.
