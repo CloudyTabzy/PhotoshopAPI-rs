@@ -981,6 +981,24 @@ impl<T: BitDepth> LayeredFile<T> {
         Ok(paths)
     }
 
+    /// The document's artboard tool settings (the document-level `artd`
+    /// block), parsed on demand.
+    pub fn artboard_settings(&self) -> Result<Option<psd_core::ArtboardSettings>> {
+        self.document_blocks
+            .as_ref()
+            .and_then(|blocks| blocks.get(TaggedBlockKey::new(*b"artd")))
+            .map(|block| psd_core::ArtboardSettings::read(&block.data))
+            .transpose()
+    }
+
+    /// Ids of the artboard groups, in arena (id) order.
+    pub fn artboards(&self) -> Vec<LayerId> {
+        self.layers_with_ids()
+            .filter(|(_, layer)| layer.is_artboard())
+            .map(|(id, _)| id)
+            .collect()
+    }
+
     /// Layers in on-disk record order (groups expanded in place, group
     /// records after their contents, section dividers where they appear).
     pub fn flatten(&self) -> Vec<LayerId> {

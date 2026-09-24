@@ -10,7 +10,9 @@
 //! state stays in the preserved record fields and tagged blocks so unknown
 //! bits round-trip.
 
+use psd_core::artboard::is_artboard_key;
 use psd_core::vector::is_vector_mask_key;
+use psd_core::Artboard;
 use psd_core::{
     AdditionalLayerInfo, AdjustmentBlock, AdjustmentKind, BeReader, BlendMode, Compression,
     LayerBlendingRanges, LayerColor, LayerEffectsBlock, LayerFlags, LayerMask, LayerMaskData,
@@ -382,6 +384,35 @@ impl<T: BitDepth> Layer<T> {
                 || AdjustmentKind::from_key(block.key).is_some_and(AdjustmentKind::is_fill);
         }
         mask && fill
+    }
+
+    /// Whether the layer is an artboard: a group whose record carries an
+    /// artboard block (`artb`, `artd`, or `abdd`). Artboards stay
+    /// [`LayerKind::Group`] layers in the tree, so every group API applies.
+    pub fn is_artboard(&self) -> bool {
+        matches!(self.kind, LayerKind::Group(_))
+            && self
+                .blocks
+                .blocks
+                .iter()
+                .any(|block| is_artboard_key(block.key))
+    }
+
+    /// This group's artboard data, parsed on demand; `None` for other layers.
+    /// The raw block remains the write source.
+    pub fn artboard(&self) -> Result<Option<Artboard>> {
+        if !matches!(self.kind, LayerKind::Group(_)) {
+            return Ok(None);
+        }
+        match self
+            .blocks
+            .blocks
+            .iter()
+            .find(|block| is_artboard_key(block.key))
+        {
+            Some(block) => Artboard::read(block),
+            None => Ok(None),
+        }
     }
 
     // ------------------------------------------------------------------

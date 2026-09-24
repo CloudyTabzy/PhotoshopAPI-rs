@@ -7,9 +7,9 @@ cargo run -p psd --example generate_fixtures
 ```
 
 They cover format features that the Photoshop-saved corpus in `../documents/`
-does not contain: adjustment, fill, and shape layers. The generator is
-deterministic: running it again with unchanged code reproduces every file byte
-for byte.
+does not contain: adjustment, fill, and shape layers, and artboards. The
+generator is deterministic: running it again with unchanged code reproduces
+every file byte for byte.
 
 Payload layouts follow what Photoshop writes. The sources are the Adobe PSD/PSB
 specification and Photoshop-saved samples. The documents were also checked with
@@ -60,3 +60,21 @@ The documents also store a work path (image resource 1025), a saved path
 `Outline` (resource 2000), and a `pths` block that gives the saved path the
 Unicode name `Outline ✓`. In the PSB, `pths` uses the `8B64` signature and an
 8-byte length, as Photoshop writes it.
+
+## Artboards/
+
+`artboards_8bit.psd` and `artboards_8bit.psb` are 128×64 RGB documents. As in
+Photoshop, each artboard is a layer group whose group record carries an `artb`
+descriptor.
+
+- `Plain Group`, an ordinary group with one pixel layer. It is not an
+  artboard.
+- `Artboard Left`, a white artboard spanning (0, 0)–(60, 50) with the preset
+  name `Icon 60`. It holds one pixel layer.
+- `Artboard Right`, an artboard spanning (68, 0)–(128, 50) with a custom
+  background color and one guide index. It holds a nested plain group,
+  `Inner Group`.
+
+The documents also carry the artboard tool settings in the document-level
+`artd` block. In the PSB, `artd` uses the `8B64` signature and an 8-byte
+length.

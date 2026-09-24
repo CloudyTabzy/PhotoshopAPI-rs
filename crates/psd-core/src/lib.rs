@@ -16,13 +16,14 @@
 //! - [`photoshop_file`]: the five sections read/written in order (`PhotoshopFile/PhotoshopFile.h`)
 //! - [`tagged_blocks`]: 4-char-keyed additional-layer-info registry with raw passthrough (`Core/TaggedBlocks/`)
 //! - [`descriptor`], [`engine_data`]: Photoshop's action-descriptor and text-engine formats (`Core/Struct/`)
-//! - [`text_tool`], [`placed_layer`], [`linked_layer`], [`layer_effects`], [`adjustments`], [`vector`]: typed views over text, placed/linked data, effect blocks, adjustment/fill settings, and vector paths/shapes
+//! - [`text_tool`], [`placed_layer`], [`linked_layer`], [`layer_effects`], [`adjustments`], [`vector`], [`artboard`]: typed views over text, placed/linked data, effect blocks, adjustment/fill settings, vector paths/shapes, and artboards
 //! - `serialize` (feature `serde`): `Serialize` views of descriptors and EngineData (upstream `to_json`)
 //!
 //! Codec math lives in `psd-codecs`; the document API lives in `psd`. This crate
 //! does no IO of its own — readers consume `&[u8]`, writers produce `Vec<u8>`.
 
 pub mod adjustments;
+pub mod artboard;
 mod color_mode_data;
 pub mod descriptor;
 pub mod engine_data;
@@ -47,6 +48,7 @@ pub mod vector;
 mod views;
 
 pub use adjustments::{AdjustmentBlock, AdjustmentData, AdjustmentKind, AdjustmentPreset};
+pub use artboard::{Artboard, ArtboardBackground, ArtboardRect, ArtboardSettings};
 pub use color_mode_data::ColorModeData;
 pub use descriptor::{
     read_item, write_item, Descriptor, DescriptorIntegerSpan, DescriptorItem, DescriptorKey,

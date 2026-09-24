@@ -12,6 +12,23 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-09-24
+
+### Added
+
+- Artboards can be read. `Layer::is_artboard` and `Layer::artboard` expose a
+  group's artboard block (`artb`, `artd`, or `abdd`): its rectangle, preset
+  name, background type and color, and guide indices.
+  `LayeredFile::artboards` lists the artboard groups, and
+  `LayeredFile::artboard_settings` reads the document-level `artd` tool
+  settings.
+- Artboards stay group layers in the layer tree. Every group operation applies
+  to them, and saving writes their blocks unchanged. Upstream also round-trips
+  artboards as groups with opaque data.
+- A generated test corpus in `fixtures/generated/Artboards` covers two
+  artboards, a nested group, a plain group, and the document settings, in
+  8-bit PSD and PSB.
+
 ## [0.6.4] - 2026-09-24
 
 ### Added
