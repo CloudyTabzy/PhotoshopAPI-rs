@@ -105,7 +105,7 @@ ceiling to be what refuses it.
 
 Measured against png-spark 0.2.0, interleaved best-of-N in a single session because the
 measurement machine thermally throttles; the noise floor measured the same way is ±0.00%. Full
-methodology, tables and caveats are in `BENCHMARKS.md`.
+methodology, tables and caveats are in [`docs/benchmarks.md`](docs/benchmarks.md).
 
 | | result |
 | --- | --- |
