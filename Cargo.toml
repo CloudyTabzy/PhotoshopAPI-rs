@@ -6,7 +6,7 @@ members = ["crates/psd-core", "crates/psd-codecs", "crates/psd", "crates/psd-py"
 edition = "2021"
 license = "BSD-3-Clause"
 # The single project version; bump it with every CHANGELOG.md entry.
-version = "0.6.5"
+version = "0.6.6"
 
 # Dependency versions are centralized here; crates pull them in with
 # `workspace = true`.

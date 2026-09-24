@@ -27,6 +27,9 @@ use crate::layer::{GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Rect, Text
 use crate::progress::{ignore_progress, ProgressEvent};
 use crate::text::TextCacheBaseline;
 
+/// The name Photoshop gives the bounding section divider of a group.
+const DIVIDER_NAME: &str = "</Layer group>";
+
 fn absolute_or_current_dir(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -1336,7 +1339,13 @@ impl<T: BitDepth> LayeredFile<T> {
                 data: payload,
             });
         }
+        // Photoshop names the divider in `luni` as well (upstream writes an
+        // empty `luni`). Without it, re-saving a read document added the block
+        // the first save had left out, so the two saves differed.
+        let mut name = BeWriter::new();
+        UnicodeString::new(DIVIDER_NAME, 4)?.write_verbatim(&mut name)?;
         let mut blocks = AdditionalLayerInfo::new();
+        blocks.push(TaggedBlock::new(TaggedBlockKey::LUNI, name.into_inner()));
         blocks.push(TaggedBlock::new(
             TaggedBlockKey::LSCT,
             SectionDivider::BoundingSection
@@ -1345,7 +1354,7 @@ impl<T: BitDepth> LayeredFile<T> {
                 .to_vec(),
         ));
         let record = LayerRecord {
-            name: PascalString::new("</Layer group>", 4),
+            name: PascalString::new(DIVIDER_NAME, 4),
             top: bounds.top,
             left: bounds.left,
             bottom: bounds.bottom,

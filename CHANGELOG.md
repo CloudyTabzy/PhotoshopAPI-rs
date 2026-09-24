@@ -12,6 +12,28 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-09-24
+
+### Added
+
+- A corpus regression test runs every document under `fixtures/` through
+  named checks:
+  - read;
+  - every on-demand view;
+  - write-and-reread equality of header fields, layer metadata, tagged
+    blocks, and decoded pixels;
+  - byte stability across a second save.
+
+  Failures are compared with a pinned list. A new failure and an unexpected
+  pass both fail the suite by name. The list is empty today. Setting
+  `PSD_EXTRA_CORPUS` sweeps another directory with the same checks.
+
+### Fixed
+
+- The section-divider record written for a new group now carries the `luni`
+  name block that Photoshop writes. Before this fix, re-saving a document read
+  back from such a save added the block, so the two saves differed.
+
 ## [0.6.5] - 2026-09-24
 
 ### Added
