@@ -10,11 +10,12 @@
 //! state stays in the preserved record fields and tagged blocks so unknown
 //! bits round-trip.
 
+use psd_core::vector::is_vector_mask_key;
 use psd_core::{
     AdditionalLayerInfo, AdjustmentBlock, AdjustmentKind, BeReader, BlendMode, Compression,
     LayerBlendingRanges, LayerColor, LayerEffectsBlock, LayerFlags, LayerMask, LayerMaskData,
     LayerMaskFlags, PlacedLayer, PlacedLayerData, PsdError, Result, SectionDivider, TaggedBlock,
-    TaggedBlockKey,
+    TaggedBlockKey, VectorBlock, VectorMask,
 };
 
 use crate::bitdepth::BitDepth;
@@ -342,6 +343,45 @@ impl<T: BitDepth> Layer<T> {
             .iter()
             .filter_map(|block| AdjustmentBlock::read(block).transpose())
             .collect()
+    }
+
+    /// Every vector block (`vmsk`/`vsms` masks, `vstk` strokes, `vscg`
+    /// content, `vogk` origination) in source order, parsed on demand. The
+    /// raw blocks remain the write source. A malformed or unsupported payload
+    /// is an error.
+    pub fn vector_blocks(&self) -> Result<Vec<VectorBlock>> {
+        self.blocks
+            .blocks
+            .iter()
+            .filter_map(|block| VectorBlock::read(block).transpose())
+            .collect()
+    }
+
+    /// The layer's vector mask (`vmsk`, or `vsms` from Photoshop CS6 on),
+    /// parsed on demand. Path points are fractions of the document size.
+    pub fn vector_mask(&self) -> Result<Option<VectorMask>> {
+        self.blocks
+            .blocks
+            .iter()
+            .find(|block| is_vector_mask_key(block.key))
+            .map(|block| VectorMask::read(&block.data))
+            .transpose()
+    }
+
+    /// Whether the layer is a shape layer: a vector mask together with a fill
+    /// (`SoCo`/`GdFl`/`PtFl`, or `vscg` from Photoshop CS6 on). A pixel layer
+    /// with a vector mask is not a shape layer. Upstream classifies any layer
+    /// with `vogk`, `vmsk`, `vstk`, or `vscg` as a shape, but only after its
+    /// adjustment check, which already claims every `SoCo` layer.
+    pub fn is_shape_layer(&self) -> bool {
+        let mut mask = false;
+        let mut fill = false;
+        for block in &self.blocks.blocks {
+            mask |= is_vector_mask_key(block.key);
+            fill |= block.key.as_bytes() == *b"vscg"
+                || AdjustmentKind::from_key(block.key).is_some_and(AdjustmentKind::is_fill);
+        }
+        mask && fill
     }
 
     // ------------------------------------------------------------------

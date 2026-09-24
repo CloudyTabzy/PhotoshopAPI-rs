@@ -7,8 +7,9 @@ cargo run -p psd --example generate_fixtures
 ```
 
 They cover format features that the Photoshop-saved corpus in `../documents/`
-does not contain. The generator is deterministic: running it again with unchanged
-code reproduces every file byte for byte.
+does not contain: adjustment, fill, and shape layers. The generator is
+deterministic: running it again with unchanged code reproduces every file byte
+for byte.
 
 Payload layouts follow what Photoshop writes. The sources are the Adobe PSD/PSB
 specification and Photoshop-saved samples. The documents were also checked with
@@ -35,4 +36,27 @@ not as rendering references.
 
 Brightness/Contrast, Levels, and Curves also carry a `CgEd` block, as
 Photoshop writes them. `Curves` has a pixel mask, and `Hue/Saturation` is
-clipped to the layer below it.
+clipped to the layer below it. As in Photoshop, every adjustment and fill
+layer marks its pixel data as irrelevant.
+
+## Vectors/
+
+`vector_shapes_8bit.psd` and `vector_shapes_8bit.psb` are 64×64 RGB
+documents. Each shape layer carries pixels rasterized from its path, and, as
+in Photoshop, marks them as derived data.
+
+- `Background`, a flat gray pixel layer.
+- `Legacy Rectangle`, a shape in the pre-CS6 form: a `SoCo` fill, a `vmsk`
+  rectangle of unlinked corner knots, and a `vogk` rectangle entry.
+- `Ellipse`, a shape in the CS6 form: `vscg` (solid fill), a `vsms` ellipse
+  of linked knots, a dashed `vstk` stroke, and a `vogk` ellipse entry.
+- `Frame`, a compound shape: an outer rounded rectangle (combine) minus an
+  inner rectangle (subtract). Each subpath points at its own `vogk` entry.
+- `Open Line`, an open two-knot subpath drawn by a stroke with fill disabled.
+- `Masked Pixels`, a pixel layer with an inverted, unlinked `vmsk` triangle.
+  This is not a shape layer.
+
+The documents also store a work path (image resource 1025), a saved path
+`Outline` (resource 2000), and a `pths` block that gives the saved path the
+Unicode name `Outline ✓`. In the PSB, `pths` uses the `8B64` signature and an
+8-byte length, as Photoshop writes it.

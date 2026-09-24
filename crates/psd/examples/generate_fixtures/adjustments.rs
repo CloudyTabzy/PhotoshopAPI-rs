@@ -9,7 +9,8 @@
 use std::path::Path;
 
 use psd::core::{
-    BeWriter, ColorMode, DescriptorValue, TaggedBlock, TaggedBlockKey, UnicodeString, Version,
+    BeWriter, ColorMode, DescriptorValue, LayerFlags, TaggedBlock, TaggedBlockKey, UnicodeString,
+    Version,
 };
 use psd::{BitDepth, ChannelKey, Layer, LayeredFile, Rect};
 
@@ -81,6 +82,9 @@ fn document<T: BitDepth>(version: Version) -> psd::core::Result<LayeredFile<T>> 
     ];
     for (name, blocks) in layers {
         let mut layer = Layer::<T>::new_image(name, Rect::default());
+        // Photoshop marks adjustment and fill pixels as derived data.
+        layer.flags =
+            LayerFlags::from_bits(LayerFlags::BIT4_USEFUL | LayerFlags::PIXEL_DATA_IRRELEVANT);
         for (key, data) in blocks {
             layer
                 .blocks

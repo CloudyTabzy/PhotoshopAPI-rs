@@ -16,7 +16,7 @@
 //! - [`photoshop_file`]: the five sections read/written in order (`PhotoshopFile/PhotoshopFile.h`)
 //! - [`tagged_blocks`]: 4-char-keyed additional-layer-info registry with raw passthrough (`Core/TaggedBlocks/`)
 //! - [`descriptor`], [`engine_data`]: Photoshop's action-descriptor and text-engine formats (`Core/Struct/`)
-//! - [`text_tool`], [`placed_layer`], [`linked_layer`], [`layer_effects`], [`adjustments`]: typed views over text, placed/linked data, effect blocks, and adjustment/fill settings
+//! - [`text_tool`], [`placed_layer`], [`linked_layer`], [`layer_effects`], [`adjustments`], [`vector`]: typed views over text, placed/linked data, effect blocks, adjustment/fill settings, and vector paths/shapes
 //! - `serialize` (feature `serde`): `Serialize` views of descriptors and EngineData (upstream `to_json`)
 //!
 //! Codec math lives in `psd-codecs`; the document API lives in `psd`. This crate
@@ -43,6 +43,8 @@ pub mod strings;
 pub mod tagged_blocks;
 pub mod text_tool;
 pub mod types;
+pub mod vector;
+mod views;
 
 pub use adjustments::{AdjustmentBlock, AdjustmentData, AdjustmentKind, AdjustmentPreset};
 pub use color_mode_data::ColorModeData;
@@ -86,3 +88,4 @@ pub use text_tool::{
     parse_text_engine_data, TypeToolDescriptorSpans, TypeToolTaggedBlock, TypeToolTextPayloadSpans,
 };
 pub use types::{FixedFloat4, RawColor};
+pub use vector::{DocumentPath, VectorBlock, VectorData, VectorMask, VectorPath};

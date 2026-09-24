@@ -23,11 +23,15 @@
 //! padding or newer data, remain in `trailing_bytes`.
 
 use crate::descriptor::{Descriptor, DescriptorKey, DescriptorValue};
-use crate::error::{PsdError, Result};
+use crate::error::Result;
 use crate::io::BeReader;
 use crate::strings::UnicodeString;
 use crate::tagged_blocks::{TaggedBlock, TaggedBlockKey};
 use crate::types::RawColor;
+use crate::views::{
+    enumerator, four_cc, invalid, next_is, number, raw_data, read_versioned_descriptor, trailing,
+    unsupported,
+};
 
 /// The adjustment or fill a tagged block describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1126,51 +1130,6 @@ impl ContentGenerator {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Read the `u32` descriptor version (16) and the descriptor that follows.
-fn read_versioned_descriptor(reader: &mut BeReader) -> Result<Descriptor> {
-    if reader.u32()? != 16 {
-        return Err(unsupported(reader));
-    }
-    Descriptor::read(reader)
-}
-
-fn trailing(reader: &mut BeReader) -> Result<Vec<u8>> {
-    Ok(reader.take(reader.remaining())?.to_vec())
-}
-
-fn next_is(reader: &BeReader, marker: &[u8; 4]) -> bool {
-    let mut probe = reader.clone();
-    probe.take(4).is_ok_and(|bytes| bytes == marker)
-}
-
-fn four_cc(reader: &mut BeReader) -> Result<[u8; 4]> {
-    let mut code = [0; 4];
-    code.copy_from_slice(reader.take(4)?);
-    Ok(code)
-}
-
-/// A numeric descriptor item, whether stored as `long`, `doub`, or `UntF`.
-fn number(descriptor: &Descriptor, key: &str) -> Option<f64> {
-    match descriptor.get(key)? {
-        DescriptorValue::Integer(value) => Some(f64::from(*value)),
-        DescriptorValue::LargeInteger(value) => Some(*value as f64),
-        DescriptorValue::Double(value) => Some(*value),
-        DescriptorValue::UnitFloat { value, .. } => Some(*value),
-        _ => None,
-    }
-}
-
-fn enumerator<'a>(descriptor: &'a Descriptor, key: &str) -> Option<&'a DescriptorKey> {
-    descriptor.get(key)?.as_enum().map(|(_, value)| value)
-}
-
-fn raw_data<'a>(descriptor: &'a Descriptor, key: &str) -> Option<&'a [u8]> {
-    match descriptor.get(key)? {
-        DescriptorValue::RawData { data, .. } => Some(data),
-        _ => None,
-    }
-}
-
 fn preset<'a>(
     descriptor: &'a Descriptor,
     kind_key: &str,
@@ -1179,17 +1138,6 @@ fn preset<'a>(
     let kind = number(descriptor, kind_key);
     let file_name = descriptor.get(name_key).and_then(DescriptorValue::as_str);
     (kind.is_some() || file_name.is_some()).then_some(AdjustmentPreset { kind, file_name })
-}
-
-fn unsupported(reader: &BeReader) -> PsdError {
-    invalid(reader, "unsupported adjustment payload version")
-}
-
-fn invalid(reader: &BeReader, message: &'static str) -> PsdError {
-    PsdError::InvalidData {
-        offset: reader.position() as u64,
-        message,
-    }
 }
 
 #[cfg(test)]

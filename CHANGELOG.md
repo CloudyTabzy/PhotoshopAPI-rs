@@ -12,6 +12,39 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-09-24
+
+### Added
+
+- Layers expose read-only typed views of vector data:
+  - Vector masks (`vmsk`, and `vsms` from Photoshop CS6 on) expose their
+    invert, unlink, and disable flags.
+  - Paths expose typed records: subpaths with their shape operation and
+    origination index, Bézier knots with pixel conversion, and fill-rule and
+    clipboard records.
+  - Shape stroke styles (`vstk`), CS6 shape fills (`vscg`), and live-shape
+    parameters (`vogk`) expose shape type, bounds, corner radii, and
+    transform.
+
+  Unknown path records, descriptor fields, and trailing bytes remain
+  available, and saving still writes the original blocks.
+- `Layer::vector_blocks`, `Layer::vector_mask`, and `Layer::is_shape_layer`
+  read a layer's vector data. A shape layer has both a vector mask and a fill,
+  so a pixel layer with a vector mask is not a shape. Upstream classifies any
+  layer with vector origination, mask, or stroke data as a shape, but only
+  after its adjustment check has already claimed every `SoCo` layer.
+- `LayeredFile::document_paths` reads the work path and the saved paths from
+  the image resources, including each saved path's Unicode name from the
+  document's `pths` block.
+- A generated test corpus in `fixtures/generated/Vectors` covers legacy and
+  CS6 shape layers, a compound path, an open path, a vector-masked pixel layer,
+  and document paths, in 8-bit PSD and PSB.
+
+### Changed
+
+- The generated adjustment fixtures mark their pixel data as irrelevant, as
+  Photoshop does for adjustment and fill layers.
+
 ## [0.6.2] - 2026-09-24
 
 ### Added

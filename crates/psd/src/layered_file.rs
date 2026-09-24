@@ -938,6 +938,49 @@ impl<T: BitDepth> LayeredFile<T> {
             .collect())
     }
 
+    /// The work path and saved paths stored in the image resources, in
+    /// resource order, parsed on demand. When the document's `pths` block
+    /// lists exactly one name per saved path, each saved path also carries
+    /// its Unicode name. The resources stay the write source.
+    pub fn document_paths(&self) -> Result<Vec<psd_core::vector::DocumentPath>> {
+        use psd_core::vector::{
+            DocumentPath, PathNames, SAVED_PATH_RESOURCE_IDS, WORK_PATH_RESOURCE_ID,
+        };
+        let mut paths = Vec::new();
+        for block in self.image_resources.blocks() {
+            let psd_core::ResourceBlock::Raw(raw) = block else {
+                continue;
+            };
+            if raw.id == WORK_PATH_RESOURCE_ID || SAVED_PATH_RESOURCE_IDS.contains(&raw.id) {
+                paths.push(DocumentPath {
+                    resource_id: raw.id,
+                    name: raw.name.value().to_owned(),
+                    unicode_name: None,
+                    path: psd_core::VectorPath::read(&raw.data)?,
+                });
+            }
+        }
+        let names = self
+            .document_blocks
+            .as_ref()
+            .and_then(|blocks| blocks.get(TaggedBlockKey::new(*b"pths")))
+            .map(|block| PathNames::read(&block.data))
+            .transpose()?;
+        if let Some(names) = names {
+            let names = names.names();
+            let mut saved: Vec<_> = paths
+                .iter_mut()
+                .filter(|path| !path.is_work_path())
+                .collect();
+            if names.len() == saved.len() {
+                for (path, name) in saved.iter_mut().zip(names) {
+                    path.unicode_name = name.map(str::to_owned);
+                }
+            }
+        }
+        Ok(paths)
+    }
+
     /// Layers in on-disk record order (groups expanded in place, group
     /// records after their contents, section dividers where they appear).
     pub fn flatten(&self) -> Vec<LayerId> {
