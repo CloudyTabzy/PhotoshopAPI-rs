@@ -6,6 +6,26 @@ no `repository` URL, so no version headings carry compare links.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-25
+
+### Changed
+
+- The two long-form documents moved into `docs/` and were rewritten as documents rather than
+  development logs. `docs/design.md` describes the decoder as built — the pipeline, the
+  reconstruction frontier and its lag invariant, the streaming stage, the fused conversion,
+  the SIMD kernel, the size ceilings, the checksum policy, interlaced handling and the
+  defences against a hostile header. `docs/benchmarks.md` carries the methodology and every
+  measurement. Both were previously organised by implementation phase and mixed proposal with
+  outcome, which made them hard to read as descriptions of the crate and easy to misread as
+  current when they were not.
+
+### Fixed
+
+- The design document recorded predictions that measurement had since overtaken, most
+  seriously a rejected SIMD-filtering option that became the single largest win. The
+  appendix now sets every original estimate against what was measured and names the
+  estimate that was wrong, instead of leaving a forward-looking table in place of a result.
+
 ## [0.2.1] - 2026-09-25
 
 Documentation only. No code, API or measurement changed.
