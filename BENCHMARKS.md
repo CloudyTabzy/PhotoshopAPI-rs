@@ -1,8 +1,9 @@
-# Evidence: fused scanline reconstruction (Phase 1, branch `fused-decode-frontier`)
+# Evidence: fused scanline reconstruction + streaming decode (branch `fused-decode-frontier`)
 
 **Provenance:** written by the PhotoshopAPI-rs port team. This document is **ours**, not upstream
 png-spark; it lives in this working checkout so the implementing agent has everything in one place.
-**Subject:** commit `ec53075` + `0dbc3dc` on `fused-decode-frontier` (base `6d256fc`, main at PR #1).
+**Subject:** Phase 1 (commits `ec53075`, `0dbc3dc`) + Phase 2 (commit pending, "decode: add
+streaming decode_to") on `fused-decode-frontier` (base `6d256fc`, main at PR #1).
 **Companion documents:** `DESIGN-banded-decode.md` (proposal), `TODO.md` (tracking, gitignored).
 
 ---
@@ -116,7 +117,71 @@ the fired-mid-inflation assertions exist.
 
 Not run here: `cargo fuzz` targets (need nightly + cargo-fuzz; the `inflate` and `decode` targets
 should pass unchanged since `()`-hook entry points compile to the old loop, but they should be run
-before any upstream PR).
+before any upstream PR). Miri: green for the filter/frontier layers; the inflate core's segmented
+variant is not Miri-covered on this Windows machine (Miri cannot enumerate directories here, and
+the fs-free inline case exceeds a practical interpreter budget), which upstream CI's Linux Miri
+runs would cover instead.
+
+## 7. Phase 2: streaming `decode_to` (added)
+
+`Decoder::decode_to` delivers reconstructed scanlines through a sink, in file order, in the file's
+native layout, at O(match window + one row + segment) memory — a few hundred kilobytes for ordinary
+images, whatever the decompressed size. The size ceiling that `decode()` enforces does not apply:
+a 16384×16384 RGBA image (~1.07 GB filtered, over the 512 MiB default) is refused by `decode()`
+and streams through `decode_to` in a ~300 KB stage (`tests/streaming_decode.rs`, generator
+`tools/gen_bomb_fixture.py`).
+
+Mechanism, in one paragraph: the decoder inflates into a bounded stage through the new
+`Inflater::zlib_segment`, which pauses at an output budget instead of erroring and hands the caller
+a `SegmentPause` — bit position, output cursor, and whether the pause is mid-block — enough to
+resume exactly, since Huffman tables are rebuilt per block regardless. Between segments the driver
+relocates the last `min(window, written)` bytes to the front of the stage and slides its base,
+keeping one reconstructed row beyond the frontier (the lookback row), and extending a segment by up
+to two rows when the frontier has not caught up. A `StreamingFrontier` reverses each row in place
+where it sits and emits it through the sink, under the same 32 KiB match-window lag as Phase 1.
+Interlaced images take the buffered path and are emitted from the decoded image (v1).
+
+**Correctness gates:** full workspace suite green (16 targets); row-exact parity with `decode()` on
+all 9 large fixtures, 24 corpus files, interlaced included; segmented-vs-one-shot parity over all
+224 reference zlib vectors with a stage barely larger than the window, plus an fs-free inline case
+for Miri-shaped CI; sink-error abort; corrupt streams agree between paths; the size-ceiling bomb
+above. `clippy --all-targets` and `fmt` clean.
+
+**Performance, like-for-like** (sink copies every row into a presized buffer, so both arms deliver
+the same pixels; interleaved in one process, best-of-6 rounds, noise floor ±0.0% as measured in §2):
+
+| fixture | decode ms | decode_to ms | delta |
+|---|---:|---:|---:|
+| rgba8_photo_3840x2400 (36.9 MB) | 47.78 | 49.45 | +3.5 % |
+| rgb8_photo_2048 | 17.30 | 17.53 | +1.3 % |
+| rgba8_gradient_1024 | 5.21 | 5.34 | +2.5 % |
+| rgba8_mixed_1024 | 4.16 | 4.37 | +5.0 % |
+| rgba8_noise_1024 | 2.18 | 2.23 | +2.3 % |
+| rgba8_wide_4096x96 | 2.00 | 2.08 | +4.0 % |
+| rgba8_tall_64x4096 | 1.27 | 1.28 | +0.8 % |
+| gray8_gradient_1600 | 1.01 | 1.06 | +5.0 % |
+| rgba16_gradient_1024 | 1.83 | 2.32 | +26.8 % |
+
+Reading: streaming costs ≤ 5 % against the fused one-shot path on every class measured except
+16-bit gradients (+27 %, an 0.5 ms absolute difference on an 8 MB image — the per-row emission and
+slide traffic show most when inflate itself is nearly free). Against a *discarding* sink, decode_to
+is faster than `decode()` outright, because it never allocates or first-touches the whole image
+buffer — for consumers that resample, convert, or write rows out (the port's planar de-interleave),
+that allocation disappears from the pipeline entirely.
+
+The Adler-32 is not verified by default in either path (`Checks::Crc`), matching upstream policy;
+`Checks::Full` enables it incrementally per segment at the same total cost the one-shot path pays.
+
+### What Phase 2 changed relative to the design doc's §3.2
+
+- The mid-block pause exists (a `SegmentPause` is a bit position plus a flag; the match-refusal
+  path rewinds to the symbol start), so the O(window + rows) memory bound holds for any stream,
+  including single-block streams — the unbounded-block-output hole flagged during review is closed.
+- `Row` carries `index` and `bytes` only; the layout travels on `Info` from `read_info`, so no new
+  public layout type was needed. The sink is `FnMut(Row<'_>) -> Result<(), E>` with `E: From<Error>`,
+  which the doc's sketch under-specified.
+- Segment size targets 256 KiB of new filtered bytes per segment (encoder-band-sized); the stage is
+  window + segment + four rows of headroom + slack.
 
 ## 6. Reproduce
 

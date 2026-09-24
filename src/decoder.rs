@@ -7,7 +7,7 @@ use crate::common::{
 use crate::crc32::crc32;
 use crate::error::Error;
 use crate::filter::unfilter_image;
-use crate::inflate::{Inflater, OUTPUT_SLACK};
+use crate::inflate::{InflateError, Inflater, OUTPUT_SLACK};
 
 /// A decoded image and the description of its pixel layout.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -17,6 +17,15 @@ pub struct Image {
     /// Pixel data in the image's own format, tightly packed, with no filter bytes and no
     /// padding between rows beyond what a sub-byte bit depth requires.
     pub data: Vec<u8>,
+}
+
+/// One scanline of a PNG, delivered by [`Decoder::decode_to`], in the file's native layout
+/// (colour type and bit depth as stored, filter byte removed).
+pub struct Row<'a> {
+    /// The row's index in the output image: `0` is the top scanline.
+    pub index: usize,
+    /// The row's bytes: `row_bytes` of pixel data, as [`Info::row_bytes`] describes.
+    pub bytes: &'a [u8],
 }
 
 impl Image {
@@ -216,8 +225,197 @@ impl Decoder {
 
     /// Decodes a PNG into its native pixel format.
     pub fn decode(&mut self, png: &[u8]) -> Result<Image, Error> {
-        let parsed = self.parse(png)?;
+        let parsed = self.parse(png, true)?;
+        self.decode_parsed(parsed)
+    }
+
+    /// Decodes a PNG one scanline at a time, in file order, in the file's native layout.
+    ///
+    /// `sink` receives each row as it is reconstructed. For a non-interlaced image the
+    /// decoder holds only a bounded stage — the DEFLATE match window plus a segment of
+    /// filtered rows, a few hundred kilobytes for ordinary images — so images far beyond
+    /// [`max_decompressed_size`](Self::max_decompressed_size) decode here that
+    /// [`decode`](Self::decode) must refuse; the ceiling does not apply to streaming.
+    /// Interlaced images are decoded into a buffer first, as they are by `decode`, and
+    /// emitted from there.
+    ///
+    /// A sink error aborts the decode and is returned. Rows already delivered stay
+    /// delivered.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let png = std::fs::read("asset.png")?;
+    /// let mut decoder = png_spark::Decoder::new();
+    /// decoder.decode_to(&png, |row: png_spark::Row<'_>| {
+    ///     println!("row {}: {} bytes", row.index, row.bytes.len());
+    ///     Ok::<(), png_spark::Error>(())
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn decode_to<E, F>(&mut self, png: &[u8], mut sink: F) -> Result<(), E>
+    where
+        F: FnMut(Row<'_>) -> Result<(), E>,
+        E: From<Error>,
+    {
+        let parsed = self.parse(png, false)?;
+        let info = &parsed.info;
+
+        match info.interlacing {
+            Interlacing::None => self.stream_rows(parsed, sink),
+            Interlacing::Adam7 => {
+                // The buffered fallback: streaming an interlaced image needs a
+                // caller-owned scatter target, which this API does not have.
+                let image = self.decode_parsed(parsed)?;
+                let row_bytes = image.info.row_bytes();
+                for index in 0..image.info.height as usize {
+                    sink(Row {
+                        index,
+                        bytes: &image.data[index * row_bytes..(index + 1) * row_bytes],
+                    })?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The streaming core of [`decode_to`](Self::decode_to) for non-interlaced images.
+    ///
+    /// The stage holds the match window plus a segment of filtered rows; the driver slides
+    /// the window by one segment per [`Filled`](crate::inflate::SegmentOutcome) outcome,
+    /// extending a segment by up to two rows when the frontier has not caught up to the
+    /// slide point yet (see `filter::StreamingFrontier::done_floor`).
+    fn stream_rows<E, F>(&mut self, parsed: Parsed<'_>, mut sink: F) -> Result<(), E>
+    where
+        F: FnMut(Row<'_>) -> Result<(), E>,
+        E: From<Error>,
+    {
+        const SEGMENT_TARGET: usize = 256 * 1024;
+
         let info = parsed.info;
+        let row_bytes = info.row_bytes();
+        let height = info.height as usize;
+        let pitch = 1 + row_bytes;
+        let window = crate::filter::MAX_MATCH_DISTANCE;
+
+        let rows_per_segment = (SEGMENT_TARGET / pitch).max(1);
+        // A segment after a slide must be able to hold a whole stored block (at most
+        // 65535 bytes) beyond the retained region, however narrow the rows are.
+        let cap = (rows_per_segment * pitch).max(65536 + pitch);
+        // The retained region is the match window plus less than a row beyond the
+        // frontier (see the slide below); four rows of headroom cover the extension.
+        let stage_len = window + cap + 4 * pitch + crate::inflate::OUTPUT_SLACK;
+        let mut stage = zeroed_vec(stage_len).ok_or(Error::OutOfMemory { bytes: stage_len })?;
+
+        let mut wrapped =
+            |index: usize, bytes: &[u8]| -> Result<(), E> { sink(Row { index, bytes }) };
+        let mut frontier = crate::filter::StreamingFrontier::new(
+            row_bytes,
+            height,
+            info.filter_stride(),
+            &mut wrapped,
+        );
+
+        let data: &[u8] = match &parsed.idat {
+            IdatData::Contiguous(data) => data,
+            IdatData::Joined(data) => data,
+        };
+
+        let verify_adler = self.checks == Checks::Full;
+        let mut adler = verify_adler.then(crate::adler32::Adler32::new);
+        let mut pause: Option<crate::inflate::SegmentPause> = None;
+        let mut base = 0usize;
+        let mut budget = window + cap;
+        let mut seg_start = 0usize;
+        let mut resume_at: Option<usize> = None;
+        let written_total;
+
+        loop {
+            frontier.set_base(base);
+            let outcome = self
+                .inflater
+                .zlib_segment(data, &mut stage, budget, resume_at, &mut pause, &mut frontier)
+                .map_err(|error| E::from(Error::from(error)))?;
+            if let Some(error) = frontier.take_error() {
+                return Err(error);
+            }
+            if let Some(row) = frontier.failed_row() {
+                return Err(Error::InvalidFilter { row }.into());
+            }
+
+            let (end, consumed) = match outcome {
+                crate::inflate::SegmentOutcome::Filled { written } => (written, None),
+                crate::inflate::SegmentOutcome::StreamEnd { written, consumed } => {
+                    (written, Some(consumed))
+                }
+            };
+
+            // Every byte below `end` is final: the segmented loop pauses at the exact
+            // budget, so no speculative literal store falls inside a segment's range. The
+            // Adler-32 covers the filtered bytes, which only the stage still holds; the
+            // per-segment sums cover each byte exactly once, in order.
+            if let Some(adler) = adler.as_mut() {
+                adler.update(&stage[seg_start..end]);
+            }
+
+            if let Some(consumed) = consumed {
+                if verify_adler {
+                    let trailer = &data[2 + consumed..];
+                    if trailer.len() < 4 {
+                        return Err(Error::from(InflateError::UnexpectedEof).into());
+                    }
+                    let expected =
+                        u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+                    if adler.map_or(true, |a| a.finish() != expected) {
+                        return Err(Error::from(InflateError::WrongChecksum).into());
+                    }
+                }
+                written_total = end;
+                break;
+            }
+
+            let abs_written = base + end;
+            let floor = frontier.done_floor();
+            if floor >= base + pitch {
+                // Slide, but keep the reconstructed lookback row (row `rows_done - 1`)
+                // above the next reconstruction: row r reads its predecessor at one pitch
+                // below its first byte. The match window rides along automatically,
+                // because the frontier trails the cursor by the window plus less than a
+                // row: done_floor >= abs_written - window - pitch + 1, so the retained
+                // region [new_base, abs_written) is at least the window.
+                let new_base = (floor - pitch + 1).min(abs_written);
+                let delta = new_base - base;
+                stage.copy_within(delta..end, 0);
+                base = new_base;
+                let resume = end - delta;
+                seg_start = resume;
+                resume_at = Some(resume);
+                budget = resume + cap;
+            } else {
+                // Row zero (or a row wider than the retained region) is not reconstructed
+                // yet; nothing can be dropped. Extend the segment by up to four rows of
+                // runway, by which point readiness always arrives.
+                budget = (budget + 2 * pitch).min(window + cap + 4 * pitch);
+                seg_start = end;
+                resume_at = Some(end);
+            }
+        }
+
+        if base + written_total != info.decompressed_size() {
+            return Err(Error::from(InflateError::OutputUnderflow).into());
+        }
+        frontier.finish(&mut stage, written_total);
+        if let Some(error) = frontier.take_error() {
+            return Err(error);
+        }
+        if let Some(row) = frontier.failed_row() {
+            return Err(Error::InvalidFilter { row }.into());
+        }
+        Ok(())
+    }
+
+    fn decode_parsed(&mut self, parsed: Parsed<'_>) -> Result<Image, Error> {
+        let Parsed { info, idat } = parsed;
 
         self.inflater.verify_checksum(self.checks == Checks::Full);
         let request = info.decompressed_size() + OUTPUT_SLACK;
@@ -234,9 +432,9 @@ impl Decoder {
                 // polling. Take the plain path, which is then identical to the unfused
                 // decoder.
                 if info.decompressed_size() <= crate::filter::MAX_MATCH_DISTANCE + 1 + row_bytes {
-                    match parsed.idat {
+                    match &idat {
                         IdatData::Contiguous(data) => self.inflater.zlib(data, &mut buffer)?,
-                        IdatData::Joined(data) => self.inflater.zlib(&data, &mut buffer)?,
+                        IdatData::Joined(data) => self.inflater.zlib(data, &mut buffer)?,
                     };
                     unfilter_image(&mut buffer, row_bytes, height, info.filter_stride())
                         .map_err(|row| Error::InvalidFilter { row })?;
@@ -249,12 +447,12 @@ impl Decoder {
                         height,
                         info.filter_stride(),
                     );
-                    let written = match parsed.idat {
+                    let written = match &idat {
                         IdatData::Contiguous(data) => {
                             self.inflater.zlib_progress(data, &mut buffer, &mut frontier)?
                         }
                         IdatData::Joined(data) => {
-                            self.inflater.zlib_progress(&data, &mut buffer, &mut frontier)?
+                            self.inflater.zlib_progress(data, &mut buffer, &mut frontier)?
                         }
                     };
                     frontier.finish(&mut buffer, written);
@@ -266,9 +464,9 @@ impl Decoder {
                 buffer
             }
             Interlacing::Adam7 => {
-                match parsed.idat {
+                match &idat {
                     IdatData::Contiguous(data) => self.inflater.zlib(data, &mut buffer)?,
-                    IdatData::Joined(data) => self.inflater.zlib(&data, &mut buffer)?,
+                    IdatData::Joined(data) => self.inflater.zlib(data, &mut buffer)?,
                 };
                 deinterlace(&info, &mut buffer)?
             }
@@ -282,15 +480,18 @@ impl Decoder {
         Ok(Image { info, data })
     }
 
-    fn parse<'a>(&self, png: &'a [u8]) -> Result<Parsed<'a>, Error> {
+    fn parse<'a>(&self, png: &'a [u8], enforce_limit: bool) -> Result<Parsed<'a>, Error> {
         let (mut info, mut chunks) = open(png, self.checks)?;
 
         // Checked here rather than at the allocation, so a header naming a petabyte costs
         // the thirty-three bytes already read and not a scan of whatever follows it.
-        if let Some(limit) = self.max_decompressed_size {
-            let size = info.decompressed_size();
-            if size > limit {
-                return Err(Error::SizeLimitExceeded { size, limit });
+        // Streaming decode does not allocate by the size, so it does not enforce it.
+        if enforce_limit {
+            if let Some(limit) = self.max_decompressed_size {
+                let size = info.decompressed_size();
+                if size > limit {
+                    return Err(Error::SizeLimitExceeded { size, limit });
+                }
             }
         }
 

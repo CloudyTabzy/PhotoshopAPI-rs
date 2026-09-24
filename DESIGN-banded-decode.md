@@ -217,6 +217,20 @@ Dynamic Huffman tables are rebuilt per block anyway, so the entire resumable sta
 position (≤ 64 bits), the 32 KiB match window, and the output cursor. No per-symbol state machine;
 the inner loop is unchanged.
 
+**Implemented revision (Phase 2, supersedes the sketch below):** pure block-boundary resume leaves
+peak memory bounded by one block's *output*, which is unbounded (a hostile stream can be a single
+block), so the shipped seam is an **output-budget pause** — `zlib_segment` stops at a caller-set
+budget anywhere, including mid-block, and returns a `SegmentPause` (bit position, output cursor,
+mid-block flag). The pause is cheap because the loop's existing output-limit checks become the pause
+sites, and the match-refusal path rewinds to the symbol start so resume never loses a match. The
+decoder drives it with a bounded stage (window + ~256 KiB segment + four rows of headroom), a
+`StreamingFrontier` that reverses rows in place and emits them through a sink under the §3.1 lag,
+and a slide that relocates the stage window and keeps one reconstructed row beyond the frontier for
+the lookback. Interlaced images take the buffered path (v1). Measured cost vs `decode()`: ≤ 5 % on
+eight of nine fixture classes (see BENCHMARKS.md §7).
+
+The original sketch, kept for the API shape:
+
 Internal API shape:
 
 ```rust

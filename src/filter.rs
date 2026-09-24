@@ -363,6 +363,50 @@ fn reconstruct_rows<const BPP: usize>(
     }
 }
 
+/// Reconstructs rows `row..` where they sit in `buffer`, without compaction: the filter
+/// byte stays in place as garbage and the row is reversed over itself. The previous row —
+/// at one pitch below the row's first byte — must already be reconstructed.
+///
+/// `base` is the absolute position of `buffer[0]`; all indexing is absolute minus `base`,
+/// which is how the streaming decoder addresses a bounded stage window that slides under
+/// a much larger logical stream.
+fn reconstruct_in_place<const BPP: usize>(
+    buffer: &mut [u8],
+    row_bytes: usize,
+    row: usize,
+    base: usize,
+    pair: bool,
+) -> Result<(), usize> {
+    let pitch = 1 + row_bytes;
+    let filter_at = row * pitch - base;
+    let filter = Filter::from_byte(buffer[filter_at]).ok_or(row)?;
+    let start = filter_at + 1;
+
+    if pair {
+        // `above` is the reconstructed previous row at one pitch below. `first` is this
+        // row's bytes where they sit; the second row's bytes sit one pitch below, at
+        // `start + pitch` — not adjacent to `first`, because the filter byte between them
+        // stays in place.
+        let (head, tail) = buffer.split_at_mut(start);
+        let above = &head[start - pitch..start - pitch + row_bytes];
+        let (first, rest) = tail.split_at_mut(pitch);
+        unfilter_paeth_pair::<BPP>(above, &mut first[..row_bytes], &mut rest[..row_bytes]);
+        Ok(())
+    } else {
+        let (head, tail) = buffer.split_at_mut(start);
+        if row == 0 {
+            unfilter_first_row::<BPP>(filter, &mut tail[..row_bytes]);
+        } else {
+            unfilter_row::<BPP>(
+                filter,
+                &head[start - pitch..start - pitch + row_bytes],
+                &mut tail[..row_bytes],
+            );
+        }
+        Ok(())
+    }
+}
+
 /// DEFLATE's maximum match distance: the distance alphabet's largest code is 24577 with 13
 /// extra bits (RFC 1951 §3.2.5), so inflate never reads an output position further back
 /// than this, whatever the stream.
@@ -494,6 +538,153 @@ impl ReconstructionFrontier {
                 return;
             }
             self.rows_done = row + if pair { 2 } else { 1 };
+        }
+        self.next_trigger =
+            (self.rows_done + 1).saturating_mul(pitch).saturating_add(MAX_MATCH_DISTANCE);
+    }
+}
+
+/// The streaming counterpart of [`ReconstructionFrontier`]: it reverses scanline filters a
+/// row at a time as a bounded stage window slides under the filtered stream, emitting each
+/// reconstructed row through a sink instead of retaining it.
+///
+/// Where [`ReconstructionFrontier`] compacts rows into the decode buffer, this frontier
+/// reverses rows where they sit (`reconstruct_in_place`) and hands the bytes to `sink`.
+/// The caller plays the driver: refill the stage with the next window+segment of filtered
+/// bytes, [`set_base`](Self::set_base) to the absolute position of `buffer[0]`, and report
+/// the cursor through `on_progress`. The same match-window lag applies: a row is reversed
+/// only once the cursor has passed its end by [`MAX_MATCH_DISTANCE`], and `finish` drains
+/// the tail once inflation is over and the lag no longer matters.
+///
+/// Emission is eager and in row order. A sink error is stored (see
+/// [`take_error`](Self::take_error)) and freezes the frontier; the driver surfaces the
+/// error and stops, usually before starting the next segment.
+pub(crate) struct StreamingFrontier<'a, E, S: FnMut(usize, &[u8]) -> Result<(), E>> {
+    row_bytes: usize,
+    height: usize,
+    stride: usize,
+    rows_done: usize,
+    failed_row: Option<usize>,
+    /// Absolute position of `buffer[0]`.
+    base: usize,
+    /// Absolute cursor position at which the next row's lag precondition first holds.
+    next_trigger: usize,
+    sink: &'a mut S,
+    pending: Option<E>,
+}
+
+impl<'a, E, S: FnMut(usize, &[u8]) -> Result<(), E>> crate::inflate::ProgressHook
+    for StreamingFrontier<'a, E, S>
+{
+    const ENABLED: bool = true;
+
+    #[inline(always)]
+    fn on_progress(&mut self, output: &mut [u8], pos: usize) {
+        StreamingFrontier::on_progress(self, output, pos);
+    }
+}
+
+impl<'a, E, S: FnMut(usize, &[u8]) -> Result<(), E>> StreamingFrontier<'a, E, S> {
+    pub(crate) fn new(row_bytes: usize, height: usize, stride: usize, sink: &'a mut S) -> Self {
+        let pitch = 1 + row_bytes;
+        Self {
+            row_bytes,
+            height,
+            stride,
+            rows_done: 0,
+            failed_row: None,
+            base: 0,
+            next_trigger: pitch.saturating_add(MAX_MATCH_DISTANCE),
+            sink,
+            pending: None,
+        }
+    }
+
+    pub(crate) fn set_base(&mut self, base: usize) {
+        self.base = base;
+    }
+
+    /// Absolute position one past the last fully reconstructed row; the streaming driver
+    /// must not slide its window past this point.
+    pub(crate) fn done_floor(&self) -> usize {
+        self.rows_done * (1 + self.row_bytes)
+    }
+
+    pub(crate) fn failed_row(&self) -> Option<usize> {
+        self.failed_row
+    }
+
+    pub(crate) fn take_error(&mut self) -> Option<E> {
+        self.pending.take()
+    }
+
+    /// Reconstructs and emits every row whose lag precondition the stage-relative cursor
+    /// `pos` now satisfies.
+    #[inline(always)]
+    pub(crate) fn on_progress(&mut self, buffer: &mut [u8], pos: usize) {
+        let abs = self.base.saturating_add(pos);
+        if abs >= self.next_trigger && self.failed_row.is_none() && self.pending.is_none() {
+            self.advance(buffer, abs, MAX_MATCH_DISTANCE);
+        }
+    }
+
+    /// Drains the rows the window lag deferred, after inflation has finished. `end` is the
+    /// stage-relative stream length.
+    pub(crate) fn finish(&mut self, buffer: &mut [u8], end: usize) {
+        self.advance(buffer, self.base.saturating_add(end), 0);
+    }
+
+    fn advance(&mut self, buffer: &mut [u8], abs: usize, lag: usize) {
+        match self.stride {
+            1 => self.advance_bpp::<1>(buffer, abs, lag),
+            2 => self.advance_bpp::<2>(buffer, abs, lag),
+            3 => self.advance_bpp::<3>(buffer, abs, lag),
+            4 => self.advance_bpp::<4>(buffer, abs, lag),
+            6 => self.advance_bpp::<6>(buffer, abs, lag),
+            8 => self.advance_bpp::<8>(buffer, abs, lag),
+            _ => unreachable!("PNG pixel strides are 1, 2, 3, 4, 6 or 8 bytes"),
+        }
+    }
+
+    #[inline(never)]
+    fn advance_bpp<const BPP: usize>(&mut self, buffer: &mut [u8], abs: usize, lag: usize) {
+        let pitch = 1 + self.row_bytes;
+        while self.rows_done < self.height {
+            let row = self.rows_done;
+
+            // Single-row precondition; `pair` strengthens it by one row of pitch. The lag
+            // is `MAX_MATCH_DISTANCE` while inflation runs and zero in `finish`.
+            let ready = (row + 1).saturating_mul(pitch).saturating_add(lag) <= abs;
+            if !ready {
+                break;
+            }
+
+            // The pair decision mirrors `unfilter_image_bpp`; an invalid filter byte is
+            // not `Paeth`, so it falls to the single-row path, which reports it.
+            let mut pair = buffer[row * pitch - self.base] == Filter::Paeth as u8
+                && row > 0
+                && row + 1 < self.height
+                && buffer[(row + 1) * pitch - self.base] == Filter::Paeth as u8;
+            if pair && (row + 2).saturating_mul(pitch).saturating_add(lag) > abs {
+                pair = false;
+            }
+
+            let take = if pair { 2 } else { 1 };
+            if let Err(bad) =
+                reconstruct_in_place::<BPP>(buffer, self.row_bytes, row, self.base, pair)
+            {
+                self.failed_row = Some(bad);
+                return;
+            }
+            for index in row..row + take {
+                let start = index * pitch + 1 - self.base;
+                if let Err(error) = (self.sink)(index, &buffer[start..start + self.row_bytes]) {
+                    self.pending = Some(error);
+                    self.rows_done = index;
+                    return;
+                }
+            }
+            self.rows_done = row + take;
         }
         self.next_trigger =
             (self.rows_done + 1).saturating_mul(pitch).saturating_add(MAX_MATCH_DISTANCE);
@@ -902,5 +1093,158 @@ mod tests {
         frontier.finish(&mut buffer, stream.len());
         assert_eq!(frontier.rows_done(), 5, "frozen at the bad row");
         assert_eq!(frontier.failed_row(), Some(5));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Streaming frontier
+    //
+    // A StreamingFrontier emits reconstructed rows through a sink while a bounded stage
+    // window slides beneath it: the caller refills the stage with the next window+segment
+    // of filtered bytes, advances the base, and the frontier reverses rows whose lag
+    // precondition the cursor satisfies. These tests simulate the driver's slide with the
+    // same rule the decoder uses (base = written - window) and require the emitted rows to
+    // equal `unfilter_image`'s output.
+    // ---------------------------------------------------------------------------------------
+
+    /// Feeds `stream` to a StreamingFrontier in driver-shaped segments and requires the
+    /// emitted rows to equal the reference reconstruction.
+    fn streaming_matches_unfilter_image<const BPP: usize>(
+        width_pixels: usize,
+        height: usize,
+        filters: &[Filter],
+        rows_per_segment: usize,
+    ) {
+        let row_bytes = width_pixels * BPP;
+        let pitch = 1 + row_bytes;
+        let image: Vec<u8> = (0..row_bytes * height)
+            .map(|i| (i.wrapping_mul(97).wrapping_add(i / row_bytes * 13) % 256) as u8)
+            .collect();
+        let stream = filtered_stream::<BPP>(&image, row_bytes, height, filters);
+
+        let mut reference = stream.clone();
+        unfilter_image(&mut reference, row_bytes, height, BPP).unwrap();
+
+        let window = MAX_MATCH_DISTANCE;
+        let cap = rows_per_segment * pitch;
+        let mut stage = vec![0u8; window + cap + 4 * pitch + 16];
+
+        let mut emitted: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut sink = |index: usize, bytes: &[u8]| -> Result<(), &'static str> {
+            emitted.push((index, bytes.to_vec()));
+            Ok(())
+        };
+        let mut frontier = StreamingFrontier::new(row_bytes, height, BPP, &mut sink);
+
+        // Driver simulation, mirroring the streaming decoder exactly: the stage keeps the
+        // retained region across slides (reconstructed rows included), and only the range
+        // after it is refilled — as inflate's writes would produce it.
+        let mut base = 0usize;
+        let mut resume = 0usize;
+        let mut budget = window + cap;
+        loop {
+            let fill = budget.min(stream.len() - base);
+            stage[resume..fill].copy_from_slice(&stream[base + resume..base + fill]);
+            frontier.set_base(base);
+            frontier.on_progress(&mut stage, fill);
+            if base + fill == stream.len() {
+                frontier.finish(&mut stage, fill);
+                break;
+            }
+            let abs_written = base + fill;
+            let floor = frontier.done_floor();
+            if floor >= base + pitch {
+                let new_base = (floor - pitch + 1).min(abs_written);
+                stage.copy_within(new_base - base..fill, 0);
+                resume = abs_written - new_base;
+                base = new_base;
+                budget = resume + cap;
+            } else {
+                budget = (budget + 2 * pitch).min(window + cap + 4 * pitch);
+            }
+        }
+
+        assert_eq!(frontier.failed_row(), None);
+        assert_eq!(emitted.len(), height, "every row emitted exactly once");
+        for (index, bytes) in &emitted {
+            assert_eq!(
+                bytes[..],
+                reference[*index * row_bytes..(*index + 1) * row_bytes],
+                "row {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_matches_unfilter_image_every_filter_and_stride() {
+        for filter in Filter::ALL {
+            streaming_matches_unfilter_image::<1>(17, 5, &[filter], 3);
+            streaming_matches_unfilter_image::<2>(13, 4, &[filter], 1);
+            streaming_matches_unfilter_image::<3>(11, 6, &[filter], 7);
+            streaming_matches_unfilter_image::<4>(9, 7, &[filter], 2);
+            streaming_matches_unfilter_image::<6>(5, 3, &[filter], 5);
+            streaming_matches_unfilter_image::<8>(4, 3, &[filter], 1);
+        }
+    }
+
+    #[test]
+    fn streaming_matches_unfilter_image_paeth_run_alignments() {
+        use Filter::{Average as A, None as N, Paeth as P, Sub as S, Up as U};
+
+        let patterns: &[&[Filter]] = &[
+            &[P],
+            &[P, S],
+            &[P, P, S],
+            &[P, P, P, S],
+            &[P, P, P, P, U],
+            &[S, P, P],
+            &[U, U, P],
+            &[N, S, U, A, P, P, P],
+        ];
+
+        for pattern in patterns {
+            for height in 1..=9 {
+                streaming_matches_unfilter_image::<1>(13, height, pattern, 1);
+                streaming_matches_unfilter_image::<3>(11, height, pattern, 4);
+                streaming_matches_unfilter_image::<4>(9, height, pattern, 1);
+                streaming_matches_unfilter_image::<8>(3, height, pattern, 2);
+            }
+        }
+    }
+
+    /// A row wider than one segment: the stage must still emit it whole, after its tail
+    /// has been reconstructed, without losing the bytes that slid beneath it.
+    #[test]
+    fn streaming_with_rows_wider_than_a_segment() {
+        use Filter::Paeth as P;
+        streaming_matches_unfilter_image::<4>(9000, 6, &[P], 1); // 36 KB rows, one per segment
+        streaming_matches_unfilter_image::<4>(9000, 6, &[P], 3);
+    }
+
+    /// A failing sink stops emission, surfaces its error, and later progress is a no-op.
+    #[test]
+    fn streaming_freezes_on_a_failing_sink() {
+        let row_bytes: usize = 4096 * 4;
+        let height: usize = 8;
+        let image: Vec<u8> = (0..row_bytes * height)
+            .map(|i| (i.wrapping_mul(13).wrapping_add(i / row_bytes * 5) % 247) as u8)
+            .collect();
+        let stream = filtered_stream::<4>(&image, row_bytes, height, &[Filter::Paeth]);
+
+        let calls = std::cell::Cell::new(0);
+        let mut sink = |_: usize, _: &[u8]| -> Result<(), &'static str> {
+            calls.set(calls.get() + 1);
+            Err("boom")
+        };
+        let mut frontier = StreamingFrontier::new(row_bytes, height, 4, &mut sink);
+        let mut stage = stream.clone();
+        frontier.on_progress(&mut stage, stream.len());
+        assert_eq!(calls.get(), 1);
+        // The error freezes further progress; the driver takes it once it notices.
+        frontier.on_progress(&mut stage, stream.len());
+        assert_eq!(calls.get(), 1, "frozen after the sink error");
+        assert_eq!(frontier.take_error(), Some("boom"));
+        // Taking the error unfreezes: the row re-reconstructs and the sink is called again.
+        frontier.on_progress(&mut stage, stream.len());
+        assert_eq!(calls.get(), 2);
     }
 }

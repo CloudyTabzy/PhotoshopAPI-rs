@@ -613,7 +613,9 @@ impl Inflater {
             return Err(InflateError::PresetDictionary);
         }
 
-        let (written, consumed) = self.inflate(&input[2..], output, limit, hook)?;
+        let mut pause = None;
+        let (written, consumed) =
+            self.inflate::<H, false>(&input[2..], output, limit, hook, &mut pause)?;
 
         let trailer = &input[2 + consumed..];
         if trailer.len() < 4 {
@@ -631,18 +633,121 @@ impl Inflater {
         Ok(written)
     }
 
+    /// Decompresses one segment of a zlib stream into `output`, pausing at `budget`.
+    ///
+    /// The first call must pass `pause` as `None`; it validates the zlib header and starts
+    /// the stream. Each call inflates until the stream ends or the output cursor reaches
+    /// `budget` (which must leave [`OUTPUT_SLACK`] in `output`), returning the outcome. On
+    /// `Filled`, `pause` carries everything needed to continue with the same `input` slice
+    /// after the caller has made room via the next call.
+    ///
+    /// `resume_at` overrides the checkpoint's output position before decoding. The
+    /// streaming decoder passes `None` on the first call, the previous `Filled` position
+    /// while extending a segment, and `window` after relocating the match window to the
+    /// front of the stage with a `copy_within`.
+    ///
+    /// This is the seam under the decoder's streaming `decode_to`: a bounded stage holds
+    /// the match window plus a segment of filtered rows, and pause/resume never crosses a
+    /// symbol boundary the format does not already provide — the state is a bit position,
+    /// and tables are rebuilt per block regardless.
+    pub(crate) fn zlib_segment<H: ProgressHook>(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        budget: usize,
+        resume_at: Option<usize>,
+        pause: &mut Option<SegmentPause>,
+        hook: &mut H,
+    ) -> Result<SegmentOutcome, InflateError> {
+        assert!(budget <= output.len() - OUTPUT_SLACK, "budget must leave OUTPUT_SLACK");
+
+        if pause.is_none() {
+            if input.len() < 2 {
+                return Err(InflateError::UnexpectedEof);
+            }
+            let cmf = input[0];
+            let flg = input[1];
+            if cmf & 0x0f != 8 || cmf >> 4 > 7 || (u16::from(cmf) * 256 + u16::from(flg)) % 31 != 0
+            {
+                return Err(InflateError::BadZlibHeader);
+            }
+            if flg & 0x20 != 0 {
+                return Err(InflateError::PresetDictionary);
+            }
+            *pause = Some(SegmentPause {
+                reader_pos: 0,
+                buf: 0,
+                nbits: 0,
+                padding: 0,
+                out_pos: 0,
+                mid_block: false,
+                last_block: false,
+            });
+        }
+        if let Some(position) = resume_at {
+            if let Some(state) = pause.as_mut() {
+                state.out_pos = position;
+            }
+        }
+
+        let (written, consumed) =
+            self.inflate::<H, true>(&input[2..], output, budget, hook, pause)?;
+
+        match pause {
+            Some(_) => Ok(SegmentOutcome::Filled { written }),
+            None => Ok(SegmentOutcome::StreamEnd { written, consumed }),
+        }
+    }
+
     /// Decodes a raw DEFLATE stream, returning the bytes written and the input bytes read.
-    fn inflate<H: ProgressHook>(
+    ///
+    /// With `SEGMENTED`, running into `limit` pauses: the reader and cursor are stored in
+    /// `pause` (with `mid_block` set when a block is partially decoded) and the caller
+    /// resumes by calling again after making room. Without it, the same condition is an
+    /// [`OutputOverflow`](InflateError::OutputOverflow) error, as before.
+    fn inflate<H: ProgressHook, const SEGMENTED: bool>(
         &mut self,
         input: &[u8],
         output: &mut [u8],
         limit: usize,
         hook: &mut H,
+        pause: &mut Option<SegmentPause>,
     ) -> Result<(usize, usize), InflateError> {
         let mut reader = BitReader::new(input);
         let mut out_pos = 0usize;
 
-        loop {
+        // Resume from the previous segment's checkpoint. `last_block` replays the final
+        // flag of a block paused mid-way: finishing it must not fall into the header loop.
+        let mut finished_block = false;
+        if let Some(state) = pause.take() {
+            reader = BitReader {
+                input,
+                pos: state.reader_pos,
+                buf: state.buf,
+                nbits: state.nbits,
+                padding: state.padding,
+            };
+            out_pos = state.out_pos;
+            if state.mid_block {
+                out_pos = self.decode_block::<H, SEGMENTED>(
+                    &mut reader,
+                    output,
+                    out_pos,
+                    hook,
+                    pause,
+                    state.last_block,
+                )?;
+                if SEGMENTED && pause.is_some() {
+                    return Ok((out_pos, 0));
+                }
+                finished_block = state.last_block;
+            }
+        }
+
+        while !finished_block {
+            // A segmented pause rewinds to here: the stored block's header is re-read once
+            // it fits, so the checkpoint is captured before any header bits are consumed.
+            let block_start = reader;
             reader.refill();
             let last_block = reader.take(1) != 0;
             let block_type = reader.take(2);
@@ -664,6 +769,18 @@ impl Inflater {
                         return Err(InflateError::UnexpectedEof);
                     }
                     if out_pos + len > limit {
+                        if SEGMENTED {
+                            *pause = Some(SegmentPause {
+                                reader_pos: block_start.pos,
+                                buf: block_start.buf,
+                                nbits: block_start.nbits,
+                                padding: block_start.padding,
+                                out_pos,
+                                mid_block: false,
+                                last_block: false,
+                            });
+                            return Ok((out_pos, 0));
+                        }
                         return Err(InflateError::OutputOverflow);
                     }
                     output[out_pos..out_pos + len]
@@ -676,15 +793,32 @@ impl Inflater {
                 }
                 1 => {
                     self.build_fixed_tables()?;
-                    out_pos = self.decode_block(&mut reader, output, out_pos, hook)?;
+                    out_pos = self.decode_block::<H, SEGMENTED>(
+                        &mut reader,
+                        output,
+                        out_pos,
+                        hook,
+                        pause,
+                        last_block,
+                    )?;
                 }
                 2 => {
                     self.read_dynamic_header(&mut reader)?;
-                    out_pos = self.decode_block(&mut reader, output, out_pos, hook)?;
+                    out_pos = self.decode_block::<H, SEGMENTED>(
+                        &mut reader,
+                        output,
+                        out_pos,
+                        hook,
+                        pause,
+                        last_block,
+                    )?;
                 }
                 _ => return Err(InflateError::InvalidBlockType),
             }
 
+            if SEGMENTED && pause.is_some() {
+                return Ok((out_pos, 0));
+            }
             if last_block {
                 break;
             }
@@ -892,12 +1026,20 @@ impl Inflater {
     /// `hook` observes the output cursor once per loop iteration. For [`()`] the call
     /// compiles out entirely (see [`ProgressHook`]), leaving the loop identical to a
     /// hook-free decoder.
-    fn decode_block<H: ProgressHook>(
+    ///
+    /// With `SEGMENTED` the two output-limit checks pause instead of erroring: the bit
+    /// reader and the cursor are stored in `pause` and the caller resumes from them after
+    /// making room. `Ok` therefore means "block end or pause"; the caller distinguishes
+    /// through `pause.is_some()`. `last_block` is recorded so a mid-block pause resumed
+    /// into the stream's final block does not decode past it.
+    fn decode_block<H: ProgressHook, const SEGMENTED: bool>(
         &mut self,
         reader: &mut BitReader,
         output: &mut [u8],
         start_pos: usize,
         hook: &mut H,
+        pause: &mut Option<SegmentPause>,
+        last_block: bool,
     ) -> Result<usize, InflateError> {
         // Binding the tables as fixed-size array references, rather than slices, lets the
         // masked table indices be proven in range and drops the bounds checks from the two
@@ -916,7 +1058,23 @@ impl Inflater {
             let mut entry = litlen[r.peek(LITLEN_TABLE_BITS) as usize];
 
             loop {
-                if pos > limit {
+                if SEGMENTED {
+                    // Pause at the exact budget: pausing past it would leave speculative
+                    // literal bytes inside the window the caller relocates.
+                    if pos >= limit {
+                        *reader = r;
+                        *pause = Some(SegmentPause {
+                            reader_pos: r.pos,
+                            buf: r.buf,
+                            nbits: r.nbits,
+                            padding: r.padding,
+                            out_pos: pos,
+                            mid_block: true,
+                            last_block,
+                        });
+                        break 'block Ok(pos);
+                    }
+                } else if pos > limit {
                     break 'block Err(InflateError::OutputOverflow);
                 }
                 if H::ENABLED {
@@ -1046,6 +1204,10 @@ impl Inflater {
                 bits >>= dist_bits;
                 let distance = (dist_base + (bits as u32 & ((1 << dist_extra) - 1))) as usize;
 
+                // The match's bits are consumed before its bounds are known; a segmented
+                // pause on the length check must rewind to here, or the resume would
+                // decode past the match and lose its bytes.
+                let symbol_start = r;
                 r.consume(code_bits + length_extra + dist_bits + dist_extra);
                 r.refill();
                 entry = litlen[r.peek(LITLEN_TABLE_BITS) as usize];
@@ -1054,6 +1216,19 @@ impl Inflater {
                     break 'block Err(InflateError::DistanceTooFarBack);
                 }
                 if pos + length > limit {
+                    if SEGMENTED {
+                        *reader = symbol_start;
+                        *pause = Some(SegmentPause {
+                            reader_pos: symbol_start.pos,
+                            buf: symbol_start.buf,
+                            nbits: symbol_start.nbits,
+                            padding: symbol_start.padding,
+                            out_pos: pos,
+                            mid_block: true,
+                            last_block,
+                        });
+                        break 'block Ok(pos);
+                    }
                     break 'block Err(InflateError::OutputOverflow);
                 }
 
@@ -1157,5 +1332,175 @@ pub fn decompress_zlib_to_vec(input: &[u8], max_output: usize) -> Result<Vec<u8>
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Segmented decompression (streaming decode)
+// ---------------------------------------------------------------------------------------
+
+/// Where a segmented decompression stopped, so the next segment can resume exactly.
+///
+/// A segment ends at a deflate block boundary or mid-block, wherever the output budget ran
+/// out; either way the bit reader's position and the output cursor are enough to continue,
+/// because the Huffman tables are rebuilt per block and the reader state is `Copy`.
+/// `mid_block` says the block header was already consumed and the tables for the current
+/// block are built: resume inside the block, not at the header loop.
+pub(crate) struct SegmentPause {
+    reader_pos: usize,
+    buf: u64,
+    nbits: u32,
+    padding: u32,
+    /// Stage-relative output position.
+    out_pos: usize,
+    mid_block: bool,
+    /// Whether the block being decoded is the stream's final one; only meaningful with
+    /// `mid_block`, so a resumed final block finishes the stream instead of reading on.
+    last_block: bool,
+}
+
+/// The outcome of one `zlib_segment` call.
+#[derive(Debug)]
+pub(crate) enum SegmentOutcome {
+    /// The stream is fully decoded. `written` is the stage-relative end of the output and
+    /// `consumed` the input bytes the deflate stream occupied, excluding the 2-byte zlib
+    /// header and the 4-byte trailer.
+    StreamEnd { written: usize, consumed: usize },
+    /// The output budget is full; `pause` (passed to the next call) carries the resume state.
+    Filled { written: usize },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    use crate::filter::MAX_MATCH_DISTANCE;
+
+    /// Miri cannot enumerate directories on Windows, so alongside the corpus sweep this
+    /// fs-free case runs the pause/resume machinery over a stream built by the crate's own
+    /// deflate encoder, with a stage smaller than the stream to force real slides.
+    #[test]
+    fn segmented_resume_matches_one_shot_inline() {
+        // Compressible data: the encoder emits a single compressed block, so the segment
+        // boundary falls mid-block, which is the resume path that matters.
+        let expected = vec![0u8; 45_000];
+        let compressed = crate::deflate::compress_zlib(&expected);
+        let mut budget = MAX_MATCH_DISTANCE + 4096;
+
+        let mut reference = vec![0u8; expected.len() + OUTPUT_SLACK];
+        Inflater::new().zlib(&compressed, &mut reference).unwrap();
+
+        let mut stage = vec![0u8; MAX_MATCH_DISTANCE + 4096 + 65_536 + OUTPUT_SLACK];
+        let mut inflater = Inflater::new();
+        let mut pause: Option<SegmentPause> = None;
+        let mut output = Vec::new();
+        let mut prev_end = 0usize;
+        let mut resume_at: Option<usize> = None;
+        let mut base = 0usize;
+        for iteration in 0.. {
+            match inflater
+                .zlib_segment(&compressed, &mut stage, budget, resume_at, &mut pause, &mut ())
+                .unwrap()
+            {
+                SegmentOutcome::StreamEnd { written, .. } => {
+                    output.extend_from_slice(&stage[prev_end..written]);
+                    break;
+                }
+                SegmentOutcome::Filled { written } => {
+                    output.extend_from_slice(&stage[prev_end..written]);
+                    // Relocate the window and advance, as the streaming decoder does.
+                    // Budget keeps pace with the absolute position (base + budget grows
+                    // every fill), so a match that refuses the budget always fits after
+                    // the next relocation. A fill with no new bytes is a block that
+                    // cannot fit (a stored block beyond the budget); grow once, enough
+                    // for any stored block.
+                    let keep = MAX_MATCH_DISTANCE.min(written);
+                    stage.copy_within(written - keep..written, 0);
+                    base += written - keep;
+                    prev_end = keep;
+                    resume_at = Some(keep);
+                    let grown = keep + 4096;
+                    budget =
+                        if output.len() == 0 && iteration > 0 { budget + 65_536 } else { grown };
+                }
+            }
+        }
+        let _ = base;
+
+        assert_eq!(output.len(), expected.len());
+        assert!(output.len() > budget, "resume path not exercised");
+        assert_eq!(output, expected);
+    }
+
+    /// Drives `zlib_segment` with a small stage over every reference vector and requires
+    /// the concatenated segments to equal the one-shot decode. A small budget forces the
+    /// pause/resume path hundreds of times per vector.
+    #[test]
+    fn segmented_resume_matches_one_shot() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp/z");
+        if !dir.exists() {
+            eprintln!("skipping: {} not generated", dir.display());
+            return;
+        }
+
+        // A segment must hold a whole stored block (65535 bytes) beyond the window, or a
+        // vector built from stored blocks can never make progress at this budget.
+        const CAP: usize = 70_000;
+        let budget = MAX_MATCH_DISTANCE + CAP;
+
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("z") {
+                continue;
+            }
+            let compressed = std::fs::read(&path).unwrap();
+            let expected = std::fs::read(path.with_extension("raw")).unwrap();
+
+            // One-shot reference.
+            let mut reference = vec![0u8; expected.len() + OUTPUT_SLACK];
+            Inflater::new().zlib(&compressed, &mut reference).unwrap();
+            reference.truncate(expected.len());
+
+            // Segmented with a stage barely larger than the match window, so almost every
+            // vector spans several slides. Models the streaming decoder's contract:
+            // relocate the window to the front after each Filled and resume there.
+            let mut stage = vec![0u8; budget + OUTPUT_SLACK];
+            let mut inflater = Inflater::new();
+            let mut pause: Option<SegmentPause> = None;
+            let mut output = Vec::new();
+            let mut prev_end = 0usize;
+            let mut resume_at: Option<usize> = None;
+            loop {
+                match inflater
+                    .zlib_segment(&compressed, &mut stage, budget, resume_at, &mut pause, &mut ())
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                {
+                    SegmentOutcome::StreamEnd { written, .. } => {
+                        output.extend_from_slice(&stage[prev_end..written]);
+                        break;
+                    }
+                    SegmentOutcome::Filled { written } => {
+                        output.extend_from_slice(&stage[prev_end..written]);
+                        // Relocate what fits of the match window, as the decoder does;
+                        // early segments can be smaller than the window.
+                        let keep = MAX_MATCH_DISTANCE.min(written);
+                        stage.copy_within(written - keep..written, 0);
+                        prev_end = keep;
+                        resume_at = Some(keep);
+                    }
+                }
+            }
+
+            assert_eq!(output, expected, "{}", path.display());
+            // The whole point: vectors bigger than one segment actually exercised resume.
+            if expected.len() > budget {
+                assert!(output.len() > budget, "{}: resume path not exercised", path.display());
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no vectors found in {}", dir.display());
+        eprintln!("checked {checked} streams");
     }
 }

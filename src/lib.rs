@@ -156,7 +156,9 @@ pub mod tables;
 pub mod transform;
 
 pub use common::{BitDepth, Chunk, ColorType, Info, Interlacing};
-pub use decoder::{Checks, DEFAULT_MAX_DECOMPRESSED_SIZE, Decoder, Image, Keep, decode, read_info};
+pub use decoder::{
+    Checks, DEFAULT_MAX_DECOMPRESSED_SIZE, Decoder, Image, Keep, Row, decode, read_info,
+};
 pub use encoder::{Encoder, FilterStrategy, encode, encode_rgb8, encode_rgba8};
 pub use error::{Error, WriteError};
 pub use filter::Filter;
