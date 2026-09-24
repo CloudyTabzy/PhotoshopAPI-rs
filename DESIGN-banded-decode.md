@@ -1,8 +1,8 @@
 # Design proposal: banded decode — fuse reconstruction into inflation, then stream
 
 **Provenance:** written by the PhotoshopAPI-rs port team. This document is **ours**, not upstream
-png-spark; it lives in this working checkout so the implementing agent has everything in one place.
-**Target:** this checkout (`png-spark`, main at `6d256fc`, the 0.2.0-era code).
+png-spark.
+**Target:** png-spark at `6d256fc`, the 0.2.0-era code this proposal was written against.
 **Status:** Phases 1, 2 and 3 implemented on `fused-decode-frontier` with measured evidence
 (see `BENCHMARKS.md`); Phase 4 cancelled. **No upstream PR is planned.** When smart-object PNG
 decode lands in the port, this becomes a decoder-only vendored crate under our own name
@@ -51,9 +51,9 @@ document corpus (11 reference renders + the two PNGs embedded in
 non-interlaced**. RGBA8 is the case that matters; RGB8/palette are the cases png-spark loses on
 (§1.4), and interlaced files are rare but must stay correct.
 
-### 1.2 Decode stage profile (measured on this machine)
+### 1.2 Decode stage profile (measured on the measurement machine)
 
-`bench/src/bin/profile.rs` (added in this checkout) reports best-of-N per stage. First run:
+`bench/src/bin/profile.rs` (added for this work) reports best-of-N per stage. First run:
 
 | fixture | KB | decode | crc | inflate | unfilter | parts | other |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -71,8 +71,8 @@ everything else (chunk walk, zeroed allocation, compaction copies) is small. The
 exceeds `decode` because the unfilter stage is measured in isolation with a cold buffer (pessimistic);
 in situ it reads rows that inflate has just written.
 
-**Noise warning (important for the implementing agent):** this machine thermally throttles on
-sustained benchmarks. A second profile run reported `rgba8_3840` decode at 93.32 ms vs 69.35 ms in
+**Noise warning:** the measurement machine thermally throttles on sustained benchmarks. A second
+profile run reported `rgba8_3840` decode at 93.32 ms vs 69.35 ms in
 the first; the port's interleaved harness reports best 52.71 ms / mean 70.09 ms for the same file.
 **All A/B comparisons must be interleaved, best-of-N, and in one session**; never compare numbers
 from separate runs.
@@ -371,8 +371,8 @@ from a faster Huffman decoder.
 4. **Gates (extended during implementation):** `cargo test` (74 tests); byte-exact output on the
    generated 180-file corpus, the PngSuite interlaced samples, and the port's 14 fixtures; Miri;
    all three fuzz targets; A/B with
-   `cargo run --release -p png-spark-bench -- decode` **and** the port's interleaved 3-way harness
-   (best-of-N; this machine throttles).
+   `cargo run --release -p psd-png-bench -- decode` **and** the port's interleaved 3-way harness
+   (best-of-N; the measurement machine throttles).
    **The existing gates are blind to this change.** Every corpus image is smaller than the 32 KiB
    match window, so a frontier whose lag is wrong passes all of them: mid-inflation reconstruction
    simply never engages. Worse, png-spark's *own encoder* emits only zero-run (distance-1)
@@ -412,7 +412,7 @@ Shipped as `decode_to_rgba8` / `_rgb8` / `_rgba16` / `_rgb16`, one `RowConverter
 `BitDepth` boundary refuses to widen a sample and a downconvert here would be unrecoverable.
 Step 8's Adam7 `(pass, x, y)` metadata was **not** built: interlaced images take the buffered
 fallback and are emitted in file order like every other row, which is what a consumer wants.
-Step 9 is the port's work and has not started — see the crate's `TODO.md` items I1–I6 and V1–V3.
+Step 9 is the port's work and has not started.
 
 ### Phase 4 — upstream contact — CANCELLED 2026-09-24
 
@@ -446,8 +446,8 @@ vendored fork (see Status). The sequence below is kept only as the record of wha
 
 - The repo has merged a PR before (`6d256fc`, PR #1, the streaming encoder), so contributions are
   plausible; **issue creation is restricted**, so the channel is a PR or direct contact.
-- Recommended sequence: implement and benchmark in this checkout first (it is our working fork);
-  decide with the team whether to PR or vendor. If upstream doesn't take it, **this checkout is the
+- Recommended sequence: implement and benchmark in the fork first;
+  decide with the team whether to PR or vendor. If upstream doesn't take it, **the fork is the
   vendor**.
 - Keep our additions (`bench/src/bin/`, `bench/tools/`, this document) out of any PR unless wanted;
   `bench/` is excluded from the published package.
@@ -456,29 +456,29 @@ vendored fork (see Status). The sequence below is kept only as the record of wha
 
 ## 10. Measurement appendix
 
-**Tools in this checkout**
+**Tools**
 
 | Tool | Path | Purpose |
 |---|---|---|
 | Stage profiler | `bench/src/bin/profile.rs` | decode / crc / inflate / unfilter breakdown on a fixtures directory |
 | Filter histogram | `bench/tools/filters.py` | per-fixture scanline filter distribution |
 | Corpus color-type scan | `bench/tools/scan_png_mix.py` | PNG signatures + IHDR colour types in a document corpus |
-| Their own bench | `cargo run --release -p png-spark-bench -- decode` | whole-PNG decode vs the `png` crate |
+| Their own bench | `cargo run --release -p psd-png-bench -- decode` | whole-PNG decode vs the `png` crate |
 
 **Commands**
 
 ```bash
-cargo run --release -p png-spark-bench --bin profile -- <fixtures dir>
+cargo run --release -p psd-png-bench --bin profile -- <fixtures dir>
 python bench/tools/filters.py <fixtures dir>
-cargo run --release -p png-spark-bench -- decode
+cargo run --release -p psd-png-bench -- decode
 ```
 
-**Port harness (external, may not persist):** `%TEMP%\opencode\png-bench` — interleaved 3-way
-decode (png / zune-png / png-spark) plus a mutation-campaign binary (`src/bin/mutate.rs`).
+**Port harness (external):** an interleaved 3-way decode (png / zune-png / psd-png) plus a
+mutation-campaign binary, none of which is part of this repository.
 
 **Methodology notes**
 
-- Best-of-N only; interleave arms; one session per comparison. Thermal throttling on this machine
-  swings sustained decode by >30%.
+- Best-of-N only; interleave arms; one session per comparison. Thermal throttling on the
+  measurement machine swung sustained decode by >30%.
 - The unfilter figure measured in isolation is pessimistic (cold buffer); in situ it is lower.
 - `Checks::None` already exists to skip CRC verification (2–5%) when a caller doesn't want it.

@@ -43,8 +43,9 @@ Decoder::new().decode_to_rgba16(&png, |row: psd_png::Row<'_>| {
 ```
 
 This is the same conversion as `to_rgba8`/`to_rgb8`, expressed per row: the palette and `tRNS`
-key are resolved once per image, each row is converted into a scratch buffer reused for the
-whole decode, and only that row is live. The whole-image methods are implemented on top of
+key are resolved once per image, only the current row is live, and a stream whose layout already
+matches the file's own — RGBA to RGBA, or RGB to RGB at the file's sample width — hands each row
+straight to the sink without converting it. The whole-image methods are implemented on top of
 the same per-row code, so the two paths cannot drift.
 
 ## Status and provenance
@@ -102,8 +103,8 @@ ceiling to be what refuses it.
 
 ## Performance
 
-Measured against png-spark 0.2.0 on this machine, interleaved best-of-N in a single session
-because it thermally throttles; the noise floor measured the same way is ±0.00%. Full
+Measured against png-spark 0.2.0, interleaved best-of-N in a single session because the
+measurement machine thermally throttles; the noise floor measured the same way is ±0.00%. Full
 methodology, tables and caveats are in `BENCHMARKS.md`.
 
 | | result |
@@ -114,7 +115,7 @@ methodology, tables and caveats are in `BENCHMARKS.md`.
 | `decode_to` vs `decode`, sink discarding rows | **faster** — it never allocates or first-touches the whole image |
 | A 16384×16384 RGBA image (1.07 GB filtered) | refused by `decode` under the default ceiling; streams through `decode_to` in a ~300 KB stage |
 | Full RGBA8 deliverable vs png-spark 0.2.0 (`decode` + `to_rgba8` there, `decode_to_rgba8` here) | **4.6 % to 25.1 % faster, 9/9, mean 14.7 %** |
-| Cost of the fused conversion on an 8-bit RGBA source | **≤ 1.6 %** — a row copy, no per-pixel work |
+| Cost of the fused conversion | **≤ 1.6 %** on an 8-bit RGBA source, measured before pass-through; a source already in the requested layout now skips conversion entirely |
 | SIMD `Paeth` vs the scalar two-row wavefront (`PSD_PNG_FORCE_SCALAR=1` vs default) | **8 % to 22 % faster** on `Paeth`-bearing images, unchanged where there is no `Paeth` |
 
 Every PNG in the port's own fixture corpus (12 files, 512×512 and 200×108 RGBA) clears the
@@ -197,7 +198,7 @@ decoder, and requires errors rather than panics.
 
 ```sh
 python3 tools/gen_testdata.py       # reference corpus, generated not committed
-cargo test -j 2
+cargo test
 cargo clippy --all-targets
 cargo fmt --all --check
 ```
