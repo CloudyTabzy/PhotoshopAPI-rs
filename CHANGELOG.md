@@ -6,6 +6,32 @@ no `repository` URL, so no version headings carry compare links.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-25
+
+Documentation only. No code, API or measurement changed.
+
+### Fixed
+
+- The README described every converting row as being copied into a scratch buffer, and the
+  benchmark notes priced the conversion of an 8-bit RGBA source at that copy. Since 0.2.0 a
+  source already in the requested layout hands its rows to the sink untouched, so both
+  descriptions were behind the code, and the quoted cost came from a measurement taken before
+  the change.
+- The benchmark notes gave the SIMD comparison as `PSD_PNG_FORCE_SCALAR=1` against a default
+  build. That variable has been read only under the `scalar-override` feature since 0.2.0, so
+  the command as written compared the kernel against itself.
+- The benchmark notes' header still said the fused conversion had not started. It shipped in
+  0.2.0.
+- The design notes' harness commands named a benchmark package that no longer exists, and
+  several notes referred to a test harness, a baseline checkout and a remaining-work list by
+  local path or by name. None of those ship with the package, so a reader following them had
+  nothing to follow; the benchmark section now states what its numbers depend on instead.
+
+### Changed
+
+- The checkout directory is now `psd-png/`, matching the crate. The package's own name,
+  version, API and contents are unaffected.
+
 ## [0.2.0] - 2026-09-25
 
 The first release of `psd-png`, the PhotoshopAPI-rs port's fork of png-spark 0.2.0 by Stephen
