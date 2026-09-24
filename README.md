@@ -139,8 +139,10 @@ the next step if the mixed-filter case ever justifies it, not this one. Two deta
 libpng, both forced by reconstructing in place: its rows live in padded buffers and may write a
 whole pixel at the last position, where here the bytes after a row are the next row's
 still-filtered data, so this kernel touches only bytes inside its own row; and its stride is a
-runtime value here, so the kernel is chosen per call. `PSD_PNG_FORCE_SCALAR=1` falls back to
-the scalar paths, which is how the two are measured against each other.
+runtime value here, so the kernel is chosen per call. SSE2 is part of the x86-64 baseline, so
+nothing is detected at run time: x86-64 builds always carry the kernel, others never do. Built
+with the `scalar-override` feature, `PSD_PNG_FORCE_SCALAR=1` falls back to the scalar paths,
+which is how the two are measured against each other; without it the environment is not read.
 
 **Inflation is pausable, not restartable.** A segment boundary can land mid-block, so resuming
 requires the bit position, the output cursor, and the start of the symbol being processed — a
@@ -187,8 +189,8 @@ cargo fmt --all --check
 ```
 
 Rust 1.96 or newer, edition 2024. CI runs the suite three ways — as built, in release, and once
-more with `PSD_PNG_FORCE_SCALAR=1` so the scalar filters are checked on a machine whose dispatch
-would otherwise never exercise them. The inherited suite covers the format; the added tests cover
+more with the `scalar-override` feature and `PSD_PNG_FORCE_SCALAR=1`, so the scalar filters are
+checked on x86-64, where the kernel would otherwise always run instead. The inherited suite covers the format; the added tests cover
 what is new here:
 
 - `tests/fused_reconstruction.rs` — fused output byte-identical to the two-pass path on
@@ -203,7 +205,7 @@ what is new here:
   rule, segmented-versus-one-shot parity over 224 reference zlib vectors at a stage barely larger than
   the window, and the SIMD `Paeth` kernel against the scalar predictor at every stride it claims
   and every length including the tails and the extremes where a lane-wise port diverges. The whole
-  suite passes with the kernel in force and with `PSD_PNG_FORCE_SCALAR=1`, so the two paths are
+  suite passes with the kernel in force and with the scalar override, so the two paths are
   held to the same bytes.
 
 The corpus is produced by a reference implementation rather than by this crate, so the tests

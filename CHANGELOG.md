@@ -60,6 +60,18 @@ package is `publish = false` and carries no `repository` URL.
   wide image could ask for tens of gigabytes. Both are now held to `max_decompressed_size`,
   and `SizeLimitExceeded` reports the buffer that was over it.
 - The crate documentation credited png-spark to the wrong author; it is Stephen Berry's.
+- The SIMD kernel's unit tests did not compile on any target but x86-64, so `cargo test`
+  failed to build on AArch64. They are now compiled only where the kernel exists.
+
+### Changed
+
+- The SSE2 `Paeth` kernel is chosen at compile time. SSE2 is part of the x86-64 baseline, so
+  x86-64 builds always carry it and other targets never do; the runtime feature detection and
+  the table of function pointers are gone, and the kernel's `unsafe` shrinks to the one call
+  into it, backed by a compile-time assertion that SSE2 is enabled.
+- `PSD_PNG_FORCE_SCALAR=1` is read only when the crate is built with the new
+  `scalar-override` feature, which the benchmark harness and the scalar CI run enable. A
+  default build no longer lets the process environment choose which code runs.
 
 ### Performance
 

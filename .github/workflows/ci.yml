@@ -52,10 +52,10 @@ jobs:
         run: cargo test --release --all-targets
       # The SIMD Paeth kernel and the scalar two-row wavefront are two implementations of one
       # filter, and only one of them runs on any given machine. Running the suite against both
-      # is what holds them to the same bytes; without this, the machine's own dispatch decides
-      # which one the corpus ever checks.
+      # is what holds them to the same bytes; without this, the target alone decides which one
+      # the corpus ever checks. The override is compiled in only under its feature.
       - name: Test (scalar filters)
-        run: cargo test --all-targets
+        run: cargo test --all-targets --features scalar-override
         env:
           PSD_PNG_FORCE_SCALAR: "1"
 

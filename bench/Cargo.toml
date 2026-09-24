@@ -7,7 +7,8 @@ publish = false
 # Benchmark harness only. `psd-png` itself has no dependencies; these exist solely to
 # compare against the crates this library aims to beat.
 [dependencies]
-psd-png = { path = ".." }
+# `scalar-override` keeps `PSD_PNG_FORCE_SCALAR=1` working for kernel-versus-scalar runs.
+psd-png = { path = "..", features = ["scalar-override"] }
 png = "0.18"
 fdeflate = "0.3"
 

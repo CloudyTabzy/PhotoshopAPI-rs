@@ -355,6 +355,7 @@ The A/B harnesses live outside the repo (`%TEMP%\opencode\ab_decode.py`, `ab_sma
 of `6d256fc` at `..\png-spark-main`. The `main` arm's `convert_bench` copy is untracked there,
 since that worktree is read-only for our purposes.
 
-`cargo test` is also a two-arm gate: `PSD_PNG_FORCE_SCALAR=1 cargo test -j 2` runs the whole suite
+`cargo test` is also a two-arm gate: `PSD_PNG_FORCE_SCALAR=1 cargo test -j 2 --features
+scalar-override` runs the whole suite
 against the scalar paths, and both must be green, which is what holds the two implementations to
 the same bytes.
