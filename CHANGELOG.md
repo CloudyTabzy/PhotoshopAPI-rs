@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Non-interlaced decoding reverses the scanline filters as inflation writes, lagging the output
+  cursor by DEFLATE's 32 KiB match window, instead of walking the whole image a second time after
+  inflation. Large decodes are 2–9% faster (measured on zlib-generated fixtures up to 36.9 MB,
+  interleaved best-of-N against `main`), small ones take the unchanged two-pass path.
+- `Decoder::decode_to` decodes a PNG one scanline at a time through a sink, in file order and the
+  file's native layout, holding only the match window plus a segment of filtered rows — a few
+  hundred kilobytes whatever the decompressed size. `max_decompressed_size` does not bound it:
+  images `decode` must refuse stream row by row. Within a few percent of `decode()` in speed.
+
 ## 0.2.0
 
 - `Encoder::encode_to` writes a PNG to any `io::Write`, filtering and compressing a band at a time. Peak working memory grows with the image's width but not its height, against the whole file plus a filtered copy of every row before.

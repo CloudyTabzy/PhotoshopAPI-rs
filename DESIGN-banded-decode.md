@@ -3,7 +3,8 @@
 **Provenance:** written by the PhotoshopAPI-rs port team. This document is **ours**, not upstream
 png-spark; it lives in this working checkout so the implementing agent has everything in one place.
 **Target:** this checkout (`png-spark`, main at `6d256fc`, the 0.2.0-era code).
-**Status:** proposal for implementation — no upstream contact has been made.
+**Status:** Phases 1 and 2 implemented on `fused-decode-frontier` with measured evidence (see
+`BENCHMARKS.md`); Phase 3 (fused conversion) not started; no upstream contact has been made.
 
 ---
 
@@ -227,7 +228,7 @@ decoder drives it with a bounded stage (window + ~256 KiB segment + four rows of
 `StreamingFrontier` that reverses rows in place and emits them through a sink under the §3.1 lag,
 and a slide that relocates the stage window and keeps one reconstructed row beyond the frontier for
 the lookback. Interlaced images take the buffered path (v1). Measured cost vs `decode()`: ≤ 5 % on
-eight of nine fixture classes (see BENCHMARKS.md §7).
+eight of nine fixture classes (see BENCHMARKS.md section 6).
 
 The original sketch, kept for the API shape:
 
@@ -352,7 +353,7 @@ from a faster Huffman decoder.
 
 ## 7. Implementation plan
 
-### Phase 1 — fused in-place reconstruction (no API change)
+### Phase 1 — fused in-place reconstruction (no API change) — DONE (`ec53075`, `0dbc3dc`)
 
 1. Add a progress hook to the inflate loop (`src/inflate.rs`, main loop ~`:851`), called at batch
    boundaries when the cursor has advanced. Keep it out of the per-symbol path; one predictable
@@ -382,7 +383,10 @@ from a faster Huffman decoder.
      alignment, invalid-filter row reporting, and assert the frontier actually reconstructs rows
      mid-stream (including the two-row wavefront) once the cursor passes the window.
 
-### Phase 2 — block-granular resumable inflate + streaming API
+### Phase 2 — block-granular resumable inflate + streaming API — DONE, revised (`2a44c37`)
+
+See §3.2's implemented revision: shipped as an output-budget mid-block pause (`zlib_segment` +
+`SegmentPause`) rather than pure block-boundary resume, closing the unbounded-block-output hole.
 
 5. Refactor `Inflater` to expose `next_block` (state: bit position + window + cursor); implement
    `zlib()` on top of it so the one-shot path is literally the same code.

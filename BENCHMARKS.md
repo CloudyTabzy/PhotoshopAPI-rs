@@ -2,13 +2,14 @@
 
 **Provenance:** written by the PhotoshopAPI-rs port team. This document is **ours**, not upstream
 png-spark; it lives in this working checkout so the implementing agent has everything in one place.
-**Subject:** Phase 1 (commits `ec53075`, `0dbc3dc`) + Phase 2 (commit pending, "decode: add
-streaming decode_to") on `fused-decode-frontier` (base `6d256fc`, main at PR #1).
+**Subject:** Phase 1 (commits `ec53075`, `0dbc3dc`) + Phase 2 (`2a44c37`) on
+`fused-decode-frontier` (base `6d256fc`, main at PR #1). Phase 3 (fused conversion) is not
+started; see `TODO.md`.
 **Companion documents:** `DESIGN-banded-decode.md` (proposal), `TODO.md` (tracking, gitignored).
 
 ---
 
-## 1. What changed
+## 1. What changed (Phase 1)
 
 `Decoder::decode` for non-interlaced images inflates the filtered stream and then reverses the
 scanline filters in a second pass. On images beyond the caches that second pass reads every row
@@ -20,7 +21,8 @@ take the plain two-pass path unchanged, so small decodes pay nothing.
 
 - Hot-loop cost: one compare per decode-loop iteration, compiled out entirely (`const ENABLED`)
   for every entry point except the decoder's non-interlaced path.
-- Public API: unchanged. `decode()` output is byte-identical to `main`.
+- Phase 1 left the public API untouched and `decode()` byte-identical to `main`; Phase 2 (§6)
+  adds `Decoder::decode_to` and `Row` on top.
 
 ## 2. Methodology
 
@@ -100,7 +102,7 @@ Reading:
 
 | gate | result |
 |---|---|
-| `cargo test -j 2` (workspace, 15 test binaries) | all green |
+| `cargo test -j 2` (workspace, 16 test targets) | all green |
 | reference corpus, 180 files (`tools/gen_testdata.py`) | byte-exact, 180/180 |
 | **fused vs legacy path** (`tests/fused_reconstruction.rs`, 9 zlib fixtures ≤ 36.9 MB) | byte-exact, 9/9 |
 | frontier unit tests (filters × strides × Paeth-run alignments, fired-mid-inflation, invalid-filter freeze) | 10/10 |
@@ -115,14 +117,14 @@ when the shared inflate block moved (87 corpus failures). The 180-file corpus al
 either bug class for this feature — see §2 — which is why the zlib-generated large fixtures and
 the fired-mid-inflation assertions exist.
 
-Not run here: `cargo fuzz` targets (need nightly + cargo-fuzz; the `inflate` and `decode` targets
-should pass unchanged since `()`-hook entry points compile to the old loop, but they should be run
-before any upstream PR). Miri: green for the filter/frontier layers; the inflate core's segmented
-variant is not Miri-covered on this Windows machine (Miri cannot enumerate directories here, and
-the fs-free inline case exceeds a practical interpreter budget), which upstream CI's Linux Miri
-runs would cover instead.
+Not run here, required before any upstream PR: the three `cargo fuzz` targets — the inflate core
+was restructured around a `SEGMENTED` const generic whose `false` instantiation is intended to
+compile to the old loop, and fuzzing is how that intention gets verified. Miri: green for the
+filter/frontier layers; the inflate core's segmented variant is not Miri-covered on this Windows
+machine (Miri cannot enumerate directories here, and the fs-free inline case exceeds a practical
+interpreter budget), which upstream CI's Linux Miri runs would cover instead.
 
-## 7. Phase 2: streaming `decode_to` (added)
+## 6. Phase 2: streaming `decode_to`
 
 `Decoder::decode_to` delivers reconstructed scanlines through a sink, in file order, in the file's
 native layout, at O(match window + one row + segment) memory — a few hundred kilobytes for ordinary
@@ -135,11 +137,12 @@ Mechanism, in one paragraph: the decoder inflates into a bounded stage through t
 `Inflater::zlib_segment`, which pauses at an output budget instead of erroring and hands the caller
 a `SegmentPause` — bit position, output cursor, and whether the pause is mid-block — enough to
 resume exactly, since Huffman tables are rebuilt per block regardless. Between segments the driver
-relocates the last `min(window, written)` bytes to the front of the stage and slides its base,
-keeping one reconstructed row beyond the frontier (the lookback row), and extending a segment by up
-to two rows when the frontier has not caught up. A `StreamingFrontier` reverses each row in place
-where it sits and emits it through the sink, under the same 32 KiB match-window lag as Phase 1.
-Interlaced images take the buffered path and are emitted from the decoded image (v1).
+slides the stage: it relocates the retained region to the front and sets its base to just above
+the reconstructed lookback row (`done_floor − pitch + 1`, so the next row's predecessor survives),
+extending a segment by up to two rows when the frontier has not caught up. A `StreamingFrontier`
+reverses each row in place where it sits and emits it through the sink, under the same 32 KiB
+match-window lag as Phase 1. Interlaced images take the buffered path and are emitted from the
+decoded image (v1).
 
 **Correctness gates:** full workspace suite green (16 targets); row-exact parity with `decode()` on
 all 9 large fixtures, 24 corpus files, interlaced included; segmented-vs-one-shot parity over all
@@ -183,13 +186,15 @@ The Adler-32 is not verified by default in either path (`Checks::Crc`), matching
 - Segment size targets 256 KiB of new filtered bytes per segment (encoder-band-sized); the stage is
   window + segment + four rows of headroom + slack.
 
-## 6. Reproduce
+## 7. Reproduce
 
 ```sh
 python3 tools/gen_testdata.py       # reference corpus
 python3 tools/gen_large_fixtures.py # this document's fixtures
+python3 tools/gen_bomb_fixture.py   # the size-ceiling fixture (§6)
 cargo test -j 2
 cargo run --release -p png-spark-bench --bin profile -- tmp/large
+cargo run --release -p png-spark-bench --bin stream_decode -- tmp/large
 ```
 
 The A/B harnesses live outside the repo (`%TEMP%\opencode\ab_decode.py`, `ab_small.py`); the
