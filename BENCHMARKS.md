@@ -1,5 +1,7 @@
 # Evidence: fused scanline reconstruction + streaming decode (branch `fused-decode-frontier`)
 
+**Naming:** the crate was `png-spark` when these measurements were taken (renamed to `psd-png`
+on 2026-09-24); package names in the commands below are the current ones.
 **Provenance:** written by the PhotoshopAPI-rs port team. This document is **ours**, not upstream
 png-spark; it lives in this working checkout so the implementing agent has everything in one place.
 **Subject:** Phase 1 (commits `ec53075`, `0dbc3dc`) + Phase 2 (`2a44c37`) on

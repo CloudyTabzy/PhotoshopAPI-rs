@@ -1,7 +1,7 @@
 //! Compressing a zlib stream in pieces, as `Encoder::encode_to` does band by band.
 
-use png_spark::deflate::Deflater;
-use png_spark::inflate::decompress_zlib_to_vec;
+use psd_png::deflate::Deflater;
+use psd_png::inflate::decompress_zlib_to_vec;
 
 const LIMIT: usize = 16 << 20;
 

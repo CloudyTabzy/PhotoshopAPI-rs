@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use png_spark::{Decoder, Row};
+use psd_png::{Decoder, Row};
 
 fn best_of(mut body: impl FnMut() -> usize) -> Duration {
     let _ = body();
@@ -46,7 +46,7 @@ fn main() {
             let mut decoder = Decoder::new();
             let mut out = Vec::with_capacity(output_size);
             decoder
-                .decode_to(&png, |row: Row<'_>| -> Result<(), png_spark::Error> {
+                .decode_to(&png, |row: Row<'_>| -> Result<(), psd_png::Error> {
                     out.extend_from_slice(row.bytes);
                     Ok(())
                 })

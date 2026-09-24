@@ -13,7 +13,7 @@ fn decodes_reference_images() {
         return;
     }
 
-    let mut decoder = png_spark::decoder::Decoder::new();
+    let mut decoder = psd_png::decoder::Decoder::new();
     let mut checked = 0;
     let mut failures = Vec::new();
 

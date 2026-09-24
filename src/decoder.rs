@@ -21,6 +21,7 @@ pub struct Image {
 
 /// One scanline of a PNG, delivered by [`Decoder::decode_to`], in the file's native layout
 /// (colour type and bit depth as stored, filter byte removed).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Row<'a> {
     /// The row's index in the output image: `0` is the top scanline.
     pub index: usize,
@@ -170,7 +171,7 @@ impl Decoder {
     /// by [`Encoder`](crate::Encoder) if that `Info` is handed to it again.
     ///
     /// ```no_run
-    /// use png_spark::{Decoder, Keep};
+    /// use psd_png::{Decoder, Keep};
     ///
     /// let mut decoder = Decoder::new();
     /// decoder.keep(Keep::Only(vec![*b"apPd"]));
@@ -209,7 +210,7 @@ impl Decoder {
     /// outright:
     ///
     /// ```
-    /// use png_spark::Decoder;
+    /// use psd_png::Decoder;
     ///
     /// let mut decoder = Decoder::new();
     /// decoder.max_decompressed_size(Some(4 << 30));
@@ -245,10 +246,10 @@ impl Decoder {
     /// ```no_run
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let png = std::fs::read("asset.png")?;
-    /// let mut decoder = png_spark::Decoder::new();
-    /// decoder.decode_to(&png, |row: png_spark::Row<'_>| {
+    /// let mut decoder = psd_png::Decoder::new();
+    /// decoder.decode_to(&png, |row: psd_png::Row<'_>| {
     ///     println!("row {}: {} bytes", row.index, row.bytes.len());
-    ///     Ok::<(), png_spark::Error>(())
+    ///     Ok::<(), psd_png::Error>(())
     /// })?;
     /// # Ok(())
     /// # }
@@ -366,7 +367,7 @@ impl Decoder {
                     }
                     let expected =
                         u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-                    if adler.map_or(true, |a| a.finish() != expected) {
+                    if adler.is_none_or(|a| a.finish() != expected) {
                         return Err(Error::from(InflateError::WrongChecksum).into());
                     }
                 }
@@ -486,12 +487,10 @@ impl Decoder {
         // Checked here rather than at the allocation, so a header naming a petabyte costs
         // the thirty-three bytes already read and not a scan of whatever follows it.
         // Streaming decode does not allocate by the size, so it does not enforce it.
-        if enforce_limit {
-            if let Some(limit) = self.max_decompressed_size {
-                let size = info.decompressed_size();
-                if size > limit {
-                    return Err(Error::SizeLimitExceeded { size, limit });
-                }
+        if enforce_limit && let Some(limit) = self.max_decompressed_size {
+            let size = info.decompressed_size();
+            if size > limit {
+                return Err(Error::SizeLimitExceeded { size, limit });
             }
         }
 
@@ -551,11 +550,11 @@ impl Decoder {
     /// would never have decoded.
     ///
     /// ```
-    /// # let png = png_spark::encode_rgba8(2, 2, &[0; 16])?;
-    /// let info = png_spark::Decoder::new().read_info(&png)?;
+    /// # let png = psd_png::encode_rgba8(2, 2, &[0; 16])?;
+    /// let info = psd_png::Decoder::new().read_info(&png)?;
     /// assert_eq!((info.width, info.height), (2, 2));
     /// assert!(info.has_alpha());
-    /// # Ok::<(), png_spark::Error>(())
+    /// # Ok::<(), psd_png::Error>(())
     /// ```
     pub fn read_info(&self, png: &[u8]) -> Result<Info, Error> {
         read_header(png, self.checks, &self.keep)

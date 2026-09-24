@@ -1,15 +1,15 @@
-//! Stage profile of png-spark's decode path over a directory of PNG fixtures.
+//! Stage profile of psd-png's decode path over a directory of PNG fixtures.
 //!
 //! Reports best-of-N wall time for the whole decode and for the stages that dominate it:
 //! chunk CRC verification, IDAT inflation, and scanline reconstruction. `other` is the
 //! remainder (chunk walk, buffer allocation, Adam7 de-interleave, copies).
 //!
-//! Usage: `cargo run --release -p png-spark-bench --bin profile -- <fixtures dir>`
+//! Usage: `cargo run --release -p psd-png-bench --bin profile -- <fixtures dir>`
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use png_spark::common::{BitDepth, ColorType, Info, Interlacing};
+use psd_png::common::{BitDepth, ColorType, Info, Interlacing};
 
 /// Best-of-N wall time, with a warm-up and a wall-clock budget, matching the crate's own
 /// benchmark methodology (minimum is the right statistic on a noisy machine).
@@ -102,10 +102,10 @@ fn main() {
         let expected = fixture.info.decompressed_size();
 
         let decode =
-            best_of(|| png_spark::decode(&fixture.data).map(|image| image.data.len()).unwrap_or(0));
-        let crc = best_of(|| png_spark::crc32::crc32(&fixture.data) as usize);
+            best_of(|| psd_png::decode(&fixture.data).map(|image| image.data.len()).unwrap_or(0));
+        let crc = best_of(|| psd_png::crc32::crc32(&fixture.data) as usize);
         let inflate = best_of(|| {
-            png_spark::inflate::decompress_zlib(&fixture.idat, expected)
+            psd_png::inflate::decompress_zlib(&fixture.idat, expected)
                 .map(|buffer| buffer.len())
                 .unwrap_or(0)
         });
@@ -116,13 +116,13 @@ fn main() {
             let row_bytes = fixture.info.row_bytes();
             let height = fixture.info.height as usize;
             let bpp = fixture.info.filter_stride();
-            let inflated = png_spark::inflate::decompress_zlib(&fixture.idat, expected).unwrap();
+            let inflated = psd_png::inflate::decompress_zlib(&fixture.idat, expected).unwrap();
             let mut buffer = inflated.clone();
             let mut best = Duration::MAX;
             for _ in 0..200 {
                 buffer.copy_from_slice(&inflated);
                 let start = Instant::now();
-                png_spark::filter::unfilter_image(&mut buffer, row_bytes, height, bpp).unwrap();
+                psd_png::filter::unfilter_image(&mut buffer, row_bytes, height, bpp).unwrap();
                 best = best.min(start.elapsed());
                 std::hint::black_box(&buffer);
             }

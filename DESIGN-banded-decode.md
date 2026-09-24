@@ -4,7 +4,12 @@
 png-spark; it lives in this working checkout so the implementing agent has everything in one place.
 **Target:** this checkout (`png-spark`, main at `6d256fc`, the 0.2.0-era code).
 **Status:** Phases 1 and 2 implemented on `fused-decode-frontier` with measured evidence (see
-`BENCHMARKS.md`); Phase 3 (fused conversion) not started; no upstream contact has been made.
+`BENCHMARKS.md`); Phase 3 (fused conversion) not started. **Parked 2026-09-24: no upstream PR is
+planned.** When smart-object PNG decode lands in the port, this becomes a decoder-only vendored
+crate under our own name (`psd-png`, vendored as `crates/psd-png`; `MIT OR Apache-2.0`, png-spark
+copyright retained); Phase 3 and the encoder / interlaced-write surface are dropped rather than
+carried. The crate was renamed to `psd-png` on 2026-09-24; the png-spark names below are what
+was measured and merged, and are left as the historical record.
 
 ---
 
@@ -425,6 +430,9 @@ See §3.2's implemented revision: shipped as an output-budget mid-block pause (`
 ---
 
 ## 9. Upstreaming — do not act without the port team's approval
+
+**Superseded 2026-09-24: no upstream PR will be pursued; the branch is parked as a decoder-only
+vendored fork (see Status). The sequence below is kept only as the record of what was considered.**
 
 - The repo has merged a PR before (`6d256fc`, PR #1, the streaming encoder), so contributions are
   plausible; **issue creation is restricted**, so the channel is a PR or direct contact.

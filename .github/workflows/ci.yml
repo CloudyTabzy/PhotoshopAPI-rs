@@ -113,16 +113,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # Round-tripping through our own code only proves self-consistency. This hands the
       # output to independent implementations of both formats.
-      - run: cargo test -p png-spark-bench
+      - run: cargo test -p psd-png-bench
 
-  package:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      # Catches a crate that builds in the workspace but not from its published tarball,
-      # which is the failure you otherwise discover after the version is permanent.
-      - run: cargo publish --dry-run
+  # A crates.io publish dry run used to sit here, and it cannot while the package is
+  # unpublished by design. Restore it the day the crate gets a `repository` to point at.
 
   fuzz:
     # Weekly and on demand only. Fuzzing is a search with no point at which it is finished,

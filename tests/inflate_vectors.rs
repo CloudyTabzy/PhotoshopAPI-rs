@@ -22,7 +22,7 @@ fn decompresses_reference_streams() {
         let compressed = std::fs::read(&path).unwrap();
         let expected = std::fs::read(path.with_extension("raw")).unwrap();
 
-        let actual = png_spark::inflate::decompress_zlib(&compressed, expected.len())
+        let actual = psd_png::inflate::decompress_zlib(&compressed, expected.len())
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert_eq!(actual, expected, "{}", path.display());
         checked += 1;

@@ -1,6 +1,6 @@
 //! The `io::Write` encoder path: same image, several `IDAT` chunks, errors reported.
 
-use png_spark::{BitDepth, ColorType, Decoder, Encoder, Info, WriteError};
+use psd_png::{BitDepth, ColorType, Decoder, Encoder, Info, WriteError};
 
 /// Pseudo-random bytes, so the image does not compress down to a single chunk.
 fn noise(len: usize) -> Vec<u8> {
@@ -41,7 +41,7 @@ fn a_streamed_image_decodes_to_the_pixels_that_went_in() {
         let mut png = Vec::new();
         Encoder::new().encode_to(&info, &pixels, &mut png).unwrap();
 
-        let image = png_spark::decode(&png).unwrap();
+        let image = psd_png::decode(&png).unwrap();
         assert_eq!(image.data, pixels, "{width}x{height}");
         assert_eq!(image.width(), width);
         assert_eq!(image.height(), height);
@@ -63,7 +63,7 @@ fn an_image_larger_than_one_chunk_is_split_across_several_idats() {
     assert_eq!(kinds.first(), Some(b"IHDR"));
     assert_eq!(kinds.last(), Some(b"IEND"));
 
-    assert_eq!(png_spark::decode(&png).unwrap().data, pixels);
+    assert_eq!(psd_png::decode(&png).unwrap().data, pixels);
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn every_colour_type_survives_the_streamed_path() {
         let pixels = noise(info.output_size());
         let mut png = Vec::new();
         Encoder::new().encode_to(&info, &pixels, &mut png).unwrap();
-        let image = png_spark::decode(&png).unwrap();
+        let image = psd_png::decode(&png).unwrap();
         assert_eq!(image.data, pixels, "{color_type:?} {bit_depth:?}");
     }
 }
@@ -100,7 +100,7 @@ fn a_palette_and_its_transparency_survive_the_streamed_path() {
     let mut png = Vec::new();
     Encoder::new().encode_to(&info, &pixels, &mut png).unwrap();
 
-    let image = png_spark::decode(&png).unwrap();
+    let image = psd_png::decode(&png).unwrap();
     assert_eq!(image.data, pixels);
     assert_eq!(image.info.palette, info.palette);
     assert_eq!(image.info.transparency, info.transparency);
@@ -109,13 +109,13 @@ fn a_palette_and_its_transparency_survive_the_streamed_path() {
 #[test]
 fn metadata_survives_the_streamed_path() {
     let (mut info, pixels) = rgba(20, 20);
-    info.metadata.push(png_spark::Chunk::new(*b"apPd", b"carried through".to_vec()));
+    info.metadata.push(psd_png::Chunk::new(*b"apPd", b"carried through".to_vec()));
 
     let mut png = Vec::new();
     Encoder::new().encode_to(&info, &pixels, &mut png).unwrap();
 
     let mut decoder = Decoder::new();
-    decoder.keep(png_spark::Keep::All);
+    decoder.keep(psd_png::Keep::All);
     let image = decoder.decode(&png).unwrap();
     assert_eq!(image.info.chunk(b"apPd"), Some(&b"carried through"[..]));
 }
@@ -183,7 +183,7 @@ fn the_buffered_and_streamed_paths_agree() {
         Encoder::new().encode_to(&info, &pixels, &mut streamed).unwrap();
 
         assert_eq!(buffered, streamed, "{width}x{height}");
-        assert_eq!(png_spark::decode(&buffered).unwrap().data, pixels);
+        assert_eq!(psd_png::decode(&buffered).unwrap().data, pixels);
     }
 }
 
@@ -206,7 +206,7 @@ fn a_row_wider_than_a_band_still_compresses() {
 
         let ratio = pixels.len() as f64 / png.len() as f64;
         assert!(ratio > 50.0, "width {width} compressed only {ratio:.2}x");
-        assert_eq!(png_spark::decode(&png).unwrap().data, pixels);
+        assert_eq!(psd_png::decode(&png).unwrap().data, pixels);
     }
 }
 
@@ -223,7 +223,7 @@ fn a_compressible_image_spanning_many_bands_round_trips() {
 
     let ratio = pixels.len() as f64 / png.len() as f64;
     assert!(ratio > 20.0, "compressed only {ratio:.2}x");
-    assert_eq!(png_spark::decode(&png).unwrap().data, pixels);
+    assert_eq!(psd_png::decode(&png).unwrap().data, pixels);
 }
 
 #[test]
@@ -241,5 +241,5 @@ fn an_encoder_reused_across_streamed_images_keeps_no_state() {
     let mut fresh = Vec::new();
     Encoder::new().encode_to(&info_b, &pixels_b, &mut fresh).unwrap();
     assert_eq!(second, fresh);
-    assert_eq!(png_spark::decode(&second).unwrap().data, pixels_b);
+    assert_eq!(psd_png::decode(&second).unwrap().data, pixels_b);
 }

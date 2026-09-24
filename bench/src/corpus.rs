@@ -12,14 +12,14 @@
 //! for chasing a two-percent regression: use the synthetic modes for that.
 //!
 //! Correctness is checked as it goes. Every re-encoded image is decoded back and compared
-//! against the pixels that went in, and png-spark's output is additionally decoded by the
+//! against the pixels that went in, and psd-png's output is additionally decoded by the
 //! `png` crate, so a corpus run doubles as a round-trip sweep over real files. The
 //! verification happens outside the timed regions.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use png_spark::common::{BitDepth, ColorType, Info, Interlacing};
+use psd_png::common::{BitDepth, ColorType, Info, Interlacing};
 
 /// One image, normalised to a form both encoders accept, exactly as `corpus-bench` does it.
 struct Source {
@@ -74,7 +74,7 @@ fn ratio(compressed: u64, raw: u64) -> f64 {
 /// format, which is what both encoders would really be handed.
 fn load(path: &Path) -> Result<Source, String> {
     let file = std::fs::read(path).map_err(|e| e.to_string())?;
-    let image = png_spark::decoder::decode(&file).map_err(|e| e.to_string())?;
+    let image = psd_png::decoder::decode(&file).map_err(|e| e.to_string())?;
 
     let mut info = Info {
         interlacing: Interlacing::None,
@@ -115,9 +115,9 @@ fn load(path: &Path) -> Result<Source, String> {
     Ok(Source { info, pixels })
 }
 
-fn encode_ours(encoder: &mut png_spark::encoder::Encoder, source: &Source, out: &mut Vec<u8>) {
+fn encode_ours(encoder: &mut psd_png::encoder::Encoder, source: &Source, out: &mut Vec<u8>) {
     out.clear();
-    encoder.encode(&source.info, &source.pixels, out).expect("png-spark encodes");
+    encoder.encode(&source.info, &source.pixels, out).expect("psd-png encodes");
 }
 
 fn encode_theirs(source: &Source, speed: png::Compression, out: &mut Vec<u8>) {
@@ -145,8 +145,8 @@ fn decode_theirs(png: &[u8], out: &mut Vec<u8>) {
 /// after that point is a bug rather than a limitation, so it panics.
 fn measure_image(
     path: &Path,
-    encoder: &mut png_spark::encoder::Encoder,
-    decoder: &mut png_spark::decoder::Decoder,
+    encoder: &mut psd_png::encoder::Encoder,
+    decoder: &mut psd_png::decoder::Decoder,
     speed: png::Compression,
     stats: &mut Stats,
 ) -> Result<(), String> {
@@ -160,9 +160,9 @@ fn measure_image(
     let our_encode = start.elapsed();
 
     let start = Instant::now();
-    let decoded = decoder.decode(&ours).expect("png-spark decodes its own output");
+    let decoded = decoder.decode(&ours).expect("psd-png decodes its own output");
     let our_decode = start.elapsed();
-    assert_eq!(decoded.data, source.pixels, "png-spark round trip differs: {}", path.display());
+    assert_eq!(decoded.data, source.pixels, "psd-png round trip differs: {}", path.display());
 
     let start = Instant::now();
     encode_theirs(&source, speed, &mut theirs);
@@ -173,9 +173,9 @@ fn measure_image(
     let their_decode = start.elapsed();
     assert_eq!(back, source.pixels, "png round trip differs: {}", path.display());
 
-    // A file only png-spark can read would be a bug the round trip above cannot see.
+    // A file only psd-png can read would be a bug the round trip above cannot see.
     decode_theirs(&ours, &mut back);
-    assert_eq!(back, source.pixels, "png disagrees with png-spark's output: {}", path.display());
+    assert_eq!(back, source.pixels, "png disagrees with psd-png's output: {}", path.display());
 
     stats.add(&Stats {
         files: 1,
@@ -238,7 +238,7 @@ const LABEL_WIDTH: usize = 38;
 const GROUP_WIDTH: usize = 7 + 1 + 9 + 1 + 9;
 
 fn header(speed: &str) {
-    println!("{:<LABEL_WIDTH$} {:>6} | {:<GROUP_WIDTH$} | png 0.18 ({speed})", "", "", "png-spark",);
+    println!("{:<LABEL_WIDTH$} {:>6} | {:<GROUP_WIDTH$} | png 0.18 ({speed})", "", "", "psd-png",);
     println!(
         "{:<LABEL_WIDTH$} {:>6} | {:>7} {:>9} {:>9} | {:>7} {:>9} {:>9}",
         "directory", "files", "ratio", "enc MP/s", "dec MP/s", "ratio", "enc MP/s", "dec MP/s",
@@ -263,7 +263,7 @@ fn print_row(name: &str, stats: &Stats) {
 ///
 /// Its own default is `Balanced`, which is what a user of that crate gets without asking,
 /// so that is the default here too. `fast` selects the fdeflate path, which is the closest
-/// thing in that crate to png-spark's single design point and the fairer speed comparison.
+/// thing in that crate to psd-png's single design point and the fairer speed comparison.
 fn compression(name: &str) -> Option<png::Compression> {
     Some(match name {
         "none" => png::Compression::NoCompression,
@@ -296,8 +296,8 @@ pub fn run(root: Option<&str>, speed: Option<&str>) {
     println!("\n=== corpus: {} ===", root.display());
     header(speed_name);
 
-    let mut encoder = png_spark::encoder::Encoder::new();
-    let mut decoder = png_spark::decoder::Decoder::new();
+    let mut encoder = psd_png::encoder::Encoder::new();
+    let mut decoder = psd_png::decoder::Decoder::new();
     let mut total = Stats::default();
     let mut skipped: Vec<(PathBuf, String)> = Vec::new();
 
@@ -335,7 +335,7 @@ pub fn run(root: Option<&str>, speed: Option<&str>) {
         total.their_decode.as_secs_f64() / total.our_decode.as_secs_f64(),
         total.our_size as f64 / total.their_size as f64,
     );
-    // Named, not counted: a file png-spark turns away is either a format it does not claim to
+    // Named, not counted: a file psd-png turns away is either a format it does not claim to
     // support or a gap in the decoder, and a bare tally hides which.
     if !skipped.is_empty() {
         println!("\n{} skipped:", skipped.len());

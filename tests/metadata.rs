@@ -1,7 +1,7 @@
 //! Arbitrary application data carried inside a PNG, in ancillary chunks.
 
-use png_spark::common::{BitDepth, Chunk, ColorType, Info};
-use png_spark::{Checks, Decoder, Error, Keep};
+use psd_png::common::{BitDepth, Chunk, ColorType, Info};
+use psd_png::{Checks, Decoder, Error, Keep};
 
 /// A small RGBA image with whatever metadata the caller wants attached.
 fn image(metadata: Vec<Chunk>) -> (Info, Vec<u8>) {
@@ -17,7 +17,7 @@ fn image(metadata: Vec<Chunk>) -> (Info, Vec<u8>) {
 /// likes, including `IDAT`.
 fn chunks(png: &[u8]) -> Vec<(usize, [u8; 4])> {
     let mut found = Vec::new();
-    let mut pos = png_spark::common::SIGNATURE.len();
+    let mut pos = psd_png::common::SIGNATURE.len();
     while pos + 12 <= png.len() {
         let length = u32::from_be_bytes(png[pos..pos + 4].try_into().unwrap()) as usize;
         found.push((pos + 4, png[pos + 4..pos + 8].try_into().unwrap()));
@@ -37,7 +37,7 @@ fn splice_before_idat(png: &[u8], kind: [u8; 4], body: &[u8]) -> Vec<u8> {
     let mut chunk = (body.len() as u32).to_be_bytes().to_vec();
     chunk.extend_from_slice(&kind);
     chunk.extend_from_slice(body);
-    chunk.extend_from_slice(&png_spark::crc32::crc32(&chunk[4..]).to_be_bytes());
+    chunk.extend_from_slice(&psd_png::crc32::crc32(&chunk[4..]).to_be_bytes());
     [&png[..at], &chunk[..], &png[at..]].concat()
 }
 
@@ -46,14 +46,14 @@ fn metadata_survives_a_round_trip_verbatim() {
     // Every byte value, including the nulls and the PNG signature itself, so that nothing in
     // the payload can be mistaken for structure on the way back.
     let mut payload: Vec<u8> = (0..=255u8).collect();
-    payload.extend_from_slice(&png_spark::common::SIGNATURE);
+    payload.extend_from_slice(&psd_png::common::SIGNATURE);
 
     let (info, data) = image(vec![
         Chunk::new(*b"apPd", payload.clone()),
         Chunk::new(*b"apPd", Vec::new()),
         Chunk::new(*b"bnDl", b"second type".to_vec()),
     ]);
-    let png = png_spark::encode(&info, &data).unwrap();
+    let png = psd_png::encode(&info, &data).unwrap();
 
     let decoded = Decoder::new().keep(Keep::All).decode(&png).unwrap();
     assert_eq!(decoded.data, data);
@@ -72,7 +72,7 @@ fn a_payload_of_the_size_an_asset_blob_actually_is_survives() {
     let payload: Vec<u8> =
         (0..1 << 20).map(|i: usize| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
     let (info, data) = image(vec![Chunk::new(*b"apPd", payload.clone())]);
-    let png = png_spark::encode(&info, &data).unwrap();
+    let png = psd_png::encode(&info, &data).unwrap();
 
     let decoded = Decoder::new().keep(Keep::All).decode(&png).unwrap();
     assert_eq!(decoded.info.chunk(b"apPd"), Some(&payload[..]));
@@ -81,9 +81,9 @@ fn a_payload_of_the_size_an_asset_blob_actually_is_survives() {
 #[test]
 fn metadata_is_dropped_unless_it_is_asked_for() {
     let (info, data) = image(vec![Chunk::new(*b"apPd", b"payload".to_vec())]);
-    let png = png_spark::encode(&info, &data).unwrap();
+    let png = psd_png::encode(&info, &data).unwrap();
 
-    let decoded = png_spark::decode(&png).unwrap();
+    let decoded = psd_png::decode(&png).unwrap();
     assert!(decoded.info.metadata.is_empty());
     assert_eq!(decoded.data, data);
 }
@@ -95,7 +95,7 @@ fn keep_only_retains_the_listed_types() {
         Chunk::new(*b"bnDl", b"unwanted".to_vec()),
         Chunk::new(*b"apPd", b"also wanted".to_vec()),
     ]);
-    let png = png_spark::encode(&info, &data).unwrap();
+    let png = psd_png::encode(&info, &data).unwrap();
 
     let decoded = Decoder::new().keep(Keep::Only(vec![*b"apPd"])).decode(&png).unwrap();
     assert_eq!(decoded.info.metadata.len(), 2);
@@ -108,11 +108,11 @@ fn re_encoding_a_decoded_image_preserves_its_metadata() {
     // Load, edit, save: the metadata rides along on `Info`, so it does not have to be
     // carried by hand.
     let (info, data) = image(vec![Chunk::new(*b"apPd", b"asset id 41".to_vec())]);
-    let png = png_spark::encode(&info, &data).unwrap();
+    let png = psd_png::encode(&info, &data).unwrap();
 
     let mut decoded = Decoder::new().keep(Keep::All).decode(&png).unwrap();
     decoded.data[0] ^= 0xff;
-    let again = png_spark::encode(&decoded.info, &decoded.data).unwrap();
+    let again = psd_png::encode(&decoded.info, &decoded.data).unwrap();
 
     let round_tripped = Decoder::new().keep(Keep::All).decode(&again).unwrap();
     assert_eq!(round_tripped.info.chunk(b"apPd"), Some(&b"asset id 41"[..]));
@@ -129,7 +129,7 @@ fn chunks_are_placed_on_the_side_of_the_palette_the_specification_requires() {
         vec![Chunk::new(*b"bKGD", vec![7]), Chunk::new(*b"gAMA", 45455u32.to_be_bytes().to_vec())];
     let data = vec![3u8; info.output_size()];
 
-    let png = png_spark::encode(&info, &data).unwrap();
+    let png = psd_png::encode(&info, &data).unwrap();
     let gama = offset_of(&png, b"gAMA").unwrap();
     let plte = offset_of(&png, b"PLTE").unwrap();
     let bkgd = offset_of(&png, b"bKGD").unwrap();
@@ -149,7 +149,7 @@ fn chunks_are_placed_on_the_side_of_the_palette_the_specification_requires() {
 fn the_encoder_refuses_chunk_types_it_must_not_write() {
     let refused = [
         // Critical: a decoder that does not know the type has to fail on it, so writing one
-        // would produce a file png-spark could not read back.
+        // would produce a file psd-png could not read back.
         *b"ApPd", *b"IDAT", // The third byte is reserved, and must be upper case.
         *b"appd", // Chunk types are four ASCII letters.
         *b"ap0d", *b"ap d",
@@ -157,7 +157,7 @@ fn the_encoder_refuses_chunk_types_it_must_not_write() {
     for kind in refused {
         let (info, data) = image(vec![Chunk::new(kind, b"payload".to_vec())]);
         assert_eq!(
-            png_spark::encode(&info, &data).unwrap_err(),
+            psd_png::encode(&info, &data).unwrap_err(),
             Error::InvalidChunkType { chunk: kind },
             "{:?} should be refused",
             core::str::from_utf8(&kind)
@@ -167,14 +167,14 @@ fn the_encoder_refuses_chunk_types_it_must_not_write() {
     // The fourth byte carries the safe-to-copy bit, and either case is meaningful.
     for kind in [*b"apPd", *b"apPD"] {
         let (info, data) = image(vec![Chunk::new(kind, b"payload".to_vec())]);
-        assert!(png_spark::encode(&info, &data).is_ok());
+        assert!(psd_png::encode(&info, &data).is_ok());
     }
 }
 
 #[test]
 fn a_corrupt_metadata_chunk_is_dropped_and_the_image_still_decodes() {
     let (info, data) = image(vec![Chunk::new(*b"apPd", b"payload".to_vec())]);
-    let mut png = png_spark::encode(&info, &data).unwrap();
+    let mut png = psd_png::encode(&info, &data).unwrap();
 
     // Corrupt the payload, leaving its length and the CRC alone.
     let start = offset_of(&png, b"apPd").unwrap() + 4;
@@ -191,13 +191,13 @@ fn a_corrupt_metadata_chunk_is_dropped_and_the_image_still_decodes() {
 
 #[test]
 fn transparency_may_not_be_smuggled_in_as_metadata() {
-    // `tRNS` is the one ancillary chunk png-spark interprets, and the encoder writes it from
+    // `tRNS` is the one ancillary chunk psd-png interprets, and the encoder writes it from
     // `Info::transparency`, where its length is checked against the colour type. A second
     // one would be an illegal duplicate, would displace the real transparency on read-back,
-    // and with an unsuitable length would make a file png-spark itself rejects.
+    // and with an unsuitable length would make a file psd-png itself rejects.
     let (info, data) = image(vec![Chunk::new(*b"tRNS", vec![0, 1, 2, 3, 4, 5])]);
     assert_eq!(
-        png_spark::encode(&info, &data).unwrap_err(),
+        psd_png::encode(&info, &data).unwrap_err(),
         Error::InvalidChunkType { chunk: *b"tRNS" }
     );
 
@@ -205,7 +205,7 @@ fn transparency_may_not_be_smuggled_in_as_metadata() {
     // metadata by a decode that keeps everything.
     let mut info = Info::new(8, 8, ColorType::Rgb, BitDepth::Eight);
     info.transparency = Some(vec![0, 1, 0, 2, 0, 3]);
-    let png = png_spark::encode(&info, &vec![0u8; info.output_size()]).unwrap();
+    let png = psd_png::encode(&info, &vec![0u8; info.output_size()]).unwrap();
     assert_eq!(chunks(&png).iter().filter(|(_, kind)| kind == b"tRNS").count(), 1);
 
     let decoded = Decoder::new().keep(Keep::All).decode(&png).unwrap();
@@ -219,14 +219,14 @@ fn a_chunk_the_encoder_could_not_write_is_never_retained() {
     // encoder would refuse is dropped on the way in, however broadly chunks were asked for.
     // These are all well formed otherwise, CRC included: only the type is wrong.
     let (info, data) = image(Vec::new());
-    let png = png_spark::encode(&info, &data).unwrap();
+    let png = psd_png::encode(&info, &data).unwrap();
 
     for kind in [*b"ab1D", *b"abcd", [b'a', b'p', 0, b'd']] {
         let spliced = splice_before_idat(&png, kind, b"payload");
         let decoded = Decoder::new().keep(Keep::All).decode(&spliced).unwrap();
         assert!(decoded.info.metadata.is_empty(), "{kind:?} should not be retained");
         assert_eq!(decoded.data, data);
-        png_spark::encode(&decoded.info, &decoded.data)
+        psd_png::encode(&decoded.info, &decoded.data)
             .expect("a decoded image must always re-encode");
     }
 

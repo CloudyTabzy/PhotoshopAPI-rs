@@ -32,7 +32,7 @@ fn main() {
     for path in files {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let png = std::fs::read(&path).expect("read fixture");
-        let best = best_of(|| png_spark::decode(&png).map(|image| image.data.len()).unwrap_or(0));
+        let best = best_of(|| psd_png::decode(&png).map(|image| image.data.len()).unwrap_or(0));
         println!(
             "{name:<26} {:>8.1} KB {:>10.0} ns",
             png.len() as f64 / 1024.0,

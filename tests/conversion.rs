@@ -1,7 +1,7 @@
 //! Checks pixel-format conversion against hand-computed expectations.
 
-use png_spark::common::{BitDepth, ColorType, Info};
-use png_spark::decoder::Image;
+use psd_png::common::{BitDepth, ColorType, Info};
+use psd_png::decoder::Image;
 
 fn image(info: Info, data: Vec<u8>) -> Image {
     Image { info, data }
@@ -92,7 +92,7 @@ fn corpus_converts_cleanly() {
         eprintln!("skipping: {} not generated", dir.display());
         return;
     }
-    let mut decoder = png_spark::decoder::Decoder::new();
+    let mut decoder = psd_png::decoder::Decoder::new();
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().and_then(|e| e.to_str()) != Some("png") {

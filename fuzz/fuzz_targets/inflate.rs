@@ -10,5 +10,5 @@ const MAX_OUTPUT: usize = 16 << 20;
 
 fuzz_target!(|data: &[u8]| {
     // The unknown-length path, since it is the one that retries and reallocates.
-    let _ = png_spark::inflate::decompress_zlib_to_vec(data, MAX_OUTPUT);
+    let _ = psd_png::inflate::decompress_zlib_to_vec(data, MAX_OUTPUT);
 });

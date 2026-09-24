@@ -1,12 +1,14 @@
 [package]
-name = "png-spark"
-version = "0.2.0"
+name = "psd-png"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
-description = "A fast, zero-dependency PNG encoder and decoder supporting every colour type and bit depth."
-repository = "https://github.com/stephenberry/png-spark"
-keywords = ["png", "image", "deflate", "inflate", "encoding"]
+description = "Streaming, memory-bounded PNG decoder with no dependencies, built for the PhotoshopAPI-rs port."
+# No `repository` until this lives somewhere that is not the author's GitHub. The crate is
+# vendored into the PhotoshopAPI-rs workspace, not fetched from a registry.
+publish = false
+keywords = ["png", "image", "decode", "inflate", "streaming"]
 categories = ["multimedia::images", "compression"]
 exclude = ["bench/", "fuzz/", ".github/"]
 

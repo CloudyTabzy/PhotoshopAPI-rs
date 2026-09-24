@@ -1,11 +1,11 @@
 //! Reading a file's header without decoding it, and asking what that header means.
 
-use png_spark::{BitDepth, Chunk, ColorType, Decoder, Error, Info, Keep};
+use psd_png::{BitDepth, Chunk, ColorType, Decoder, Error, Info, Keep};
 
 /// Encodes an image described by `info`, filling the pixels with something reproducible.
 fn encoded(info: &Info) -> Vec<u8> {
     let data: Vec<u8> = (0..info.output_size()).map(|i| (i * 31) as u8).collect();
-    png_spark::encode(info, &data).unwrap()
+    psd_png::encode(info, &data).unwrap()
 }
 
 fn palette_info() -> Info {
@@ -23,7 +23,7 @@ fn a_well_formed_file_reads_the_same_header_either_way() {
         palette_info(),
     ] {
         let png = encoded(&info);
-        assert_eq!(png_spark::read_info(&png).unwrap(), png_spark::decode(&png).unwrap().info);
+        assert_eq!(psd_png::read_info(&png).unwrap(), psd_png::decode(&png).unwrap().info);
     }
 }
 
@@ -32,7 +32,7 @@ fn splice_before_end(png: &[u8], kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let mut chunk = (body.len() as u32).to_be_bytes().to_vec();
     chunk.extend_from_slice(kind);
     chunk.extend_from_slice(body);
-    let crc = png_spark::crc32::crc32(&chunk[4..]);
+    let crc = psd_png::crc32::crc32(&chunk[4..]);
     chunk.extend_from_slice(&crc.to_be_bytes());
 
     let split = png.len() - 12;
@@ -48,17 +48,17 @@ fn the_header_read_is_the_weaker_check_of_the_two() {
     // only on decode. The asymmetry runs one way and has to: a file this accepts may still
     // fail to decode, but a file this rejects would never have decoded.
     let png = encoded(&Info::new(4, 4, ColorType::Rgba, BitDepth::Eight));
-    assert!(png_spark::decode(&png).is_ok());
+    assert!(psd_png::decode(&png).is_ok());
 
     // An unknown critical chunk after the image data.
     let hidden = splice_before_end(&png, b"ZzZz", b"");
-    assert!(png_spark::read_info(&hidden).is_ok(), "the header is intact and is read as such");
-    assert_eq!(png_spark::decode(&hidden), Err(Error::UnknownCriticalChunk { chunk: *b"ZzZz" }));
+    assert!(psd_png::read_info(&hidden).is_ok(), "the header is intact and is read as such");
+    assert_eq!(psd_png::decode(&hidden), Err(Error::UnknownCriticalChunk { chunk: *b"ZzZz" }));
 
     // A truncated trailer after the image data.
     let cut = &png[..png.len() - 4];
-    assert!(png_spark::read_info(cut).is_ok());
-    assert!(matches!(png_spark::decode(cut), Err(Error::TruncatedChunk)));
+    assert!(psd_png::read_info(cut).is_ok());
+    assert!(matches!(psd_png::decode(cut), Err(Error::TruncatedChunk)));
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn transparency_is_read_because_it_precedes_the_image_data() {
     info.transparency = Some(vec![0, 64, 128]);
     let png = encoded(&info);
 
-    let read = png_spark::read_info(&png).unwrap();
+    let read = psd_png::read_info(&png).unwrap();
     assert_eq!(read.transparency, info.transparency);
     assert_eq!(read.palette, info.palette);
     assert!(read.has_alpha());
@@ -84,7 +84,7 @@ fn metadata_before_the_image_data_is_kept_when_asked_for() {
 
     let read = Decoder::new().keep(Keep::All).read_info(&png).unwrap();
     assert_eq!(read.chunk(b"apPd"), Some(&b"header side"[..]));
-    assert_eq!(png_spark::read_info(&png).unwrap().metadata, Vec::new());
+    assert_eq!(psd_png::read_info(&png).unwrap().metadata, Vec::new());
 }
 
 #[test]
@@ -93,8 +93,8 @@ fn a_file_with_no_image_data_is_not_a_header_either() {
 
     // Signature and IHDR alone: the header parses, but the file promises an image it does
     // not contain, and saying so is more useful than describing pixels that are not there.
-    assert!(matches!(png_spark::read_info(&png[..33]), Err(Error::MissingImageData)));
-    assert!(matches!(png_spark::read_info(b"not a png"), Err(Error::NotAPng)));
+    assert!(matches!(psd_png::read_info(&png[..33]), Err(Error::MissingImageData)));
+    assert!(matches!(psd_png::read_info(b"not a png"), Err(Error::NotAPng)));
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn an_indexed_file_with_no_palette_is_refused_at_the_header() {
     let mut stripped = png[..start].to_vec();
     stripped.extend_from_slice(&png[start + length + 12..]);
 
-    assert!(matches!(png_spark::read_info(&stripped), Err(Error::MissingPalette)));
+    assert!(matches!(psd_png::read_info(&stripped), Err(Error::MissingPalette)));
 }
 
 #[test]

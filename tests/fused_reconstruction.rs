@@ -4,7 +4,7 @@
 //! `Decoder::decode` reverses scanline filters as inflation's output cursor advances. The
 //! generated fixtures exceed DEFLATE's 32 KiB match window in their filtered size and are
 //! compressed by CPython's zlib, a full LZ77 match finder, so their streams contain matches
-//! reaching back across reconstructed rows. png-spark's own encoder cannot produce such
+//! reaching back across reconstructed rows. psd-png's own encoder cannot produce such
 //! streams (it emits zero-run, distance-1 matches only), which is why these exist.
 //!
 //! Run `python3 tools/gen_large_fixtures.py` to produce the fixtures. The test skips when
@@ -12,9 +12,9 @@
 
 use std::path::Path;
 
-use png_spark::filter::unfilter_image;
-use png_spark::inflate::decompress_zlib;
-use png_spark::{Decoder, Interlacing};
+use psd_png::filter::unfilter_image;
+use psd_png::inflate::decompress_zlib;
+use psd_png::{Decoder, Interlacing};
 
 /// The frontier's soundness condition: it never reconstructs a row whose bytes a later
 /// match could still reach. Fixtures must exceed this to exercise the live path.
@@ -38,7 +38,7 @@ fn idat_bytes(png: &[u8]) -> Vec<u8> {
 }
 
 /// The legacy two-pass decode: inflate everything, then unfilter, in place.
-fn legacy_decode(png: &[u8], info: &png_spark::Info) -> Vec<u8> {
+fn legacy_decode(png: &[u8], info: &psd_png::Info) -> Vec<u8> {
     let idat = idat_bytes(png);
     let mut buffer = decompress_zlib(&idat, info.decompressed_size()).unwrap();
     unfilter_image(&mut buffer, info.row_bytes(), info.height as usize, info.filter_stride())

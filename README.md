@@ -1,205 +1,162 @@
-# png-spark
+# psd-png
 
-[![CI](https://github.com/stephenberry/png-spark/actions/workflows/ci.yml/badge.svg)](https://github.com/stephenberry/png-spark/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/png-spark.svg)](https://crates.io/crates/png-spark)
-[![docs.rs](https://docs.rs/png-spark/badge.svg)](https://docs.rs/png-spark)
+A streaming PNG decoder with **zero dependencies**, built to decode smart-object rasters for
+PhotoshopAPI-rs, the Rust port of PhotoshopAPI.
 
-A fast PNG encoder and decoder for Rust, with **zero dependencies**. Complete format coverage, and a single compression setting chosen for speed.
-
-png-spark implements the whole PNG format — every colour type, every bit depth, interlaced or not — on top of its own DEFLATE codec, its own checksums, and its own filter code. Nothing outside the standard library is involved.
-
-```toml
-[dependencies]
-png-spark = "0.2"
-```
+`decode_to` hands out one reconstructed scanline at a time while holding only DEFLATE's 32 KiB
+match window, a segment of filtered rows, and the row being worked on — a few hundred kilobytes
+whatever the image's size. That is the whole point of the crate: a raster larger than the
+whole-image path's 512 MiB ceiling, or larger than the memory you want to spend on someone
+else's pixels, still decodes row by row straight into your own buffer.
 
 ```rust
-// Decode
-let image = png_spark::decode(&std::fs::read("input.png")?)?;
-println!("{}x{} {:?}", image.width(), image.height(), image.color_type());
-let rgba = image.to_rgba8()?;
+use psd_png::Decoder;
 
-// Encode
-let png = png_spark::encode_rgba8(image.width(), image.height(), &rgba)?;
-std::fs::write("output.png", png)?;
+let png = std::fs::read("smart-object.png")?;
+Decoder::new().decode_to(&png, |row: psd_png::Row<'_>| {
+    // row.index counts from zero; row.bytes is one scanline, filters already reversed,
+    // in the file's own layout — planar, one channel after another, at its native depth.
+    planar.push(row.bytes);
+    Ok::<(), psd_png::Error>(())
+})?;
 ```
 
-Or write straight to a file, or anything else that takes bytes, without the encoded image ever being resident:
+Rows arrive in file order, each borrowed only for the duration of the call. A sink error aborts
+the decode and is returned; rows already delivered stay delivered.
 
-```rust
-let mut file = std::io::BufWriter::new(std::fs::File::create("output.png")?);
-png_spark::Encoder::new().encode_to(&image.info, &image.data, &mut file)?;
-```
+## Status and provenance
 
-## Why
+This crate is **not published to a registry**. It is developed in its own checkout and vendored
+into the PhotoshopAPI-rs workspace as `crates/psd-png` when smart-object raster decoding lands
+there. Nothing in this repository is a GitHub fork, and the package carries no `repository` URL
+until it has a home of its own.
 
-The usual Rust PNG stack is `png` + `fdeflate` + `miniz_oxide` + `flate2` + `crc32fast` + a handful of others: 15 crates, and a build that does about five times the compiler work of this one. png-spark is one crate with no dependency graph at all, and it is faster.
+It began as **[png-spark](https://github.com/stephenberry/png-spark) 0.2.0 by Stephen Berry**,
+which contributed:
 
-| | png-spark | png 0.18 + fdeflate 0.3 |
-| --- | --- | --- |
-| Crates compiled | 1 | 15 |
-| Clean release build | 1.0 s CPU | 5.3 s CPU |
+- the complete PNG format layer — every colour type, every bit depth, Adam7 on read, chunk
+  parsing, ancillary-chunk retention, the 512 MiB ceiling and the fallible allocation behind it;
+- the DEFLATE codec, the CRC-32 and Adler-32 implementations with their SIMD paths, and the
+  scanline filters, forward and reverse.
 
-## Performance
+The PhotoshopAPI-rs port team added:
 
-In one line: png-spark encodes an order of magnitude faster than `png` and decodes a little faster, at the same file size on synthetic images and about a tenth larger on real ones.
+- **fused reconstruction** — the scanline filters are reversed as inflation writes, lagging the
+  output cursor by the match window, instead of walking the whole image a second time afterwards;
+- **`decode_to`** — the resumable, budget-paused streaming decoder above.
 
-Measured on an Apple M-series laptop against `png` 0.18 and `fdeflate` 0.3, over twelve 1920×1080 images spanning the compressibility range — smooth gradients, flat UI graphics, noisy photographs, and pure noise — in grey, RGB and RGBA. `cargo run --release -p png-spark-bench` reproduces all of it.
+Both upstream licences (`MIT OR Apache-2.0`) and the original copyright
+(`Copyright (c) 2026 Stephen Berry`) are retained unchanged; see [Licence](#licence).
 
-### Decoding
-
-| | speed |
-| --- | --- |
-| **PNG decode** vs `png` | **5% faster** — never slower on any of the 12, and up to 23% faster |
-| **zlib inflate** vs `fdeflate` | **18% faster** — faster on all 12, by 4% at worst and 2.3x at best |
-
-Inflate wins most on compressible data, where a redesigned Adler-32 and shorter dependency chains in the Huffman decode loop matter most; on incompressible data both implementations are bound by the same serial table lookups.
-
-`to_rgba8` and `to_rgb8` run at roughly 1.8 GP/s over the corpus below. Layouts that already match the request are a straight copy, and the rest resolve the colour type and bit depth once per scanline rather than once per pixel.
-
-### Encoding
-
-Whole-PNG encoding, filtering included, against `png` at its default setting:
-
-| | speed | output size |
-| --- | --- | --- |
-| **PNG encode** vs `png` | **12.4x faster** | **1% smaller** |
-
-`png` spends most of its encode time scoring filters. png-spark scores them on a sample of each row, and scores each candidate through a specialization of the loop rather than a filter argument, so the predictor is straight-line code instead of a branch on every byte examined.
-
-Raw zlib compression, against `fdeflate` alone:
-
-| | speed | output size |
-| --- | --- | --- |
-| **zlib deflate** vs `fdeflate` | **20% faster** | **19% smaller** |
-
-Faster *and* a fifth smaller. It reaches 6–8x on incompressible input, where it recognises the data is not worth coding and stops trying, and is about 20% slower on the flat graphics `fdeflate` is specialised for.
-
-There is no compression level to choose; see [One compression setting](#design-notes) below for why.
-
-### On a real corpus
-
-The twelve images above are synthetic, all the same size and shape. The QOI benchmark suite is 2848 real files — photographs, screenshots, game textures, icons and wallpapers — and `cargo run --release -p png-spark-bench -- corpus` reports it per directory ([see below](#real-world-corpora) for how to fetch it). Against `png` at its default setting, over the whole suite:
-
-| | speed | output size |
-| --- | --- | --- |
-| **PNG encode** vs `png` | **17.9x faster** | **11% larger** |
-
-Decoding is **30% faster** across the same files. Each library decodes its own re-encoded output there rather than a shared file, so it is a coarser figure than the 5% above, and it flatters png-spark: its own encoder picks `Paeth` for about two thirds of all scanline bytes, which is the filter the reverse pass below is fastest at.
-
-Size is where the single compression setting shows its cost, and the cost is not uniform. On the suite's photographs png-spark is about **23x faster for 1–10% more bytes**. On flat graphics — icons, web screenshots, tiled textures — its files are 20–46% larger, because that is exactly the data an LZ77 match finder is good at and png-spark does not have one.
-
-Against `png`'s `Fast` setting, which routes through `fdeflate` instead of flate2, the picture is closer: png-spark writes 3% smaller files but takes about 15% longer. `fdeflate` writes with a Huffman code fixed in advance for PNG data, where png-spark fits one to the block in front of it, and on files this size that counting pass is not fully amortised. Run `cargo run --release -p png-spark-bench -- corpus tmp/corpus/qoi fast` to see it per directory.
-
-## What it does
+## What it decodes
 
 - Colour types: grayscale, RGB, indexed, grayscale+alpha, RGBA
 - Bit depths: 1, 2, 4, 8, 16
-- Interlacing: Adam7 on read; output is always non-interlaced
-- Chunks: `IHDR`, `PLTE`, `tRNS`, `IDAT`, `IEND`, plus any ancillary chunks you attach; unrecognised critical chunks are an error
+- Interlacing: Adam7 on read; non-interlaced images stream, interlaced ones are decoded into a
+  buffer first and emitted from there
+- Chunks: `IHDR`, `PLTE`, `tRNS`, `IDAT`, `IEND`, plus any ancillary chunks you ask to keep;
+  an unrecognised *critical* chunk is an error
 - Conversion to 8-bit RGB or RGBA, resolving palettes, `tRNS`, and sub-byte depths
+- The whole-file path: `decode` returns pixels in the file's own format, which is the only
+  representation that is always correct and always free; `read_info` stops at the image data
 
 Not supported: APNG, and writing interlaced files.
 
-## Reading files you did not write
+## Performance
 
-`IHDR` states an image's dimensions in thirteen bytes, and a decoder needs the buffer they imply before it can read any of the compressed data, so a seventy-byte file can name a size in petabytes. The decoder carries a ceiling on that size, `DEFAULT_MAX_DECOMPRESSED_SIZE`, of 512 MiB, which is room for a 16-bit RGBA image of 8000×8000 pixels. A header over it is an error rather than an allocation, and `Decoder::max_decompressed_size` raises or removes it where the images really are that large.
+Measured against png-spark 0.2.0 on this machine, interleaved best-of-N in a single session
+because it thermally throttles; the noise floor measured the same way is ±0.00%. Full
+methodology, tables and caveats are in `BENCHMARKS.md`.
 
-An allocation the operating system refuses comes back as `Error::OutOfMemory` rather than aborting the process. `read_info` parses the header and colour chunks and stops at the image data, for a caller that wants to decide something about a file before decoding it.
+| | result |
+| --- | --- |
+| Fused reconstruction, 9 large zlib-generated fixtures (0.1–36.9 MB filtered) | **1.8 % to 8.9 % faster, 9/9** |
+| Small files around and below the 32 KiB window | unchanged; the gate sends them down the inherited two-pass path |
+| `decode_to` vs `decode`, sink copying into a presized buffer | within **5 %** on 8 of 9 classes (16-bit gradients +27 %, an absolute 0.5 ms) |
+| `decode_to` vs `decode`, sink discarding rows | **faster** — it never allocates or first-touches the whole image |
+| A 16384×16384 RGBA image (1.07 GB filtered) | refused by `decode` under the default ceiling; streams through `decode_to` in a ~300 KB stage |
 
-## Carrying your own data in a PNG
+Every PNG in the port's own fixture corpus (12 files, 512×512 and 200×108 RGBA) clears the
+fusion threshold, so the fused path is the one that runs in production rather than a benchmark
+shape.
 
-PNG stores everything in typed chunks, and a decoder must skip any *ancillary* chunk it does not recognise. An ancillary chunk of your own is therefore a place to keep application data inside the image file: arbitrary bytes, just under 2 GiB of them, with no escaping and no encoding, which every other PNG reader ignores.
+## Inherited encoder, being removed
 
-```rust
-use png_spark::{Chunk, Decoder, Keep};
-
-// Attach data to an image on the way out.
-image.info.metadata.push(Chunk::new(*b"apPd", asset_id.to_vec()));
-let png = png_spark::encode(&image.info, &image.data)?;
-
-// Ask for it on the way back in.
-let image = Decoder::new().keep(Keep::Only(vec![*b"apPd"])).decode(&png)?;
-let asset_id = image.info.chunk(b"apPd");
-```
-
-The four type bytes are not free-form. `apPd` is lower case first, marking the chunk ancillary; lower case second, marking it private to one application and so unable to collide with a registered type; upper case third, which the specification reserves; and lower case fourth, saying an editor that does not understand the chunk may still copy it through. The encoder rejects a type that breaks those rules rather than writing a file it could not read back, and writes each chunk on whichever side of `PLTE` the specification requires. What a *registered* type means is not checked, so two `gAMA` chunks or a `hIST` without a palette are the caller's mistake to avoid; private types have no such rules to break.
-
-Ignoring a chunk is not the same as preserving it. A tool that rewrites the file may well drop it: libpng discards unknown chunks unless asked for them, and optimisers such as oxipng and pngcrush strip ancillary chunks by default. Data that has to survive an arbitrary third-party tool does not belong here; data that has to survive your own pipeline does.
-
-Decoding keeps nothing by default, since retaining a chunk means copying it and nothing the decoder returns depends on one. `Keep::All` takes everything the file carries. What is kept travels on `Info`, so handing a decoded image straight back to the encoder preserves its metadata. A chunk that fails its CRC is dropped rather than returned.
-
-Payloads are written exactly as given; compress yours first if it is worth compressing.
+The PNG **encoder** and the DEFLATE compressor under it are still present, unchanged and still
+tested — this repository's history is one of identity first, subtraction second. The port
+decodes rasters and never writes one, so the encoder is not part of the plan: it is removed in
+the next step, and the README, crate docs and API are written as though it is already gone.
+Until then it carries no support commitment.
 
 ## Design notes
 
-**Encoding works in bands.** A scanline's filter is chosen from the row above it and the compressor's blocks are independent of one another, so the encoder filters and compresses a couple of hundred kilobytes at a time rather than building a filtered copy of the whole image and compressing that. The band is still in cache when the compressor reads it, and `encode_to` can hand each `IDAT` to a sink as it is finished, so what is held grows with the image's width but not with its height. A chunk states its length before its data, which is why the compressed output is buffered to a chunk's worth and no further.
+**Reconstruction is fused into inflation.** Reversing a PNG filter is serial along a row, so the
+inherited decoder did it in a second pass over the whole image — reading every row long after
+inflation had evicted it. The streaming decoder instead reverses each row in place as the output
+cursor passes it, held back by DEFLATE's maximum match distance (32 KiB) so that no future match
+can read a byte reconstruction has rewritten. Streams no larger than one window plus one row can
+never trigger this and take the original two-pass path, so small decodes pay nothing.
 
-**Decoding gives you the file's own format.** `decode` returns pixels exactly as the file stores them, because that is the only representation that is always correct and always free. `to_rgba8` and `to_rgb8` convert when you want a uniform layout.
+**Inflation is pausable, not restartable.** A segment boundary can land mid-block, so resuming
+requires the bit position, the output cursor, and the start of the symbol being processed — a
+match the decoder refused to take before the pause is rewound and retried. Huffman tables are
+rebuilt per block regardless, which is what makes any pause point recoverable. A single-block
+stream therefore obeys the same memory bound as a many-block one.
 
-**The decompressor is not a state machine.** PNG says up front how many bytes the image data expands to, so the whole stream is decoded in one call against one buffer. That removes the per-symbol state checks and output clamping a resumable decoder needs, and leaves the bit buffer and output cursor in registers.
+**The decompressor is not a state machine.** The one-shot path decodes a whole stream in one call
+against one buffer, which removes the per-symbol state checks a resumable decoder needs and
+leaves the bit buffer and output cursor in registers. Resumability costs nothing on the path that
+does not use it: the segmented loop is a const-generic instantiation, and the ordinary decode
+never enters it.
 
-**Checksums use the hardware.** Adler-32 has an AArch64 NEON path that runs at roughly 31 GB/s; CRC-32 uses the AArch64 CRC instructions where present and slice-by-16 otherwise. Both fall back to portable code, and every implementation is tested against the same reference.
+**Checksums use the hardware.** Adler-32 has an AArch64 NEON path; CRC-32 uses the AArch64 CRC
+instructions where present and slice-by-16 otherwise. Both fall back to portable code, and every
+implementation is tested against the same reference.
 
-**Chunk CRCs are checked; the Adler-32 is not, by default.** The Adler-32 inside the compressed stream covers the same bytes the chunk CRC already covered. Checking one of them catches the same file corruption for one pass over the data instead of two. `Decoder::checks(Checks::Full)` turns both on.
+**Chunk CRCs are checked; the Adler-32 is not, by default.** The Adler-32 inside the compressed
+stream covers the same bytes the chunk CRC already covered, so checking one catches the same
+corruption for one pass instead of two. `Decoder::checks(Checks::Full)` turns both on, and
+streaming verifies it incrementally per segment.
 
-**A bad CRC on an ancillary chunk drops the chunk, not the file.** Nothing a decode returns is built from a colour profile or a text comment, and files exist whose metadata was rewritten without recomputing its checksum. Losing the image over four stale bytes describing something discarded anyway helps nobody, so it is skipped, as libpng and the `png` crate both do. On a critical chunk it remains an error.
-
-**One compression setting, deliberately.** There is no level knob. The compressor codes literals and runs of zero bytes and nothing else: no hash table, no match finder, no token buffer, just two sequential passes over each block. Zero runs are the repetition filtered image data is actually made of, since a flat region leaves a zero residual under any of the PNG filters, and finding them costs a scan rather than a random memory access per input byte.
-
-An LZ77 match finder on top of this buys a few percent of size for several times the time — and on photographs it buys nothing at all, turning up short matches that displace literals the entropy coder was already handling well and leaving the file *larger*. That is the wrong trade for a library whose reason to exist is speed, so it is not offered. If you want the last few percent, use the `png` crate.
-
-**Blocks reuse the previous block's Huffman code.** Only the first block of a stream is scanned twice, once to count and once to write. Every block after it is written in a single pass using the code fitted to the block before, while counting its own symbols for the next one. Adjacent bands of the same image have near-identical byte distributions, so a code one block out of date costs a fraction of a percent and halves the number of times the data is walked.
-
-**Filters are sticky.** Consecutive scanlines filtered the same way stay similar to each other, and that similarity is what becomes a match one scanline back. A filter has to beat the previous row's choice by an eighth before the encoder will switch, which is worth a few percent on its own.
-
-**Reverse `Paeth` runs two rows at a time.** Undoing a filter is serial along a row — pixel *x* cannot start until pixel *x-1* is known — and `Paeth` is a long enough chain of compares and selects that the loop waits far more than it works: on its own it reconstructs at around 800 MB/s where `Up` manages 28 GB/s. Two rows offset by one pixel break the wait. Row *r* pixel *x* and row *r+1* pixel *x-1* depend only on values settled before the step, so the two predictions issue together and the chain retires two pixels instead of one. It is worth 1.8x on 8-bit RGBA, and about 15% on decoding a real corpus, where `Paeth` covers 42% of scanline bytes and adjacent rows share it often enough for the pair path to cover 92% of them. Rows without a `Paeth` neighbour fall back to the one-row loop.
+**A bad CRC on an ancillary chunk drops the chunk, not the file.** Nothing a decode returns is
+built from a colour profile or a text comment, and files exist whose metadata was rewritten
+without recomputing its checksum.
 
 ## Safety
 
-The crate is safe Rust apart from four narrow places, each with the invariant that justifies it written next to it: the literal stores and the match reads and copies in the inflate loop, the bit writer's eight-byte flush, the SIMD checksum paths, and the fallible zeroed allocation the decoder sizes its buffers with. Everything else — chunk parsing, filtering, conversion — is bounds-checked. Malformed input is a tested case: the suite feeds truncated files, single-bit corruptions at every byte, and thousands of random byte strings through the decoder, and requires errors rather than panics.
+Safe Rust apart from the inherited narrow places, each with the invariant that justifies it
+written next to it: the literal stores and match reads and copies in the inflate loop, the bit
+writer's eight-byte flush, the SIMD checksum paths, and the fallible zeroed allocation the
+decoder sizes its buffers with. Everything else — chunk parsing, filtering, conversion — is
+bounds-checked. Malformed input is a tested case: the suite feeds truncated files, single-bit
+corruptions at every byte, and thousands of random byte strings through the decoder, and
+requires errors rather than panics.
 
 ## Testing
 
 ```sh
-python3 tools/gen_testdata.py     # generate the reference corpus (once)
-cargo test                        # 74 tests, no dependencies
-cargo test -p png-spark-bench     # cross-checks against png and fdeflate
-cargo clippy --all-targets        # clean at -D warnings
-cargo fmt --all --check           # style settings live in rustfmt.toml
+python3 tools/gen_testdata.py       # reference corpus, generated not committed
+cargo test -j 2
+cargo clippy --all-targets
+cargo fmt --all --check
 ```
 
-Rust 1.96 or newer, edition 2024. CI runs all of the above on Linux, macOS and Windows, across x86-64 and AArch64, plus Miri over the unsafe code and a publish dry run.
+Rust 1.96 or newer, edition 2024. The inherited suite covers the format; the added tests cover
+what is new here:
 
-### Fuzzing
+- `tests/fused_reconstruction.rs` — fused output byte-identical to the two-pass path on
+  zlib-generated fixtures up to 36.9 MB, including rows fired mid-inflation
+- `tests/streaming_decode.rs` — row-exact parity with `decode` across large fixtures, corpus
+  files and interlaced images; sink-error abort; a 1.07 GB image past the ceiling; corrupt
+  streams agreeing between the two paths
+- unit tests in `filter.rs` and `inflate.rs` — the frontier's lag invariant, the slide rule, and
+  segmented-versus-one-shot parity over 224 reference zlib vectors at a stage barely larger than
+  the window
 
-Three targets, run weekly in CI and available locally with a nightly toolchain and `cargo install cargo-fuzz`:
-
-```sh
-python3 tools/gen_testdata.py                    # seeds, if not already generated
-mkdir -p fuzz/corpus/decode fuzz/corpus/roundtrip
-cp tmp/png/*.png fuzz/corpus/decode/
-cp tmp/png/*.png fuzz/corpus/roundtrip/
-cargo +nightly fuzz run decode                   # arbitrary bytes through the decoder
-cargo +nightly fuzz run roundtrip                # decode, re-encode, decode, compare pixels
-cargo +nightly fuzz run inflate                  # arbitrary bytes through the decompressor
-```
-
-`decode` and `inflate` fail on a panic or a hang. `roundtrip` additionally fails on a wrong answer: whatever the decoder accepts must survive being written back out and read again with the same pixels. Seeding from the generated images matters, since a fuzzer starting from nothing spends most of its budget rediscovering the PNG signature.
-
-The corpus is produced by a reference implementation rather than by png-spark, so the tests check the format and not just self-consistency: 224 zlib streams from zlib itself at every level and window size, and 180 PNGs covering every colour type, bit depth, interlace mode and filter combination. The benchmark crate additionally round-trips png-spark's output through `fdeflate` and the `png` crate, and `fdeflate`'s output back through png-spark.
-
-### Real-world corpora
-
-The figures above come from a synthetic set of twelve 1920×1080 images, which says nothing about small files, indexed colour, or the screenshot and icon data real workloads are full of. Two public corpora cover that, and the `png` crate measures itself against both, so the numbers line up with the ones that project publishes:
-
-```sh
-python3 tools/fetch_corpus.py image-png   # 15 files, ~14 MB, from image-rs/image-png
-python3 tools/fetch_corpus.py qoi         # ~2800 files, 1.1 GB, the QOI benchmark suite
-cargo run --release -p png-spark-bench -- corpus
-```
-
-Both land in `tmp/corpus/`, which is gitignored, and keep their own licences. The `corpus` mode re-encodes and re-decodes every file, reporting compression ratio and megapixels per second for png-spark and `png` side by side, per directory. It is also a round-trip sweep over real files: each image is decoded back and compared with the pixels that went in, and png-spark's output is checked against the `png` crate's decoder as well.
+The corpus is produced by a reference implementation rather than by this crate, so the tests
+check the format and not just self-consistency. Three fuzz targets (`decode`, `inflate`,
+`roundtrip`) and a Miri run over the unsafe code are wired in CI. Miri cannot cover the
+segmented inflate path on Windows — it is covered by the Linux CI run instead.
 
 ## Licence
 
@@ -210,4 +167,4 @@ Licensed under either of
 
 at your option.
 
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this crate, as defined in the Apache-2.0 licence, shall be dual licensed as above, without any additional terms or conditions.
+`Copyright (c) 2026 Stephen Berry` is retained from png-spark, which this crate is derived from.

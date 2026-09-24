@@ -164,11 +164,11 @@ impl Encoder {
     /// partial file behind, since by then the earlier chunks have gone.
     ///
     /// ```no_run
-    /// # fn main() -> Result<(), png_spark::WriteError> {
-    /// # let (info, pixels) = (png_spark::Info::new(1, 1, png_spark::ColorType::Rgba,
-    /// #     png_spark::BitDepth::Eight), vec![0u8; 4]);
+    /// # fn main() -> Result<(), psd_png::WriteError> {
+    /// # let (info, pixels) = (psd_png::Info::new(1, 1, psd_png::ColorType::Rgba,
+    /// #     psd_png::BitDepth::Eight), vec![0u8; 4]);
     /// let mut file = std::io::BufWriter::new(std::fs::File::create("out.png")?);
-    /// png_spark::Encoder::new().encode_to(&info, &pixels, &mut file)?;
+    /// psd_png::Encoder::new().encode_to(&info, &pixels, &mut file)?;
     /// # Ok(())
     /// # }
     /// ```

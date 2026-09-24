@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetches real-world PNG corpora for `cargo run --release -p png-spark-bench -- corpus`.
+"""Fetches real-world PNG corpora for `cargo run --release -p psd-png-bench -- corpus`.
 
 The synthetic set from gen_bench_images.py is twelve 1920x1080 images of one shape, which
 says nothing about small files, indexed colour, or the screenshot and icon data that real
@@ -37,7 +37,7 @@ QOI_URL = "https://qoiformat.org/benchmark/qoi_benchmark_suite.tar"
 IMAGE_PNG_API = "https://api.github.com/repos/image-rs/image-png/contents/tests/benches"
 
 # GitHub rejects requests without one, and it is polite to say who is asking.
-HEADERS = {"User-Agent": "png-spark-fetch-corpus"}
+HEADERS = {"User-Agent": "psd-png-fetch-corpus"}
 
 
 def human(n):
@@ -199,7 +199,7 @@ def main():
     if "qoi" in chosen:
         fetch_qoi(args.keep_archive)
 
-    print("\nrun: cargo run --release -p png-spark-bench -- corpus")
+    print("\nrun: cargo run --release -p psd-png-bench -- corpus")
 
 
 if __name__ == "__main__":

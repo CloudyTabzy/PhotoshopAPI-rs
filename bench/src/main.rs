@@ -1,6 +1,6 @@
-//! Benchmarks png-spark against the `png` + `fdeflate` stack it aims to replace.
+//! Benchmarks psd-png against the `png` + `fdeflate` stack it aims to replace.
 //!
-//! Usage: `cargo run --release -p png-spark-bench -- <mode>`
+//! Usage: `cargo run --release -p psd-png-bench -- <mode>`
 //!
 //! Modes:
 //!   `all` (default)  decode, encode, inflate, deflate and unfilter
@@ -63,7 +63,7 @@ fn report(title: &str, rows: &[Row]) {
     println!("\n=== {title} ===");
     println!(
         "{:<22} {:>11} {:>11} {:>8}   {:>11} {:>11} {:>8}",
-        "case", "png-spark", "reference", "speedup", "png-spark", "reference", "ratio"
+        "case", "psd-png", "reference", "speedup", "psd-png", "reference", "ratio"
     );
     let mut total_ours = Duration::ZERO;
     let mut total_theirs = Duration::ZERO;
@@ -106,16 +106,16 @@ fn bench_inflate(images: &[TestImage]) {
         let expected = image.raw_stream.len();
 
         let (ours, _) =
-            measure(|| png_spark::inflate::decompress_zlib(stream, expected).unwrap().len());
+            measure(|| psd_png::inflate::decompress_zlib(stream, expected).unwrap().len());
         let (theirs, _) = measure(|| fdeflate::decompress_to_vec(stream).unwrap().len());
 
         // Split out the two halves of the work so a regression can be attributed.
-        let mut buffer = vec![0u8; expected + png_spark::inflate::OUTPUT_SLACK];
-        let mut plain = png_spark::inflate::Inflater::new();
+        let mut buffer = vec![0u8; expected + psd_png::inflate::OUTPUT_SLACK];
+        let mut plain = psd_png::inflate::Inflater::new();
         plain.verify_checksum(false);
         let (no_checksum, _) = measure(|| plain.zlib(stream, &mut buffer).unwrap());
         let (checksum_only, _) = measure(|| {
-            std::hint::black_box(png_spark::adler32::adler32(std::hint::black_box(
+            std::hint::black_box(psd_png::adler32::adler32(std::hint::black_box(
                 &buffer[..expected],
             ))) as usize
         });
@@ -142,7 +142,7 @@ fn bench_decode(images: &[TestImage]) {
     let mut rows = Vec::new();
     for image in images {
         let png = &image.png;
-        let mut decoder = png_spark::decoder::Decoder::new();
+        let mut decoder = psd_png::decoder::Decoder::new();
         let (ours, size) = measure(|| decoder.decode(png).unwrap().data.len());
 
         let (theirs, other) = measure(|| {
@@ -170,7 +170,7 @@ fn bench_decode(images: &[TestImage]) {
 fn bench_unfilter(images: &[TestImage]) {
     let mut rows = Vec::new();
     for image in images {
-        let info = png_spark::common::Info::new(
+        let info = psd_png::common::Info::new(
             image.width,
             image.height,
             image.color_type,
@@ -183,7 +183,7 @@ fn bench_unfilter(images: &[TestImage]) {
         let mut scratch = vec![0u8; image.raw_stream.len() + 16];
         let (ours, _) = measure(|| {
             scratch[..image.raw_stream.len()].copy_from_slice(&image.raw_stream);
-            png_spark::filter::unfilter_image(&mut scratch, row_bytes, height, stride).unwrap();
+            psd_png::filter::unfilter_image(&mut scratch, row_bytes, height, stride).unwrap();
             scratch[0] as usize
         });
         // Subtract the cost of restoring the input, which is not part of unfiltering.
@@ -243,25 +243,25 @@ fn bench_reference_compressors(images: &[TestImage]) {
     }
 }
 
-/// Translates png-spark's colour type and bit depth into the `png` crate's equivalents, so
+/// Translates psd-png's colour type and bit depth into the `png` crate's equivalents, so
 /// both encoders are asked for the same output format.
 fn png_color(
-    color_type: png_spark::common::ColorType,
-    bit_depth: png_spark::common::BitDepth,
+    color_type: psd_png::common::ColorType,
+    bit_depth: psd_png::common::BitDepth,
 ) -> (png::ColorType, png::BitDepth) {
     let color = match color_type {
-        png_spark::common::ColorType::Grayscale => png::ColorType::Grayscale,
-        png_spark::common::ColorType::Rgb => png::ColorType::Rgb,
-        png_spark::common::ColorType::Indexed => png::ColorType::Indexed,
-        png_spark::common::ColorType::GrayscaleAlpha => png::ColorType::GrayscaleAlpha,
-        png_spark::common::ColorType::Rgba => png::ColorType::Rgba,
+        psd_png::common::ColorType::Grayscale => png::ColorType::Grayscale,
+        psd_png::common::ColorType::Rgb => png::ColorType::Rgb,
+        psd_png::common::ColorType::Indexed => png::ColorType::Indexed,
+        psd_png::common::ColorType::GrayscaleAlpha => png::ColorType::GrayscaleAlpha,
+        psd_png::common::ColorType::Rgba => png::ColorType::Rgba,
     };
     let depth = match bit_depth {
-        png_spark::common::BitDepth::One => png::BitDepth::One,
-        png_spark::common::BitDepth::Two => png::BitDepth::Two,
-        png_spark::common::BitDepth::Four => png::BitDepth::Four,
-        png_spark::common::BitDepth::Eight => png::BitDepth::Eight,
-        png_spark::common::BitDepth::Sixteen => png::BitDepth::Sixteen,
+        psd_png::common::BitDepth::One => png::BitDepth::One,
+        psd_png::common::BitDepth::Two => png::BitDepth::Two,
+        psd_png::common::BitDepth::Four => png::BitDepth::Four,
+        psd_png::common::BitDepth::Eight => png::BitDepth::Eight,
+        psd_png::common::BitDepth::Sixteen => png::BitDepth::Sixteen,
     };
     (color, depth)
 }
@@ -270,7 +270,7 @@ fn bench_deflate(images: &[TestImage]) {
     let mut rows = Vec::new();
     for image in images {
         let raw = &image.raw_stream;
-        let mut deflater = png_spark::deflate::Deflater::new();
+        let mut deflater = psd_png::deflate::Deflater::new();
         let mut buffer = Vec::with_capacity(raw.len());
         let (ours, our_size) = measure(|| {
             buffer.clear();
@@ -294,7 +294,7 @@ fn bench_deflate(images: &[TestImage]) {
 fn bench_encode(images: &[TestImage]) {
     let mut rows = Vec::new();
     for image in images {
-        let info = png_spark::common::Info::new(
+        let info = psd_png::common::Info::new(
             image.width,
             image.height,
             image.color_type,
@@ -302,7 +302,7 @@ fn bench_encode(images: &[TestImage]) {
         );
         let pixels = &image.pixels;
 
-        let mut encoder = png_spark::encoder::Encoder::new();
+        let mut encoder = psd_png::encoder::Encoder::new();
         let mut buffer = Vec::new();
         let (ours, our_size) = measure(|| {
             buffer.clear();
@@ -336,8 +336,8 @@ fn bench_encode(images: &[TestImage]) {
 
 /// Prints the size each filter strategy reaches, to show where a size regression comes from.
 fn bench_sizes(images: &[TestImage]) {
-    use png_spark::encoder::{Encoder, FilterStrategy};
-    use png_spark::filter::Filter;
+    use psd_png::encoder::{Encoder, FilterStrategy};
+    use psd_png::filter::Filter;
 
     println!("\n=== encoded size by strategy ===");
     let strategies: Vec<(String, FilterStrategy)> = vec![
@@ -354,7 +354,7 @@ fn bench_sizes(images: &[TestImage]) {
     }
     println!("{:>10}", "png");
     for image in images {
-        let info = png_spark::common::Info::new(
+        let info = psd_png::common::Info::new(
             image.width,
             image.height,
             image.color_type,
@@ -384,8 +384,8 @@ fn bench_sizes(images: &[TestImage]) {
 /// Writes the filtered scanline stream for each image so an external compressor can be run
 /// against exactly the same input.
 fn dump_filtered(images: &[TestImage]) {
-    use png_spark::common::Info;
-    use png_spark::filter::{Filter, filter_row};
+    use psd_png::common::Info;
+    use psd_png::filter::{Filter, filter_row};
 
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tmp/filtered");
     std::fs::create_dir_all(&dir).unwrap();
@@ -431,7 +431,7 @@ fn dump_filtered(images: &[TestImage]) {
 /// Compresses each dumped filtered stream on its own, so behaviour on one kind of data can
 /// be looked at in isolation. Run `bench dump` first.
 fn bench_files(filter: Option<&str>) {
-    use png_spark::deflate::Deflater;
+    use psd_png::deflate::Deflater;
 
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tmp/filtered");
     let mut paths: Vec<_> = std::fs::read_dir(&dir)

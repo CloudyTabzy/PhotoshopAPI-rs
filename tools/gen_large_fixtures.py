@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate large PNG fixtures whose zlib streams carry a real LZ77 match finder.
 
-png-spark's own encoder emits zero-run (distance-1) matches only, so its output cannot
+psd-png's own encoder emits zero-run (distance-1) matches only, so its output cannot
 detect a reconstruction frontier whose match-window lag is wrong. These fixtures are
 filtered and compressed by CPython's zlib — a full match finder — so their streams hold
 matches at arbitrary distances up to 32 KiB, crossing rows the decoder reconstructs

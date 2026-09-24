@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use png_spark::{Decoder, Row};
+use psd_png::{Decoder, Row};
 
 /// Collect every row through the sink and require the concatenation to equal `decode()`s
 /// pixel buffer, row for row.
@@ -21,7 +21,7 @@ fn assert_rows_match_decode(png: &[u8], name: &str) {
     let mut rows: Vec<Vec<u8>> = Vec::new();
     let mut decoder = Decoder::new();
     decoder
-        .decode_to(png, |row: Row<'_>| -> Result<(), png_spark::Error> {
+        .decode_to(png, |row: Row<'_>| -> Result<(), psd_png::Error> {
             rows.push(row.bytes.to_vec());
             Ok(())
         })
@@ -90,12 +90,12 @@ fn streaming_rows_match_decode_on_small_and_interlaced() {
 
 #[derive(Debug)]
 enum SinkError {
-    Decode(#[allow(dead_code)] png_spark::Error),
+    Decode(#[allow(dead_code)] psd_png::Error),
     Boom,
 }
 
-impl From<png_spark::Error> for SinkError {
-    fn from(error: png_spark::Error) -> Self {
+impl From<psd_png::Error> for SinkError {
+    fn from(error: psd_png::Error) -> Self {
         SinkError::Decode(error)
     }
 }
@@ -141,7 +141,7 @@ fn streaming_ignores_the_decompressed_size_ceiling() {
     let mut bytes = 0usize;
     let mut decoder = Decoder::new();
     decoder
-        .decode_to(&png, |row: Row<'_>| -> Result<(), png_spark::Error> {
+        .decode_to(&png, |row: Row<'_>| -> Result<(), psd_png::Error> {
             rows += 1;
             bytes += row.bytes.len();
             Ok(())
@@ -178,8 +178,8 @@ fn corrupt_streams_agree_between_paths() {
     let decoded = Decoder::new().decode(&png);
     let mut rows: Vec<Vec<u8>> = Vec::new();
     let mut decoder = Decoder::new();
-    let streamed: Result<(), png_spark::Error> =
-        decoder.decode_to(&png, |row: Row<'_>| -> Result<(), png_spark::Error> {
+    let streamed: Result<(), psd_png::Error> =
+        decoder.decode_to(&png, |row: Row<'_>| -> Result<(), psd_png::Error> {
             rows.push(row.bytes.to_vec());
             Ok(())
         });

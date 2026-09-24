@@ -9,7 +9,7 @@ use libfuzzer_sys::fuzz_target;
 const MAX_DECOMPRESSED: usize = 16 << 20;
 
 fuzz_target!(|data: &[u8]| {
-    let mut decoder = png_spark::Decoder::new();
+    let mut decoder = psd_png::Decoder::new();
     decoder.max_decompressed_size(Some(MAX_DECOMPRESSED));
 
     // Most inputs are not PNGs at all; those are `decode`'s business, not this target's.
@@ -17,7 +17,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    let png = png_spark::encode(&first.info, &first.data)
+    let png = psd_png::encode(&first.info, &first.data)
         .expect("the encoder must accept what the decoder produced");
     let second = decoder.decode(&png).expect("the decoder must accept its own output");
 

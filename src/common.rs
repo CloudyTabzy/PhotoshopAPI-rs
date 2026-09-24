@@ -166,13 +166,13 @@ impl Chunk {
     /// The type must be four ASCII letters, its first lower case, and its third upper case. A
     /// critical type is rejected because the encoder writes the critical chunks itself and a
     /// decoder must fail on a critical type it does not know, so accepting one would produce a
-    /// file png-spark could not read back. A lower-case third byte is reserved by the
+    /// file psd-png could not read back. A lower-case third byte is reserved by the
     /// specification and means nothing yet.
     ///
     /// `tRNS` is excluded for the same reason as the critical types: the encoder writes it
     /// itself from [`Info::transparency`], where it is checked against the colour type. A second
     /// one here would be an illegal duplicate, would silently displace the real transparency on
-    /// read-back, and if its length did not suit the colour type would produce a file png-spark
+    /// read-back, and if its length did not suit the colour type would produce a file psd-png
     /// itself rejects.
     ///
     /// The payload is limited to `i32::MAX` bytes, the longest a PNG chunk may declare.
@@ -190,7 +190,7 @@ impl Chunk {
     }
 }
 
-/// Whether `kind` names a chunk png-spark will carry as metadata.
+/// Whether `kind` names a chunk psd-png will carry as metadata.
 ///
 /// The rules, and the reasons behind them, are documented on [`Chunk::validate`].
 pub(crate) fn writable_kind(kind: [u8; 4]) -> bool {
@@ -264,7 +264,7 @@ impl Info {
     /// its colour type stays [`Indexed`](ColorType::Indexed) or
     /// [`Grayscale`](ColorType::Grayscale) while the image is nonetheless transparent.
     ///
-    /// Decoders that expand every image to RGBA hide that distinction. png-spark hands back
+    /// Decoders that expand every image to RGBA hide that distinction. psd-png hands back
     /// the file's own format, so it does not, and a caller that reads the colour type alone
     /// silently loses the alpha of every palette image. Ask here instead.
     ///

@@ -2,7 +2,7 @@
 """Generates the reference corpus used by the integration tests.
 
 Writes zlib streams (tmp/z) and PNG images (tmp/png) produced by known-good implementations,
-so the tests can check png-spark against something other than itself. The output is not
+so the tests can check psd-png against something other than itself. The output is not
 committed; run this script before `cargo test`.
 """
 import os, random, zlib, struct, sys

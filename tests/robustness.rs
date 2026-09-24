@@ -3,13 +3,13 @@
 //! A decoder is usually pointed at data from somewhere untrusted, so every corruption of a
 //! valid file has to come back as an `Err`.
 
-use png_spark::common::{BitDepth, Chunk, ColorType, Info};
+use psd_png::common::{BitDepth, Chunk, ColorType, Info};
 
 fn valid_png() -> Vec<u8> {
     let info = Info::new(23, 17, ColorType::Rgba, BitDepth::Eight);
     let data: Vec<u8> =
         (0..info.output_size()).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
-    png_spark::encode(&info, &data).unwrap()
+    psd_png::encode(&info, &data).unwrap()
 }
 
 #[test]
@@ -17,15 +17,15 @@ fn truncation_at_every_length_is_rejected() {
     let png = valid_png();
     for length in 0..png.len() {
         // Nothing shorter than the whole file can decode, and nothing may panic.
-        let _ = png_spark::decode(&png[..length]);
+        let _ = psd_png::decode(&png[..length]);
     }
-    assert!(png_spark::decode(&png).is_ok());
+    assert!(psd_png::decode(&png).is_ok());
 }
 
 #[test]
 fn single_byte_corruption_is_rejected_or_decoded() {
     let png = valid_png();
-    let mut decoder = png_spark::Decoder::new();
+    let mut decoder = psd_png::Decoder::new();
 
     // Flipping any single bit either breaks a checksum or, in the rare case it lands
     // somewhere inert, still produces a well-formed result. Neither may panic.
@@ -46,10 +46,10 @@ fn corruption_of_a_file_carrying_metadata_is_rejected_or_decoded() {
     info.metadata = vec![Chunk::new(*b"apPd", (0..=255u8).collect())];
     let data: Vec<u8> =
         (0..info.output_size()).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
-    let png = png_spark::encode(&info, &data).unwrap();
+    let png = psd_png::encode(&info, &data).unwrap();
 
-    let mut decoder = png_spark::Decoder::new();
-    decoder.keep(png_spark::Keep::All);
+    let mut decoder = psd_png::Decoder::new();
+    decoder.keep(psd_png::Keep::All);
     for index in 0..png.len() {
         for bit in [0u8, 3, 7] {
             let mut damaged = png.clone();
@@ -64,20 +64,20 @@ fn corruption_of_a_file_carrying_metadata_is_rejected_or_decoded() {
 fn structurally_invalid_headers_are_rejected() {
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("empty", Vec::new()),
-        ("signature only", png_spark::common::SIGNATURE.to_vec()),
+        ("signature only", psd_png::common::SIGNATURE.to_vec()),
         ("wrong signature", vec![0; 32]),
         ("text", b"not a png at all, just some bytes".to_vec()),
     ];
     for (name, data) in cases {
-        assert!(png_spark::decode(&data).is_err(), "{name} should not decode");
+        assert!(psd_png::decode(&data).is_err(), "{name} should not decode");
     }
 
     // A header claiming a colour type and bit depth that cannot go together.
     let mut png = valid_png();
     png[24] = 3; // IHDR bit depth byte -> 3, which no colour type allows
-    let crc = png_spark::crc32::crc32(&png[12..29]);
+    let crc = psd_png::crc32::crc32(&png[12..29]);
     png[29..33].copy_from_slice(&crc.to_be_bytes());
-    assert!(png_spark::decode(&png).is_err(), "bit depth 3 should not decode");
+    assert!(psd_png::decode(&png).is_err(), "bit depth 3 should not decode");
 }
 
 #[test]
@@ -95,8 +95,8 @@ fn hostile_zlib_streams_do_not_hang_or_panic() {
             })
             .collect();
         // Any expected length: the decompressor must terminate either way.
-        let _ = png_spark::inflate::decompress_zlib(&data, 4096);
-        let _ = png_spark::inflate::decompress_zlib(&data, 0);
+        let _ = psd_png::inflate::decompress_zlib(&data, 4096);
+        let _ = psd_png::inflate::decompress_zlib(&data, 0);
     }
 }
 
@@ -105,7 +105,7 @@ fn zlib_headers_with_valid_framing_but_junk_payload_are_rejected() {
     for payload_len in [0usize, 1, 4, 64] {
         let mut stream = vec![0x78, 0x01];
         stream.extend(std::iter::repeat_n(0xA5, payload_len));
-        assert!(png_spark::inflate::decompress_zlib(&stream, 1024).is_err());
+        assert!(psd_png::inflate::decompress_zlib(&stream, 1024).is_err());
     }
 }
 
@@ -124,7 +124,7 @@ const IHDR_END: usize = 8 + 4 + 4 + 13 + 4;
 #[test]
 fn ancillary_chunk_with_a_bad_crc_is_discarded() {
     let png = valid_png();
-    let expected = png_spark::decode(&png).unwrap();
+    let expected = psd_png::decode(&png).unwrap();
 
     // Files exist whose colour profile was rewritten without recomputing the chunk's
     // checksum. Nothing about the image depends on that chunk, so it must still decode.
@@ -132,7 +132,7 @@ fn ancillary_chunk_with_a_bad_crc_is_discarded() {
     damaged.extend_from_slice(&chunk_with_bad_crc(b"iCCP", b"ICC PROFILE\0\0not a profile"));
     damaged.extend_from_slice(&png[IHDR_END..]);
 
-    let decoded = png_spark::decode(&damaged).unwrap();
+    let decoded = psd_png::decode(&damaged).unwrap();
     assert_eq!(decoded.data, expected.data);
     assert_eq!(decoded.info, expected.info);
 }
@@ -144,6 +144,6 @@ fn critical_chunk_with_a_bad_crc_is_rejected() {
     for offset in [IHDR_END - 1, IHDR_END + 4] {
         let mut damaged = valid_png();
         damaged[offset] ^= 0xff;
-        assert!(png_spark::decode(&damaged).is_err());
+        assert!(psd_png::decode(&damaged).is_err());
     }
 }

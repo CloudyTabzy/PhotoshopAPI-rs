@@ -1,7 +1,7 @@
 # Its own workspace, which is what cargo-fuzz expects: these targets build only on nightly
 # with a sanitizer, and should not be dragged into an ordinary `cargo build` of the crate.
 [package]
-name = "png-spark-fuzz"
+name = "psd-png-fuzz"
 version = "0.0.0"
 edition = "2024"
 publish = false
@@ -11,7 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-png-spark = { path = ".." }
+psd-png = { path = ".." }
 
 [[bin]]
 name = "decode"

@@ -1,8 +1,8 @@
 //! Checks that everything the compressor emits is a valid zlib stream, both by decoding it
 //! with this crate and by decoding it with the reference streams' own decoder.
 
-use png_spark::deflate::Deflater;
-use png_spark::inflate::decompress_zlib;
+use psd_png::deflate::Deflater;
+use psd_png::inflate::decompress_zlib;
 
 fn round_trip(data: &[u8], label: &str) {
     let mut compressed = Vec::new();

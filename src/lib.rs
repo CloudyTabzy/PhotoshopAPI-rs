@@ -1,15 +1,32 @@
-//! A fast PNG encoder and decoder with no dependencies.
+//! A streaming PNG decoder with no dependencies, built for the PhotoshopAPI-rs port.
 //!
-//! png-spark reads and writes the whole PNG format — every colour type, every bit depth,
-//! interlaced or not — through its own DEFLATE implementation, its own checksums, and its
-//! own filter code. Nothing outside the standard library is involved, so it builds in a
-//! couple of seconds and adds nothing to a dependency tree.
+//! `psd-png` reads the whole PNG format — every colour type, every bit depth, interlaced
+//! or not — through its own DEFLATE implementation, its own checksums, and its own filter
+//! code. Nothing outside the standard library is involved, so it builds in a couple of
+//! seconds and adds nothing to a dependency tree.
+//!
+//! Its reason to exist is [`Decoder::decode_to`]: a decode that hands out one reconstructed
+//! scanline at a time while holding only DEFLATE's 32 KiB match window, a segment of
+//! filtered rows, and the row being worked on. Memory is a few hundred kilobytes whatever
+//! the image's size, which is what lets a raster the whole-image path must refuse — the
+//! 512 MiB ceiling exists precisely so that a seventy-byte file cannot make a decoder
+//! allocate for a petabyte — be decoded row by row into the caller's own storage.
+//! [`decode`] remains for the ordinary case.
+//!
+//! # Provenance
+//!
+//! This crate began as [png-spark](https://github.com/stephenberry/png-spark) 0.2.0 by
+//! Emil Dohne, which contributed the format coverage, the DEFLATE codec, the checksums,
+//! the scanline filters, and the encoder still inherited below. The PhotoshopAPI-rs port
+//! team added the fused reconstruction and the streaming decoder, and is removing the
+//! encoder, which the port has no use for. Both licences (`MIT OR Apache-2.0`) and the
+//! original copyright are retained unchanged.
 //!
 //! # Decoding
 //!
 //! ```no_run
 //! let bytes = std::fs::read("input.png")?;
-//! let image = png_spark::decode(&bytes)?;
+//! let image = psd_png::decode(&bytes)?;
 //!
 //! println!("{}x{} {:?}", image.width(), image.height(), image.color_type());
 //!
@@ -24,6 +41,29 @@
 //! in its pixels. Ask [`Info::has_alpha`] rather than reading the colour type, or convert
 //! with `to_rgba8`, which resolves `tRNS` for you.
 //!
+//! # Streaming decode
+//!
+//! [`Decoder::decode_to`] is the API the port uses. Rows arrive in file order, in the
+//! file's native layout, each borrowed only for the duration of the call:
+//!
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let png = std::fs::read("asset.png")?;
+//! psd_png::Decoder::new().decode_to(&png, |row: psd_png::Row<'_>| {
+//!     // `row.index` counts from zero; `row.bytes` is one scanline, filters already reversed.
+//!     consume(row.index, row.bytes);
+//!     Ok::<(), psd_png::Error>(())
+//! })?;
+//! # fn consume(_index: usize, _bytes: &[u8]) {}
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A sink error aborts the decode and is returned; rows already delivered stay delivered.
+//! Interlaced images need a scatter target the callback does not have, so they are decoded
+//! into a buffer first and emitted from there — the memory bound is the non-interlaced
+//! case, which is what every raster in the port's corpus is.
+//!
 //! # Reading files you did not write
 //!
 //! `IHDR` states an image's dimensions in thirteen bytes, and a decoder needs the buffer
@@ -36,51 +76,14 @@
 //! [`read_info`] parses the header and colour chunks and stops at the image data, for a
 //! caller that wants to decide something about a file before decoding it.
 //!
-//! # Encoding
+//! # Inherited encoder
 //!
-//! ```no_run
-//! let width = 256;
-//! let height = 256;
-//! let pixels: Vec<u8> = (0..width * height * 4).map(|i| i as u8).collect();
-//!
-//! let png = png_spark::encode_rgba8(width as u32, height as u32, &pixels)?;
-//! std::fs::write("output.png", png)?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
-//! [`Encoder::encode_to`] writes to any [`io::Write`](std::io::Write) instead of to a buffer.
-//! It filters and compresses the image a band at a time and lets each `IDAT` chunk go as it
-//! is finished, so neither the encoded file nor a filtered copy of the image is ever
-//! resident. What it holds grows with the image's width but not with its height:
-//!
-//! ```no_run
-//! # let (info, pixels) = (png_spark::Info::new(1, 1, png_spark::ColorType::Rgba,
-//! #     png_spark::BitDepth::Eight), vec![0u8; 4]);
-//! let mut file = std::io::BufWriter::new(std::fs::File::create("output.png")?);
-//! png_spark::Encoder::new().encode_to(&info, &pixels, &mut file)?;
-//! # Ok::<(), png_spark::WriteError>(())
-//! ```
-//!
-//! For repeated work, reuse a [`Decoder`] or [`Encoder`]: they hold the Huffman tables and
-//! scratch buffers, so a second image costs no allocation for them.
-//!
-//! ```no_run
-//! use png_spark::{Encoder, FilterStrategy};
-//!
-//! let mut encoder = Encoder::new();
-//! encoder.filter(FilterStrategy::Adaptive);
-//! ```
-//!
-//! # Choosing settings
-//!
-//! There is no compression level. The compressor has one mode - literals and zero runs,
-//! coded in a single pass - because that is the setting worth having: it reaches within a
-//! few percent of a full LZ77 match finder on filtered image data for several times the
-//! speed. Anyone who wants the last few percent should use the `png` crate.
-//!
-//! [`FilterStrategy`] decides how each scanline's filter is picked. The default scores the
-//! five filters on a sample of the row; [`FilterStrategy::Adaptive`] scores all of it, for
-//! a small gain on images with sharp edges.
+//! The encoder, the DEFLATE compressor under it, and [`FilterStrategy`] arrived with the
+//! fork and are on their way out: the port decodes PNG rasters and never writes one, so
+//! carrying an encoder would mean maintaining a capability nothing calls. They are still
+//! here, unchanged and still tested, so that this change is one of identity and nothing
+//! else; the removal is the next step, and the README says so where a reader will see it.
+//! The decode path does not touch any of it.
 //!
 //! # Carrying your own data in a PNG
 //!
@@ -89,56 +92,44 @@
 //! application data inside the image file: arbitrary bytes, up to `i32::MAX` of them, with
 //! no escaping and no encoding, which every other PNG reader ignores.
 //!
-//! Ignoring is not the same as preserving. A tool that rewrites the file may well drop the
-//! chunk: libpng discards unknown chunks unless the application asks for them, and
-//! optimisers such as oxipng and pngcrush strip ancillary chunks by default. Data that must
-//! survive an arbitrary third-party tool does not belong here; data that must survive your
-//! own pipeline does.
-//!
-//! Attach chunks by putting them on the [`Info`] you encode with, and ask for them back
-//! with [`Decoder::keep`]:
-//!
-//! ```
-//! use png_spark::{Chunk, Decoder, Keep};
-//!
-//! let mut image = png_spark::decode(&make_png())?;
-//! image.info.metadata.push(Chunk::new(*b"apPd", b"anything at all".to_vec()));
-//! let png = png_spark::encode(&image.info, &image.data)?;
-//!
-//! let read_back = Decoder::new().keep(Keep::Only(vec![*b"apPd"])).decode(&png)?;
-//! assert_eq!(read_back.info.chunk(b"apPd"), Some(&b"anything at all"[..]));
-//! # fn make_png() -> Vec<u8> { png_spark::encode_rgba8(2, 2, &[0; 16]).unwrap() }
-//! # Ok::<(), png_spark::Error>(())
-//! ```
-//!
-//! The four type bytes are not free-form: `apPd` above is lower case first, marking the
-//! chunk ancillary; lower case second, marking it private to one application and so unable
-//! to collide with a registered type; upper case third, which the specification reserves;
-//! and lower case fourth, saying an editor that does not understand it may still copy it
-//! through. [`Chunk::validate`] enforces the rules, and the encoder rejects a chunk that
-//! breaks them rather than writing a file it could not read back.
-//!
-//! What the encoder checks is the type bytes and the placement relative to `PLTE`. It does
-//! not know what a *registered* type means, so writing two `gAMA` chunks, or a `hIST` for an
-//! image with no palette, is the caller's mistake to avoid. Private types have no such
-//! rules to break.
-//!
 //! Decoding keeps nothing by default, because retaining a chunk means copying it and
-//! nothing the decoder returns depends on one. Metadata that is kept travels on `Info`, so
-//! handing a decoded image straight back to the encoder preserves it.
+//! nothing the decoder returns depends on one. [`Decoder::keep`] asks for what a caller
+//! actually wants, and what is kept travels on [`Info`]:
 //!
-//! There is no compression here: a payload is written exactly as given. Compress it first
-//! if it is worth compressing.
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let png = std::fs::read("asset.png")?;
+//! let image = psd_png::Decoder::new()
+//!     .keep(psd_png::Keep::Only(vec![*b"apPd"]))
+//!     .decode(&png)?;
+//! if let Some(asset_id) = image.info.chunk(b"apPd") {
+//!     // use the carried bytes
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`Keep::All`] takes everything the file carries. A chunk that fails its CRC is dropped
+//! rather than returned. What is checked is the type bytes and the placement relative to
+//! `PLTE`, not what a *registered* type means: two `gAMA` chunks are the caller's mistake
+//! to avoid, and private types have no such rules to break.
+//!
+//! Ignoring a chunk is not the same as preserving it. A tool that rewrites the file may
+//! well drop it: libpng discards unknown chunks unless the application asks for them, and
+//! optimisers such as oxipng and pngcrush strip ancillary chunks by default. Data that
+//! must survive an arbitrary third-party tool does not belong here; data that must
+//! survive your own pipeline does.
 //!
 //! # Layout
 //!
 //! The pieces are public in their own right, so the DEFLATE and checksum implementations can
 //! be used on their own:
 //!
-//! - [`inflate`] and [`deflate`] — zlib streams, independent of PNG
+//! - [`inflate`] — zlib streams, independent of PNG; the streaming decoder's engine
 //! - [`crc32`] and [`adler32`] — the two checksums, with SIMD paths where they exist
 //! - [`filter`] — the five PNG scanline filters, forward and reverse
-//! - [`decoder`], [`encoder`], [`common`] — the PNG layer itself
+//! - [`decoder`] and [`common`] — the PNG layer itself
+//! - [`deflate`] and [`encoder`] — inherited, on their way out (see above)
 
 #![warn(missing_docs, missing_debug_implementations)]
 

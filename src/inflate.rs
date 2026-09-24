@@ -684,10 +684,10 @@ impl Inflater {
                 last_block: false,
             });
         }
-        if let Some(position) = resume_at {
-            if let Some(state) = pause.as_mut() {
-                state.out_pos = position;
-            }
+        if let Some(position) = resume_at
+            && let Some(state) = pause.as_mut()
+        {
+            state.out_pos = position;
         }
 
         let (written, consumed) =
@@ -819,9 +819,7 @@ impl Inflater {
             if SEGMENTED && pause.is_some() {
                 return Ok((out_pos, 0));
             }
-            if last_block {
-                break;
-            }
+            finished_block = last_block;
         }
 
         reader.align();
@@ -1422,7 +1420,7 @@ mod tests {
                     resume_at = Some(keep);
                     let grown = keep + 4096;
                     budget =
-                        if output.len() == 0 && iteration > 0 { budget + 65_536 } else { grown };
+                        if output.is_empty() && iteration > 0 { budget + 65_536 } else { grown };
                 }
             }
         }

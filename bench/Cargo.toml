@@ -1,13 +1,13 @@
 [package]
-name = "png-spark-bench"
+name = "psd-png-bench"
 version = "0.0.0"
 edition = "2024"
 publish = false
 
-# Benchmark harness only. `png-spark` itself has no dependencies; these exist solely to
+# Benchmark harness only. `psd-png` itself has no dependencies; these exist solely to
 # compare against the crates this library aims to beat.
 [dependencies]
-png-spark = { path = ".." }
+psd-png = { path = ".." }
 png = "0.18"
 fdeflate = "0.3"
 

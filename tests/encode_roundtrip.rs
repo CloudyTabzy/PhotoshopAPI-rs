@@ -1,8 +1,8 @@
 //! Encodes images in every colour type and bit depth, then decodes them back.
 
-use png_spark::common::{BitDepth, ColorType, Info};
-use png_spark::encoder::{Encoder, FilterStrategy};
-use png_spark::filter::Filter;
+use psd_png::common::{BitDepth, ColorType, Info};
+use psd_png::encoder::{Encoder, FilterStrategy};
+use psd_png::filter::Filter;
 
 fn make_info(width: u32, height: u32, color_type: ColorType, bit_depth: BitDepth) -> Info {
     let mut info = Info::new(width, height, color_type, bit_depth);
@@ -47,7 +47,7 @@ fn combinations() -> Vec<(ColorType, BitDepth)> {
 #[test]
 fn every_format_round_trips() {
     let mut encoder = Encoder::new();
-    let mut decoder = png_spark::decoder::Decoder::new();
+    let mut decoder = psd_png::decoder::Decoder::new();
 
     for (color_type, bit_depth) in combinations() {
         for (width, height) in [(1, 1), (1, 17), (17, 1), (13, 9), (64, 40)] {
@@ -89,13 +89,13 @@ fn rejects_mismatched_buffers() {
 #[test]
 fn convenience_helpers_produce_decodable_files() {
     let rgba: Vec<u8> = (0..16 * 16 * 4).map(|i| (i * 3) as u8).collect();
-    let png = png_spark::encoder::encode_rgba8(16, 16, &rgba).unwrap();
-    let decoded = png_spark::decoder::decode(&png).unwrap();
+    let png = psd_png::encoder::encode_rgba8(16, 16, &rgba).unwrap();
+    let decoded = psd_png::decoder::decode(&png).unwrap();
     assert_eq!(decoded.data, rgba);
 
     let rgb: Vec<u8> = (0..16 * 16 * 3).map(|i| (i * 5) as u8).collect();
-    let png = png_spark::encoder::encode_rgb8(16, 16, &rgb).unwrap();
-    assert_eq!(png_spark::decoder::decode(&png).unwrap().data, rgb);
+    let png = psd_png::encoder::encode_rgb8(16, 16, &rgb).unwrap();
+    assert_eq!(psd_png::decoder::decode(&png).unwrap().data, rgb);
 }
 
 #[test]

@@ -9,8 +9,8 @@ pub struct TestImage {
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    pub color_type: png_spark::common::ColorType,
-    pub bit_depth: png_spark::common::BitDepth,
+    pub color_type: psd_png::common::ColorType,
+    pub bit_depth: psd_png::common::BitDepth,
     /// Filter bytes plus filtered scanlines, exactly as the file's `IDAT` decompresses to.
     pub raw_stream: Vec<u8>,
     /// The file's `IDAT` payload, concatenated.
@@ -35,7 +35,7 @@ pub fn load_images() -> Vec<TestImage> {
         .into_iter()
         .map(|path| {
             let png = std::fs::read(&path).unwrap();
-            let image = png_spark::decoder::decode(&png).unwrap();
+            let image = psd_png::decoder::decode(&png).unwrap();
             let zlib_stream = extract_idat(&png);
             let raw_stream =
                 fdeflate::decompress_to_vec(&zlib_stream).expect("reference stream decodes");

@@ -1,10 +1,10 @@
-//! Verifies png-spark's output against independent implementations.
+//! Verifies psd-png's output against independent implementations.
 //!
 //! Round-tripping through our own code proves self-consistency; these tests prove the
 //! streams and files are actually what the formats specify, by handing them to `fdeflate`
 //! and the `png` crate.
 
-use png_spark::deflate::Deflater;
+use psd_png::deflate::Deflater;
 
 fn corpus() -> Vec<(String, Vec<u8>)> {
     let mut cases: Vec<(String, Vec<u8>)> = vec![
@@ -49,7 +49,7 @@ fn deflate_output_decodes_with_fdeflate() {
 fn inflate_accepts_fdeflate_output() {
     for (name, data) in corpus() {
         let compressed = fdeflate::compress_to_vec(&data);
-        let decoded = png_spark::inflate::decompress_zlib(&compressed, data.len())
+        let decoded = psd_png::inflate::decompress_zlib(&compressed, data.len())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(decoded, data, "{name}");
     }
@@ -57,8 +57,8 @@ fn inflate_accepts_fdeflate_output() {
 
 #[test]
 fn encoded_pngs_decode_with_the_png_crate() {
-    use png_spark::common::{BitDepth, ColorType, Info};
-    use png_spark::encoder::{Encoder, FilterStrategy};
+    use psd_png::common::{BitDepth, ColorType, Info};
+    use psd_png::encoder::{Encoder, FilterStrategy};
 
     let mut encoder = Encoder::new();
     let cases = [
@@ -102,7 +102,7 @@ fn encoded_pngs_decode_with_the_png_crate() {
 /// Application data in an ancillary chunk must be invisible to every other PNG reader.
 #[test]
 fn private_chunks_are_ignored_by_the_png_crate() {
-    use png_spark::common::{BitDepth, Chunk, ColorType, Info};
+    use psd_png::common::{BitDepth, Chunk, ColorType, Info};
 
     let mut info = Info::new(48, 31, ColorType::Rgba, BitDepth::Eight);
     info.metadata = vec![
@@ -111,7 +111,7 @@ fn private_chunks_are_ignored_by_the_png_crate() {
     ];
     let data: Vec<u8> =
         (0..info.output_size()).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
-    let png = png_spark::encode(&info, &data).unwrap();
+    let png = psd_png::encode(&info, &data).unwrap();
 
     let decoder = png::Decoder::new(std::io::Cursor::new(&png));
     let mut reader = decoder.read_info().unwrap();
