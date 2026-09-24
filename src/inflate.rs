@@ -48,6 +48,63 @@ impl ProgressHook for () {
     fn on_progress(&mut self, _: &mut [u8], _: usize) {}
 }
 
+/// Hashes each region of the output **before** the hook behind it can rewrite it.
+///
+/// The Adler-32 in a zlib stream covers the filtered bytes the decompressor produces. A
+/// hook that reverses scanline filters does so in place, so once inflation returns, the
+/// buffer is part reconstructed and part not — and the trailer no longer describes it. This
+/// wrapper hashes inside the same call that triggers reconstruction, which is the only
+/// order that sees the bytes the checksum was computed over.
+///
+/// `ENABLED` is unconditionally `true`: this type exists only when verification is on, and
+/// the hashing is the point, so the call sites must not compile out.
+pub(crate) struct ChecksumHook<'a, H> {
+    inner: H,
+    checksum: &'a mut Adler32,
+    hashed: usize,
+}
+
+impl<'a, H: ProgressHook> ChecksumHook<'a, H> {
+    /// Wraps `inner`, resuming from `hashed`: the position in the output buffer up to which
+    /// the caller has already accounted for these bytes.
+    pub(crate) fn new(inner: H, checksum: &'a mut Adler32, hashed: usize) -> Self {
+        Self { inner, checksum, hashed }
+    }
+
+    /// Hashes what the hook has not seen: the tail after its final call.
+    ///
+    /// Those bytes are still filtered — the hook reconstructs a region only from inside a
+    /// call, and no call happens for the tail until the caller asks for one.
+    pub(crate) fn hash_rest(&mut self, output: &[u8], written: usize) {
+        self.checksum.update(&output[self.hashed..written]);
+        self.hashed = written;
+    }
+
+    /// Hands the wrapped hook back, for a caller that reuses it across segments.
+    pub(crate) fn into_inner(self) -> H {
+        self.inner
+    }
+}
+
+/// Lets a wrapper own a `&mut` hook as its inner, so a caller can pass either form.
+impl<H: ProgressHook + ?Sized> ProgressHook for &mut H {
+    const ENABLED: bool = H::ENABLED;
+
+    fn on_progress(&mut self, output: &mut [u8], pos: usize) {
+        (**self).on_progress(output, pos);
+    }
+}
+
+impl<H: ProgressHook> ProgressHook for ChecksumHook<'_, H> {
+    const ENABLED: bool = true;
+
+    fn on_progress(&mut self, output: &mut [u8], pos: usize) {
+        self.checksum.update(&output[self.hashed..pos]);
+        self.hashed = pos;
+        self.inner.on_progress(output, pos);
+    }
+}
+
 /// Non-exhaustive, for the reason [`Error`](crate::Error) is. Match with a fallback arm.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -614,17 +671,27 @@ impl Inflater {
         }
 
         let mut pause = None;
-        let (written, consumed) =
-            self.inflate::<H, false>(&input[2..], output, limit, hook, &mut pause)?;
+        // With verification on, the checksum has to be taken region by region ahead of the
+        // hook: a hook that reverses filters in place would otherwise leave the buffer
+        // partly rewritten by the time a single pass over it ran.
+        let mut checksum = self.verify_checksum.then(Adler32::new);
+        let (written, consumed) = match checksum.as_mut() {
+            Some(checksum) => {
+                let mut hook = ChecksumHook::new(hook, checksum, 0);
+                let result =
+                    self.inflate::<_, false>(&input[2..], output, limit, &mut hook, &mut pause)?;
+                hook.hash_rest(output, result.0);
+                result
+            }
+            None => self.inflate::<H, false>(&input[2..], output, limit, hook, &mut pause)?,
+        };
 
         let trailer = &input[2 + consumed..];
         if trailer.len() < 4 {
             return Err(InflateError::UnexpectedEof);
         }
-        if self.verify_checksum {
+        if let Some(checksum) = checksum {
             let expected = u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-            let mut checksum = Adler32::new();
-            checksum.update(&output[..written]);
             if checksum.finish() != expected {
                 return Err(InflateError::WrongChecksum);
             }

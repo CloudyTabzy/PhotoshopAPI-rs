@@ -7,7 +7,8 @@ use crate::common::{
 use crate::crc32::crc32;
 use crate::error::Error;
 use crate::filter::unfilter_image;
-use crate::inflate::{InflateError, Inflater, OUTPUT_SLACK};
+use crate::inflate::{ChecksumHook, InflateError, Inflater, OUTPUT_SLACK};
+use crate::transform::{RowConverter, RowSample};
 
 /// A decoded image and the description of its pixel layout.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -19,8 +20,13 @@ pub struct Image {
     pub data: Vec<u8>,
 }
 
-/// One scanline of a PNG, delivered by [`Decoder::decode_to`], in the file's native layout
-/// (colour type and bit depth as stored, filter byte removed).
+/// One scanline of a PNG, delivered by [`Decoder::decode_to`] and its converting
+/// variants, in file order.
+///
+/// `index` counts from zero. `bytes` is one scanline with its filters already reversed:
+/// for [`decode_to`](Decoder::decode_to) it is the file's own layout, as
+/// [`Info::row_bytes`] describes it, and for the converting methods it is the converted
+/// layout those methods document. `bytes.len()` is always the authority on which one it is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Row<'a> {
     /// The row's index in the output image: `0` is the top scanline.
@@ -254,12 +260,122 @@ impl Decoder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn decode_to<E, F>(&mut self, png: &[u8], mut sink: F) -> Result<(), E>
+    pub fn decode_to<E, F>(&mut self, png: &[u8], sink: F) -> Result<(), E>
     where
         F: FnMut(Row<'_>) -> Result<(), E>,
         E: From<Error>,
     {
         let parsed = self.parse(png, false)?;
+        self.dispatch_rows(parsed, sink)
+    }
+
+    /// Decodes a PNG one scanline at a time as tightly packed 8-bit RGBA.
+    ///
+    /// The conversion happens as each row is reconstructed, so the concatenated rows equal
+    /// [`to_rgba8`](Image::to_rgba8) on the whole image without the whole-image buffer
+    /// existing: sub-byte grey levels are scaled to the full range, 16-bit samples are
+    /// truncated to their high byte, palette indices are resolved, and `tRNS` becomes real
+    /// alpha. Rows are `width * 4` bytes, interleaved, in file order.
+    ///
+    /// The size ceiling does not apply, and neither does the memory a whole-image decode
+    /// needs: see [`decode_to`](Self::decode_to).
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let png = std::fs::read("asset.png")?;
+    /// let mut decoder = psd_png::Decoder::new();
+    /// decoder.decode_to_rgba8(&png, |row: psd_png::Row<'_>| {
+    ///     // Always four bytes per pixel, filters reversed, palette and tRNS resolved.
+    ///     consume(row.index, row.bytes);
+    ///     Ok::<(), psd_png::Error>(())
+    /// })?;
+    /// # fn consume(_index: usize, _bytes: &[u8]) {}
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn decode_to_rgba8<E, F>(&mut self, png: &[u8], sink: F) -> Result<(), E>
+    where
+        F: FnMut(Row<'_>) -> Result<(), E>,
+        E: From<Error>,
+    {
+        self.decode_to_converted::<u8, 4, E, F>(png, sink)
+    }
+
+    /// Decodes a PNG one scanline at a time as tightly packed 8-bit RGB, dropping alpha.
+    ///
+    /// As [`decode_to_rgba8`](Self::decode_to_rgba8), with three bytes per pixel: a
+    /// grayscale source still expands to three equal channels, and a `tRNS` match is
+    /// resolved and then discarded with the rest of the alpha.
+    pub fn decode_to_rgb8<E, F>(&mut self, png: &[u8], sink: F) -> Result<(), E>
+    where
+        F: FnMut(Row<'_>) -> Result<(), E>,
+        E: From<Error>,
+    {
+        self.decode_to_converted::<u8, 3, E, F>(png, sink)
+    }
+
+    /// Decodes a PNG one scanline at a time as tightly packed 16-bit RGBA.
+    ///
+    /// A 16-bit source is passed through untouched, so a consumer whose samples are
+    /// [`u16`] keeps every bit the file had. A narrower source is scaled up to fill the
+    /// 16-bit range rather than sitting in the bottom of it: an 8-bit sample `b` becomes
+    /// `b * 257`, and 1-, 2- and 4-bit samples reach the top of the range exactly. Rows are
+    /// `width * 4` big-endian `u16` samples, interleaved, in file order.
+    pub fn decode_to_rgba16<E, F>(&mut self, png: &[u8], sink: F) -> Result<(), E>
+    where
+        F: FnMut(Row<'_>) -> Result<(), E>,
+        E: From<Error>,
+    {
+        self.decode_to_converted::<u16, 4, E, F>(png, sink)
+    }
+
+    /// Decodes a PNG one scanline at a time as tightly packed 16-bit RGB, dropping alpha.
+    ///
+    /// As [`decode_to_rgba16`](Self::decode_to_rgba16), with three big-endian [`u16`]
+    /// samples per pixel.
+    pub fn decode_to_rgb16<E, F>(&mut self, png: &[u8], sink: F) -> Result<(), E>
+    where
+        F: FnMut(Row<'_>) -> Result<(), E>,
+        E: From<Error>,
+    {
+        self.decode_to_converted::<u16, 3, E, F>(png, sink)
+    }
+
+    /// The shared body of the converting streaming methods.
+    ///
+    /// The image's colour facts are resolved once, each row is converted into a scratch
+    /// buffer reused for the whole image, and routing is left to
+    /// [`dispatch_rows`](Self::dispatch_rows) so the interlaced fallback, the segment
+    /// driver and the sink-error contract are the same code the native path uses. Only one
+    /// row of converted output is ever live, whatever the image's height.
+    fn decode_to_converted<S: RowSample, const CHANNELS: usize, E, F>(
+        &mut self,
+        png: &[u8],
+        mut sink: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(Row<'_>) -> Result<(), E>,
+        E: From<Error>,
+    {
+        let parsed = self.parse(png, false)?;
+        let converter = RowConverter::new(&parsed.info)?;
+        let scratch_len = parsed.info.width as usize * CHANNELS * S::WIDTH;
+        let mut scratch =
+            zeroed_vec(scratch_len).ok_or(Error::OutOfMemory { bytes: scratch_len })?;
+
+        let mut emit = |row: Row<'_>| -> Result<(), E> {
+            converter.convert::<CHANNELS, S>(row.bytes, &mut scratch).map_err(E::from)?;
+            sink(Row { index: row.index, bytes: &scratch })
+        };
+        self.dispatch_rows(parsed, &mut emit)
+    }
+
+    /// Routes parsed rows to `sink` in the way the image's interlace mode allows.
+    fn dispatch_rows<E, F>(&mut self, parsed: Parsed<'_>, mut sink: F) -> Result<(), E>
+    where
+        F: FnMut(Row<'_>) -> Result<(), E>,
+        E: From<Error>,
+    {
         let info = &parsed.info;
 
         match info.interlacing {
@@ -333,30 +449,53 @@ impl Decoder {
 
         loop {
             frontier.set_base(base);
-            let outcome = self
-                .inflater
-                .zlib_segment(data, &mut stage, budget, resume_at, &mut pause, &mut frontier)
-                .map_err(|error| E::from(Error::from(error)))?;
+            // The Adler-32 covers the filtered bytes, and the frontier rewrites them in
+            // place as it goes, so the hash has to run inside the hook — ahead of each
+            // reconstruction — rather than over the stage once the segment returns. The
+            // tail after the hook's last call is still filtered, and is hashed before the
+            // slide can move it.
+            let (end, consumed) = match adler.as_mut() {
+                Some(checksum) => {
+                    let mut hook = ChecksumHook::new(frontier, checksum, seg_start);
+                    let outcome = self
+                        .inflater
+                        .zlib_segment(data, &mut stage, budget, resume_at, &mut pause, &mut hook)
+                        .map_err(|error| E::from(Error::from(error)))?;
+                    let (end, consumed) = match outcome {
+                        crate::inflate::SegmentOutcome::Filled { written } => (written, None),
+                        crate::inflate::SegmentOutcome::StreamEnd { written, consumed } => {
+                            (written, Some(consumed))
+                        }
+                    };
+                    hook.hash_rest(&stage, end);
+                    frontier = hook.into_inner();
+                    (end, consumed)
+                }
+                None => {
+                    let outcome = self
+                        .inflater
+                        .zlib_segment(
+                            data,
+                            &mut stage,
+                            budget,
+                            resume_at,
+                            &mut pause,
+                            &mut frontier,
+                        )
+                        .map_err(|error| E::from(Error::from(error)))?;
+                    match outcome {
+                        crate::inflate::SegmentOutcome::Filled { written } => (written, None),
+                        crate::inflate::SegmentOutcome::StreamEnd { written, consumed } => {
+                            (written, Some(consumed))
+                        }
+                    }
+                }
+            };
             if let Some(error) = frontier.take_error() {
                 return Err(error);
             }
             if let Some(row) = frontier.failed_row() {
                 return Err(Error::InvalidFilter { row }.into());
-            }
-
-            let (end, consumed) = match outcome {
-                crate::inflate::SegmentOutcome::Filled { written } => (written, None),
-                crate::inflate::SegmentOutcome::StreamEnd { written, consumed } => {
-                    (written, Some(consumed))
-                }
-            };
-
-            // Every byte below `end` is final: the segmented loop pauses at the exact
-            // budget, so no speculative literal store falls inside a segment's range. The
-            // Adler-32 covers the filtered bytes, which only the stage still holds; the
-            // per-segment sums cover each byte exactly once, in order.
-            if let Some(adler) = adler.as_mut() {
-                adler.update(&stage[seg_start..end]);
             }
 
             if let Some(consumed) = consumed {

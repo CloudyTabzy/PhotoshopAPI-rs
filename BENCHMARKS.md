@@ -177,6 +177,85 @@ that allocation disappears from the pipeline entirely.
 The Adler-32 is not verified by default in either path (`Checks::Crc`), matching upstream policy;
 `Checks::Full` enables it incrementally per segment at the same total cost the one-shot path pays.
 
+### Converting variants: fused conversion against png-spark 0.2.0
+
+The question this answers is the one the port asks: the fastest route to the pixels it
+consumes. Both arms deliver the same thing — every pixel of the image as 8-bit RGBA in a
+buffer the caller keeps — and each takes the best route its version has:
+
+| arm | route |
+|---|---|
+| png-spark 0.2.0 | `decode` into the file's own layout, then `to_rgba8` as a second pass |
+| this fork | `decode_to_rgba8`, converting each row as it is reconstructed |
+
+`bench/src/bin/convert_bench.rs` (one copy per worktree, identical apart from the route) times
+them. Process-level interleaving, per-fixture minimum across 6 rounds, arm order alternated per
+round, and a control arm — the fork's own binary run a second time in every round — to measure
+today's noise floor:
+
+| fixture | spark ms | fork ms | delta | control noise |
+|---|---:|---:|---:|---:|
+| rgba8_photo_3840x2400 (36.9 MB) | 60.66 | 50.25 | **−17.2 %** | +0.5 % |
+| rgba8_tall_64x4096 | 1.57 | 1.30 | −17.2 % | +0.0 % |
+| rgba8_noise_1024 | 2.97 | 2.24 | −24.6 % | +2.2 % |
+| rgba8_gradient_1024 | 6.39 | 5.45 | −14.7 % | +0.0 % |
+| rgba8_mixed_1024 | 5.08 | 4.51 | −11.2 % | −0.4 % |
+| rgba8_wide_4096x96 | 2.43 | 2.14 | −11.9 % | +0.0 % |
+| rgb8_photo_2048 | 22.05 | 20.76 | −5.9 % | −0.5 % |
+| rgba16_gradient_1024 | 3.31 | 2.48 | **−25.1 %** | +0.4 % |
+| gray8_gradient_1600 | 3.67 | 3.50 | −4.6 % | +0.6 % |
+
+**9/9 faster, mean −14.7 %.** Every delta clears its own control noise, including the 4.6 %
+on the gray fixture. The control's 2.2 % outlier is the 2.2 ms noise image, where a fixed
+jitter is proportionally largest; the other eight sit at or below 0.6 %.
+
+The machine was in the state §3 recorded, checked rather than assumed: this session's whole-image
+`decode` arm read the 4K fixture at 47.46 ms against the 47.60 ms measured for Phase 1.
+
+#### What the conversion itself costs now
+
+The same session, the fork's three arms (minimum across 6 rounds), isolates the two overheads
+that remain:
+
+| fixture | decode | stream (native rows) | rgba8 (converted) | conversion cost |
+|---|---:|---:|---:|---:|
+| rgba8_photo_3840x2400 | 47.46 | 49.24 | 49.48 | +0.5 % |
+| rgba8_gradient_1024 | 5.24 | 5.41 | 5.41 | +0.0 % |
+| rgba8_mixed_1024 | 4.20 | 4.45 | 4.41 | −0.9 % |
+| rgba8_noise_1024 | 2.19 | 2.22 | 2.24 | +0.9 % |
+| rgba8_wide_4096x96 | 2.00 | 2.07 | 2.08 | +0.5 % |
+| rgba8_tall_64x4096 | 1.30 | 1.29 | 1.31 | +1.6 % |
+| rgba16_gradient_1024 | 1.87 | 2.36 | 2.47 | +4.7 % |
+| rgb8_photo_2048 | 17.09 | 17.52 | 20.72 | +18.3 % |
+| gray8_gradient_1600 | 1.00 | 1.07 | 3.45 | +222 % |
+
+Reading:
+
+- **For an 8-bit RGBA source the conversion is free**: at most 1.6 %, and that is the row copy
+  into the scratch buffer. The port's dominant class pays nothing for it.
+- **The two expensive cases are paid in output bytes, not in arithmetic.** An RGB source asked
+  for RGBA writes four bytes per pixel where the file had three (+18 %); a gray source writes
+  four where the file had one (+222 %). Both are inherent to the deliverable rather than to the
+  conversion code, and the fork still wins both against 0.2.0 because that version pays the same
+  volume *and* a second pass over it. A port that does not need alpha can ask for
+  `decode_to_rgb8` and take a quarter off the gray case.
+- **16-bit from an 8-bit source** (+4.7 %) is the only case doing real per-sample work, and it
+  is still four times cheaper than the two-pass route it replaces (−25.1 % overall).
+
+#### Is this as fast as it gets?
+
+The plumbing is no longer where the time is. For the port's class, streaming costs 3–4 % over a
+whole-image decode and the fused conversion costs under 2 % on top of that, so the remaining
+time is inflation and filter reversal — the serial Huffman loop and the serial per-row reversal,
+which is what the whole design was built to overlap. Going further means attacking those two
+directly: SIMD paths for the `Sub`/`Up`/`Average` filters on x86 (today only the two-row `Paeth`
+wavefront is specialised), and the Huffman decode itself. Neither is a small change, and the
+x86 CRC item does not apply here at all: chunk CRCs are off by default (`Checks::Crc`), so the
+PCLMULQDQ path would only matter to a caller that asks for `Checks::Full`.
+
+The honest summary: the decoder is within a few percent of what this design can do, and the
+design's remaining ceiling is the codec, not the decode path around it.
+
 ### What Phase 2 changed relative to the design doc's §3.2
 
 - The mid-block pause exists (a `SegmentPause` is a bit position plus a flag; the match-refusal

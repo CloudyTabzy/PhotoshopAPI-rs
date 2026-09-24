@@ -24,6 +24,27 @@ Decoder::new().decode_to(&png, |row: psd_png::Row<'_>| {
 Rows arrive in file order, each borrowed only for the duration of the call. A sink error aborts
 the decode and is returned; rows already delivered stay delivered.
 
+## Converting while streaming
+
+`decode_to_rgba8`, `decode_to_rgb8`, `decode_to_rgba16` and `decode_to_rgb16` deliver the same
+rows already converted, interleaved, at the sample width you name — so a caller never holds a
+converted image it did not ask for, and the whole-image buffer the port would otherwise
+allocate and then deinterleave never exists:
+
+```rust
+// 16-bit RGBA, big-endian samples: a 16-bit source untouched, 8-bit scaled by 257,
+// sub-byte greys across the full range, palette resolved, tRNS turned into alpha.
+Decoder::new().decode_to_rgba16(&png, |row: psd_png::Row<'_>| {
+    planar.push(row.bytes);
+    Ok::<(), psd_png::Error>(())
+})?;
+```
+
+This is the same conversion as `to_rgba8`/`to_rgb8`, expressed per row: the palette and `tRNS`
+key are resolved once per image, each row is converted into a scratch buffer reused for the
+whole decode, and only that row is live. The whole-image methods are implemented on top of
+the same per-row code, so the two paths cannot drift.
+
 ## Status and provenance
 
 This crate is **not published to a registry**. It is developed in its own checkout and vendored
@@ -75,6 +96,8 @@ methodology, tables and caveats are in `BENCHMARKS.md`.
 | `decode_to` vs `decode`, sink copying into a presized buffer | within **5 %** on 8 of 9 classes (16-bit gradients +27 %, an absolute 0.5 ms) |
 | `decode_to` vs `decode`, sink discarding rows | **faster** — it never allocates or first-touches the whole image |
 | A 16384×16384 RGBA image (1.07 GB filtered) | refused by `decode` under the default ceiling; streams through `decode_to` in a ~300 KB stage |
+| Full RGBA8 deliverable vs png-spark 0.2.0 (`decode` + `to_rgba8` there, `decode_to_rgba8` here) | **4.6 % to 25.1 % faster, 9/9, mean 14.7 %** |
+| Cost of the fused conversion on an 8-bit RGBA source | **≤ 1.6 %** — a row copy, no per-pixel work |
 
 Every PNG in the port's own fixture corpus (12 files, 512×512 and 200×108 RGBA) clears the
 fusion threshold, so the fused path is the one that runs in production rather than a benchmark

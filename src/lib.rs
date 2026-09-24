@@ -64,6 +64,34 @@
 //! into a buffer first and emitted from there — the memory bound is the non-interlaced
 //! case, which is what every raster in the port's corpus is.
 //!
+//! # Converting while streaming
+//!
+//! [`Decoder::decode_to_rgba8`], [`Decoder::decode_to_rgb8`],
+//! [`Decoder::decode_to_rgba16`] and [`Decoder::decode_to_rgb16`] deliver the same rows
+//! already converted, so a caller never holds a converted image it did not ask for:
+//!
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let png = std::fs::read("asset.png")?;
+//! psd_png::Decoder::new().decode_to_rgba16(&png, |row: psd_png::Row<'_>| {
+//!     // Four big-endian u16 samples per pixel: palette resolved, tRNS turned into alpha,
+//!     // a 16-bit source untouched and a narrower one scaled across the full range.
+//!     consume(row.bytes);
+//!     Ok::<(), psd_png::Error>(())
+//! })?;
+//! # fn consume(_bytes: &[u8]) {}
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! These are the same conversion as [`to_rgba8`](Image::to_rgba8) and
+//! [`to_rgb8`](Image::to_rgb8), expressed per row: one image's palette and `tRNS` key are
+//! resolved once, each reconstructed row is converted into a scratch buffer reused for the
+//! whole image, and only that row is live. The 8-bit and 16-bit forms differ in what they do
+//! to a narrow source, and nothing else: 16-bit input passes through untouched, 8-bit input
+//! keeps its high byte going down and is scaled up going the other way, and sub-byte greys
+//! reach the ends of the output range exactly.
+//!
 //! # Reading files you did not write
 //!
 //! `IHDR` states an image's dimensions in thirteen bytes, and a decoder needs the buffer

@@ -83,6 +83,72 @@ fn alpha_channels_pass_through() {
     assert_eq!(grey_alpha.to_rgba8().unwrap(), [9, 9, 9, 200, 60, 60, 60, 0]);
 }
 
+/// The eight-bit layouts at their own depth, including the rows that convert by a straight
+/// copy: an 8-bit RGB asked for as RGB and an 8-bit RGBA asked for as RGBA must come back
+/// byte for byte, and grey at 8 bits must not be rescaled on the way through.
+#[test]
+fn eight_bit_sources_convert_at_their_own_depth() {
+    let grey = image(info(2, 1, ColorType::Grayscale, BitDepth::Eight), vec![0x10, 0x20]);
+    assert_eq!(grey.to_rgba8().unwrap(), [0x10, 0x10, 0x10, 255, 0x20, 0x20, 0x20, 255]);
+
+    let rgb = image(info(2, 1, ColorType::Rgb, BitDepth::Eight), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(rgb.to_rgb8().unwrap(), [1, 2, 3, 4, 5, 6], "the copy path is exact");
+    assert_eq!(rgb.to_rgba8().unwrap(), [1, 2, 3, 255, 4, 5, 6, 255]);
+
+    let rgba = image(info(1, 1, ColorType::Rgba, BitDepth::Eight), vec![9, 8, 7, 6]);
+    assert_eq!(rgba.to_rgba8().unwrap(), [9, 8, 7, 6], "the copy path is exact");
+    assert_eq!(rgba.to_rgb8().unwrap(), [9, 8, 7]);
+}
+
+/// Sixteen-bit RGB converts by its high byte, and a `tRNS` key is matched at sixteen bits:
+/// two colours that share a high byte are still different colours in the file.
+#[test]
+fn sixteen_bit_rgb_converts_by_high_byte_and_compares_at_full_depth() {
+    let rgb = image(
+        info(2, 1, ColorType::Rgb, BitDepth::Sixteen),
+        vec![0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+    );
+    assert_eq!(rgb.to_rgb8().unwrap(), [0x12, 0x56, 0x9A, 0x01, 0x03, 0x05]);
+
+    // The key names (1, 2, 3) at full depth. The first pixel has the same high bytes but
+    // differs below them, so it must stay opaque.
+    let mut keyed = info(2, 1, ColorType::Rgb, BitDepth::Sixteen);
+    keyed.transparency = Some(vec![0x00, 0x01, 0x00, 0x02, 0x00, 0x03]);
+    let keyed =
+        image(keyed, vec![0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03]);
+    let converted = keyed.to_rgba8().unwrap();
+    assert_eq!(converted[3], 255, "a shared high byte is not a match");
+    assert_eq!(converted[7], 0, "the exact 16-bit colour is transparent");
+
+    let grey_alpha = image(
+        info(1, 1, ColorType::GrayscaleAlpha, BitDepth::Sixteen),
+        vec![0x11, 0x22, 0x33, 0x44],
+    );
+    assert_eq!(grey_alpha.to_rgba8().unwrap(), [0x11, 0x11, 0x11, 0x33]);
+}
+
+/// Palettes at every depth a PNG allows an indexed image to use, since the index is read
+/// from a differently packed row each time.
+#[test]
+fn narrow_palettes_resolve() {
+    let mut palette = Some(Vec::new());
+    for index in 0..16u8 {
+        palette.as_mut().unwrap().extend_from_slice(&[index, index, index]);
+    }
+
+    let mut one = info(2, 1, ColorType::Indexed, BitDepth::One);
+    one.palette = palette.clone();
+    assert_eq!(image(one, vec![0b0100_0000]).to_rgb8().unwrap(), [0, 0, 0, 1, 1, 1]);
+
+    let mut four = info(2, 1, ColorType::Indexed, BitDepth::Four);
+    four.palette = palette.clone();
+    assert_eq!(image(four, vec![0x0F]).to_rgb8().unwrap(), [0, 0, 0, 15, 15, 15]);
+
+    let mut eight = info(2, 1, ColorType::Indexed, BitDepth::Eight);
+    eight.palette = palette;
+    assert_eq!(image(eight, vec![0, 15]).to_rgb8().unwrap(), [0, 0, 0, 15, 15, 15]);
+}
+
 /// Every image in the generated corpus must convert without panicking, and the result must
 /// have exactly one pixel per pixel.
 #[test]
