@@ -6,6 +6,7 @@
 //! `psd-codecs` for channel payloads.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use psd_core::{
@@ -18,7 +19,9 @@ use psd_core::{
 };
 
 use crate::bitdepth::BitDepth;
-use crate::channels::{compress_channel, decompress_channel, ChannelKey, ChannelStore};
+use crate::channels::{
+    compress_channel, decompress_channel, ChannelKey, ChannelStore, RawChannelData,
+};
 use crate::layer::upsert_block;
 use crate::layer::{GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Rect, TextLayer};
 use crate::progress::{ignore_progress, ProgressEvent};
@@ -39,6 +42,55 @@ pub fn color_channel_count(color_mode: ColorMode) -> u16 {
         ColorMode::Rgb | ColorMode::Lab => 3,
         ColorMode::Cmyk => 4,
         ColorMode::Multichannel => 0,
+    }
+}
+
+/// Default cumulative budget for decoded layer-channel bitmaps: 2 GiB.
+pub const DEFAULT_TOTAL_MEMORY_LIMIT: usize = 2 * 1024 * 1024 * 1024;
+
+/// Options for reading a PSD or PSB document.
+///
+/// The cumulative bitmap budget follows the caller-controlled read-budget
+/// design in [ag-psd-rs](https://github.com/Vasyanator/ag-psd-rs), adapted to
+/// this crate's planar typed channel storage. The default is 2 GiB. Set
+/// [`total_memory_limit`](Self::total_memory_limit) to `None` to disable the
+/// limit explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadOptions {
+    /// Maximum cumulative bytes of decoded layer-channel samples retained by
+    /// the parsed document. This does not limit input bytes, parsed metadata,
+    /// or temporary codec workspace.
+    pub total_memory_limit: Option<usize>,
+    /// Retain compressed layer and mask channels until explicitly decoded.
+    /// Untouched raw channels are written from their stored payloads without
+    /// decoding. This follows `ReadOptions::use_raw_data` in ag-psd-rs
+    /// (<https://github.com/Vasyanator/ag-psd-rs>). The default is `false` to
+    /// preserve eager pixel access.
+    pub use_raw_data: bool,
+}
+
+impl ReadOptions {
+    /// Read without a cumulative decoded-channel memory limit.
+    pub const fn unlimited() -> Self {
+        Self {
+            total_memory_limit: None,
+            use_raw_data: false,
+        }
+    }
+
+    /// Select whether layer and mask channels remain compressed after reading.
+    pub const fn with_raw_data(mut self, use_raw_data: bool) -> Self {
+        self.use_raw_data = use_raw_data;
+        self
+    }
+}
+
+impl Default for ReadOptions {
+    fn default() -> Self {
+        Self {
+            total_memory_limit: Some(DEFAULT_TOTAL_MEMORY_LIMIT),
+            use_raw_data: false,
+        }
     }
 }
 
@@ -67,6 +119,88 @@ fn channel_sort_key(key: ChannelKey) -> (u8, i16) {
 fn mask_channel_rect(mask: Option<&psd_core::LayerMaskData>, key: ChannelKey) -> Option<Rect> {
     mask.and_then(|data| data.record_for_channel(key.index()))
         .map(|mask| Rect::new(mask.top, mask.left, mask.bottom, mask.right))
+}
+
+/// Validate file-provided layer and mask bounds before deriving bitmap sizes.
+/// This follows the early rectangle check in ag-psd-rs
+/// (https://github.com/Vasyanator/ag-psd-rs), using 30,000 pixels per side for
+/// PSD and 300,000 for PSB while doing the subtraction in i64.
+fn read_rect_extents(rect: Rect, kind: &'static str, version: Version) -> Result<(usize, usize)> {
+    let width_i64 = i64::from(rect.right) - i64::from(rect.left);
+    let height_i64 = i64::from(rect.bottom) - i64::from(rect.top);
+    let maximum = match version {
+        Version::Psd => 30_000,
+        Version::Psb => 300_000,
+    };
+    if width_i64 < 0 || height_i64 < 0 || width_i64 > maximum || height_i64 > maximum {
+        return Err(PsdError::InvalidImageBounds {
+            kind,
+            width: width_i64,
+            height: height_i64,
+        });
+    }
+    let width = usize::try_from(width_i64).map_err(|_| PsdError::InvalidImageBounds {
+        kind,
+        width: width_i64,
+        height: height_i64,
+    })?;
+    let height = usize::try_from(height_i64).map_err(|_| PsdError::InvalidImageBounds {
+        kind,
+        width: width_i64,
+        height: height_i64,
+    })?;
+    Ok((width, height))
+}
+
+fn mask_channel_extents(
+    rect: Rect,
+    kind: &'static str,
+    version: Version,
+    empty_payload: bool,
+) -> Result<(usize, usize)> {
+    match read_rect_extents(rect, kind, version) {
+        Ok(extents) => Ok(extents),
+        // PhotoshopAPI/src/PhotoshopFile/LayerAndMaskInformation.cpp passes
+        // mask extents to its decoder without checking them, while ag-psd-rs
+        // rejects inverted extents. The corpus has an empty vector-mask
+        // channel with a 0x-1 placeholder; retain it as zero-area because it
+        // has no bytes and cannot allocate pixels.
+        Err(PsdError::InvalidImageBounds { width, height, .. })
+            if empty_payload && matches!((width, height), (0, -1) | (-1, 0)) =>
+        {
+            Ok((0, 0))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Charge one retained channel plane before calling its decoder. This adapts
+/// ag-psd-rs's remaining-budget model
+/// (https://github.com/Vasyanator/ag-psd-rs) to planar typed channels.
+fn charge_decoded_bitmap(
+    remaining: &mut Option<usize>,
+    width: usize,
+    height: usize,
+    bytes_per_sample: usize,
+) -> Result<()> {
+    let requested = width
+        .checked_mul(height)
+        .and_then(|samples| samples.checked_mul(bytes_per_sample))
+        .ok_or(PsdError::InvalidImageBounds {
+            kind: "layer channel",
+            width: i64::try_from(width).unwrap_or(i64::MAX),
+            height: i64::try_from(height).unwrap_or(i64::MAX),
+        })?;
+    if let Some(available) = *remaining {
+        if requested > available {
+            return Err(PsdError::ExceededMemoryLimit {
+                requested,
+                available,
+            });
+        }
+        *remaining = Some(available - requested);
+    }
+    Ok(())
 }
 
 /// Byte range of the blend-mode key inside an `lsct` payload
@@ -115,6 +249,9 @@ pub struct LayeredFile<T: BitDepth> {
     /// smart object be re-linked externally later (upstream keeps the path
     /// on its `LinkedLayerData`). Excluded from equality.
     pub(crate) linked_sources: std::collections::HashMap<String, PathBuf>,
+    /// Remaining cumulative budget for channels materialized by a lazy read.
+    /// Runtime state, excluded from document equality.
+    remaining_bitmap_memory: Option<usize>,
     /// Slot arena: removed layers leave `None` so ids stay stable and are
     /// never reused (see [`LayerId`]).
     layers: Vec<Option<Layer<T>>>,
@@ -171,6 +308,7 @@ impl<T: BitDepth> LayeredFile<T> {
             source_path: None,
             text_cache: None,
             linked_sources: std::collections::HashMap::new(),
+            remaining_bitmap_memory: Some(DEFAULT_TOTAL_MEMORY_LIMIT),
             layers: Vec::new(),
             root_children: Vec::new(),
         })
@@ -178,7 +316,7 @@ impl<T: BitDepth> LayeredFile<T> {
 
     /// Read a document from disk (mmap-backed).
     pub fn read(path: impl AsRef<Path>) -> Result<Self> {
-        Self::read_with_progress(path, &mut ignore_progress)
+        Self::read_with_options(path, ReadOptions::default())
     }
 
     /// Read a document from disk, reporting one [`ProgressEvent`] per layer.
@@ -186,19 +324,36 @@ impl<T: BitDepth> LayeredFile<T> {
         path: impl AsRef<Path>,
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<Self> {
+        Self::read_with_options_and_progress(path, ReadOptions::default(), progress)
+    }
+
+    /// Read a document from disk with explicit bitmap memory options.
+    /// Set [`ReadOptions::use_raw_data`] to retain compressed layer and mask
+    /// channels until explicitly decoded.
+    pub fn read_with_options(path: impl AsRef<Path>, options: ReadOptions) -> Result<Self> {
+        Self::read_with_options_and_progress(path, options, &mut ignore_progress)
+    }
+
+    /// Read a document from disk with explicit bitmap memory options and report
+    /// one [`ProgressEvent`] per layer.
+    pub fn read_with_options_and_progress(
+        path: impl AsRef<Path>,
+        options: ReadOptions,
+        progress: &mut dyn FnMut(ProgressEvent<'_>),
+    ) -> Result<Self> {
         let path = path.as_ref();
         let file = std::fs::File::open(path)?;
         // SAFETY: the mapping outlives the parse call and every field of the
         // returned document owns its data — nothing borrows the mapping.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let mut document = Self::from_bytes_with_progress(&mmap, progress)?;
+        let mut document = Self::from_bytes_with_options_and_progress(&mmap, options, progress)?;
         document.source_path = Some(absolute_or_current_dir(path)?);
         Ok(document)
     }
 
     /// Read a document from memory.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Self::from_bytes_with_progress(bytes, &mut ignore_progress)
+        Self::from_bytes_with_options(bytes, ReadOptions::default())
     }
 
     /// Read a document from memory while retaining the path it came from as
@@ -208,7 +363,17 @@ impl<T: BitDepth> LayeredFile<T> {
         bytes: &[u8],
         source_path: impl AsRef<Path>,
     ) -> Result<Self> {
-        let mut document = Self::from_bytes(bytes)?;
+        Self::from_bytes_with_source_path_and_options(bytes, source_path, ReadOptions::default())
+    }
+
+    /// Read from memory with explicit options while retaining the path as
+    /// context for relative external smart-object links.
+    pub fn from_bytes_with_source_path_and_options(
+        bytes: &[u8],
+        source_path: impl AsRef<Path>,
+        options: ReadOptions,
+    ) -> Result<Self> {
+        let mut document = Self::from_bytes_with_options(bytes, options)?;
         document.source_path = Some(absolute_or_current_dir(source_path.as_ref())?);
         Ok(document)
     }
@@ -223,13 +388,34 @@ impl<T: BitDepth> LayeredFile<T> {
         bytes: &[u8],
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<Self> {
+        Self::from_bytes_with_options_and_progress(bytes, ReadOptions::default(), progress)
+    }
+
+    /// Read a document from memory with explicit bitmap memory options.
+    ///
+    /// [`ReadOptions::default()`] limits cumulative decoded layer-channel
+    /// samples to 2 GiB; use [`ReadOptions::unlimited()`] to disable the limit.
+    /// With `use_raw_data`, pixel getters return `None` until their channels
+    /// are explicitly decoded. Untouched raw channels remain writable.
+    pub fn from_bytes_with_options(bytes: &[u8], options: ReadOptions) -> Result<Self> {
+        Self::from_bytes_with_options_and_progress(bytes, options, &mut ignore_progress)
+    }
+
+    /// Read a document from memory with explicit bitmap memory options and
+    /// report one [`ProgressEvent`] per layer.
+    pub fn from_bytes_with_options_and_progress(
+        bytes: &[u8],
+        options: ReadOptions,
+        progress: &mut dyn FnMut(ProgressEvent<'_>),
+    ) -> Result<Self> {
         let mut reader = BeReader::new(bytes);
         let file = PhotoshopFile::read(&mut reader)?;
-        Self::from_photoshop_file(file, progress)
+        Self::from_photoshop_file(file, options, progress)
     }
 
     fn from_photoshop_file(
         file: PhotoshopFile,
+        options: ReadOptions,
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<Self> {
         let header = file.header;
@@ -250,6 +436,7 @@ impl<T: BitDepth> LayeredFile<T> {
             .icc_profile()
             .map(|icc| icc.data().to_vec())
             .unwrap_or_default();
+        let mut layer_and_mask_info = file.layer_and_mask_info;
 
         let mut document = Self {
             version: header.version,
@@ -261,32 +448,38 @@ impl<T: BitDepth> LayeredFile<T> {
             icc_profile,
             color_mode_data: file.color_mode_data,
             image_resources: file.image_resources,
-            global_layer_mask_info: file.layer_and_mask_info.global_layer_mask_info,
-            document_blocks: file
-                .layer_and_mask_info
+            global_layer_mask_info: layer_and_mask_info.global_layer_mask_info,
+            document_blocks: layer_and_mask_info
                 .additional_layer_info
                 .map(|blocks| blocks.into_owned()),
-            has_merged_alpha: file.layer_and_mask_info.layer_info.has_merged_alpha,
+            has_merged_alpha: layer_and_mask_info.layer_info.has_merged_alpha,
             compression: None,
             source_path: None,
             text_cache: None,
             linked_sources: std::collections::HashMap::new(),
+            remaining_bitmap_memory: options.total_memory_limit,
             layers: Vec::new(),
             root_children: Vec::new(),
         };
+        let mut remaining_bitmap_memory = options.total_memory_limit;
         document.build_layers(
-            &file.layer_and_mask_info.layer_info,
+            &mut layer_and_mask_info.layer_info,
             header.version,
+            options,
+            &mut remaining_bitmap_memory,
             progress,
         )?;
+        document.remaining_bitmap_memory = remaining_bitmap_memory;
         document.text_cache = TextCacheBaseline::capture(&document);
         Ok(document)
     }
 
     fn build_layers(
         &mut self,
-        info: &LayerInfo,
+        info: &mut LayerInfo,
         version: Version,
+        options: ReadOptions,
+        remaining_bitmap_memory: &mut Option<usize>,
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<()> {
         if info.layer_records.len() != info.channel_image_data.len() {
@@ -298,18 +491,23 @@ impl<T: BitDepth> LayeredFile<T> {
 
         let total = info.layer_records.len();
         let mut ids = Vec::with_capacity(total);
-        for (index, (record, channel_data)) in info
-            .layer_records
-            .iter()
-            .zip(&info.channel_image_data)
-            .enumerate()
-        {
+        for index in 0..total {
+            let record = &info.layer_records[index];
+            // Move compressed bytes into lazy channel entries when requested;
+            // eager decoding consumes the same owned payloads without cloning.
+            let channel_data = std::mem::take(&mut info.channel_image_data[index]);
             progress(ProgressEvent::Layer {
                 name: record.name.value(),
                 index,
                 total,
             });
-            ids.push(self.build_layer(record, channel_data, version)?);
+            ids.push(self.build_layer(
+                record,
+                channel_data,
+                version,
+                options,
+                remaining_bitmap_memory,
+            )?);
         }
 
         // Assign parents by walking the (bottom-to-top) record order in
@@ -347,8 +545,10 @@ impl<T: BitDepth> LayeredFile<T> {
     fn build_layer(
         &mut self,
         record: &LayerRecord,
-        channel_data: &ChannelImageData,
+        channel_data: ChannelImageData,
         version: Version,
+        options: ReadOptions,
+        remaining_bitmap_memory: &mut Option<usize>,
     ) -> Result<LayerId> {
         let blocks = record
             .additional_layer_info
@@ -381,31 +581,66 @@ impl<T: BitDepth> LayeredFile<T> {
                 message: "layer channel count mismatch",
             });
         }
+        // PhotoshopAPI/src/LayeredFile/LayerTypes/ImageLayer.h assigns parsed
+        // channels into a keyed map and overwrites repeated indices. Reject a
+        // duplicate before either storage mode could discard its payload.
+        let mut seen_channels = BTreeSet::new();
+        for channel in &record.channels {
+            if !seen_channels.insert(channel.index) {
+                return Err(PsdError::InvalidData {
+                    offset: 0,
+                    message: "duplicate layer channel index",
+                });
+            }
+        }
+        let mut channel_iter = channel_data.channels.into_iter();
         let layer_rect = Rect::new(record.top, record.left, record.bottom, record.right);
+        let layer_extents = read_rect_extents(layer_rect, "layer", version)?;
         let is_group = matches!(
             divider,
             Some(SectionDivider::OpenFolder | SectionDivider::ClosedFolder)
         );
-        let decode_channels = |keep: fn(ChannelKey) -> bool| -> Result<ChannelStore<T>> {
+        let mut decode_channels = |keep: fn(ChannelKey) -> bool| -> Result<ChannelStore<T>> {
             let mut channels = ChannelStore::new();
-            for (info, channel) in record.channels.iter().zip(&channel_data.channels) {
+            for (info, channel) in record.channels.iter().zip(channel_iter.by_ref()) {
                 let key = ChannelKey(info.index);
                 if !keep(key) {
                     continue;
                 }
-                let rect = if key.is_mask() {
-                    mask_channel_rect(record.mask_data.as_ref(), key).unwrap_or(layer_rect)
+                let (width, height) = if key.is_mask() {
+                    let rect =
+                        mask_channel_rect(record.mask_data.as_ref(), key).unwrap_or(layer_rect);
+                    let kind = if key == ChannelKey::REAL_USER_MASK {
+                        "real mask"
+                    } else {
+                        "mask"
+                    };
+                    mask_channel_extents(rect, kind, version, channel.data.is_empty())?
                 } else {
-                    layer_rect
+                    layer_extents
                 };
-                let samples = decompress_channel::<T>(
-                    channel.compression,
-                    &channel.data,
-                    rect.width().max(0) as usize,
-                    rect.height().max(0) as usize,
-                    version,
-                )?;
-                channels.insert(key, samples);
+                if options.use_raw_data {
+                    channels.insert_raw(
+                        key,
+                        RawChannelData::new(
+                            channel.compression,
+                            channel.data,
+                            width,
+                            height,
+                            version,
+                        ),
+                    );
+                } else {
+                    charge_decoded_bitmap(remaining_bitmap_memory, width, height, T::SIZE)?;
+                    let samples = decompress_channel::<T>(
+                        channel.compression,
+                        &channel.data,
+                        width,
+                        height,
+                        version,
+                    )?;
+                    channels.insert(key, samples);
+                }
             }
             Ok(channels)
         };
@@ -487,6 +722,80 @@ impl<T: BitDepth> LayeredFile<T> {
 
     pub fn layer_mut(&mut self, id: LayerId) -> Option<&mut Layer<T>> {
         self.layers.get_mut(id)?.as_mut()
+    }
+
+    /// Decode one raw-backed layer or mask channel into the layer's
+    /// [`ChannelStore`], releasing that channel's compressed payload.
+    ///
+    /// Returns `false` when an existing layer or key has no raw payload. The document's
+    /// cumulative read budget is charged before decoding and is not refunded.
+    /// Decoded samples become canonical channel data; no second cache is kept.
+    pub fn decode_layer_channel(&mut self, id: LayerId, key: ChannelKey) -> Result<bool> {
+        let mut remaining = self.remaining_bitmap_memory;
+        let decoded = {
+            let layer = self.layer_mut(id).ok_or(PsdError::InvalidData {
+                offset: 0,
+                message: "cannot decode channels for an absent layer",
+            })?;
+            let Some(channels) = layer.channels_mut() else {
+                return Ok(false);
+            };
+            let Some(raw) = channels.raw(key) else {
+                return Ok(false);
+            };
+            charge_decoded_bitmap(&mut remaining, raw.width, raw.height, T::SIZE)?;
+            let samples = decompress_channel::<T>(
+                raw.compression,
+                &raw.payload,
+                raw.width,
+                raw.height,
+                raw.version,
+            )?;
+            channels.insert(key, samples);
+            true
+        };
+        if decoded {
+            self.remaining_bitmap_memory = remaining;
+        }
+        Ok(decoded)
+    }
+
+    /// Decode all remaining raw-backed channels of one layer, then release
+    /// their compressed payloads. Other layers remain lazy. If any channel
+    /// fails, the layer remains unchanged and its budget is not consumed.
+    /// Decoded samples become canonical channel data; no second cache is kept.
+    pub fn decode_layer_pixels(&mut self, id: LayerId) -> Result<()> {
+        let mut remaining = self.remaining_bitmap_memory;
+        let decoded_count = {
+            let layer = self.layer_mut(id).ok_or(PsdError::InvalidData {
+                offset: 0,
+                message: "cannot decode channels for an absent layer",
+            })?;
+            let Some(channels) = layer.channels_mut() else {
+                return Ok(());
+            };
+            let mut decoded = Vec::new();
+            for (key, raw) in channels.raw_channels() {
+                charge_decoded_bitmap(&mut remaining, raw.width, raw.height, T::SIZE)?;
+                let samples = decompress_channel::<T>(
+                    raw.compression,
+                    &raw.payload,
+                    raw.width,
+                    raw.height,
+                    raw.version,
+                )?;
+                decoded.push((key, samples));
+            }
+            let decoded_count = decoded.len();
+            for (key, samples) in decoded {
+                channels.insert(key, samples);
+            }
+            decoded_count
+        };
+        if decoded_count > 0 {
+            self.remaining_bitmap_memory = remaining;
+        }
+        Ok(())
     }
 
     /// Number of layers in the document (removed layers excluded).
@@ -581,7 +890,8 @@ impl<T: BitDepth> LayeredFile<T> {
     /// Use `compression` for every channel of every layer (upstream
     /// `set_compression`): sets the document default and clears the
     /// per-layer overrides so it applies everywhere. `None` restores the
-    /// automatic choice.
+    /// automatic choice. Raw-backed channels with a different codec must be
+    /// decoded before writing with the new setting.
     pub fn set_compression(&mut self, compression: Option<Compression>) {
         self.compression = compression;
         for layer in self.layers.iter_mut().flatten() {
@@ -1024,10 +1334,6 @@ impl<T: BitDepth> LayeredFile<T> {
         let mut channels = Vec::new();
         let mut data = Vec::new();
         for key in keys {
-            let samples: &[T] = layer
-                .channels()
-                .and_then(|channels| channels.get(key))
-                .unwrap_or(&[]);
             let rect = if key.is_mask() {
                 mask_channel_rect(layer.mask.as_ref(), key).unwrap_or(bounds)
             } else if stub_channels {
@@ -1037,13 +1343,71 @@ impl<T: BitDepth> LayeredFile<T> {
             } else {
                 bounds
             };
-            let (compression, payload) = compress_channel(
-                samples,
-                rect.width().max(0) as usize,
-                rect.height().max(0) as usize,
-                self.version,
-                layer.write_compression(key, self.compression),
-            )?;
+            let (compression, payload) =
+                if let Some(raw) = layer.channels().and_then(|channels| channels.raw(key)) {
+                    // Like ag-psd-rs's `use_raw_data` writer path, preserve the
+                    // encoded payload until a caller decodes or replaces it.
+                    let (width, height) = if key.is_mask() {
+                        let kind = if key == ChannelKey::REAL_USER_MASK {
+                            "real mask"
+                        } else {
+                            "mask"
+                        };
+                        mask_channel_extents(rect, kind, self.version, raw.payload.is_empty())?
+                    } else if stub_channels {
+                        (0, 0)
+                    } else {
+                        read_rect_extents(rect, "layer", self.version)?
+                    };
+                    if (raw.width, raw.height) != (width, height) {
+                        return Err(PsdError::InvalidData {
+                            offset: 0,
+                            message: "decode raw channel data before changing its geometry",
+                        });
+                    }
+                    // PhotoshopAPI/src/PhotoshopFile/LayerAndMaskInformation.cpp
+                    // converts plain ZIP to ZIP prediction for 32-bit channels.
+                    // Raw passthrough must keep that write-time requirement.
+                    if T::DEPTH == 32 && raw.compression == Compression::Zip {
+                        return Err(PsdError::InvalidData {
+                            offset: 0,
+                            message: "decode raw 32-bit ZIP channels before writing",
+                        });
+                    }
+                    if raw.compression == Compression::Rle && raw.version != self.version {
+                        return Err(PsdError::InvalidData {
+                            offset: 0,
+                            message: "decode raw RLE channels before changing PSD/PSB version",
+                        });
+                    }
+                    let requested_compression =
+                        layer.write_compression(key, self.compression).map(|codec| {
+                            if T::DEPTH == 32 && codec == Compression::Zip {
+                                Compression::ZipPrediction
+                            } else {
+                                codec
+                            }
+                        });
+                    if requested_compression.is_some_and(|codec| codec != raw.compression) {
+                        return Err(PsdError::InvalidData {
+                            offset: 0,
+                            message: "decode raw channels before changing their compression",
+                        });
+                    }
+                    (raw.compression, raw.payload.clone())
+                } else {
+                    let samples: &[T] = layer
+                        .channels()
+                        .and_then(|channels| channels.get(key))
+                        .unwrap_or(&[]);
+                    compress_channel(
+                        samples,
+                        rect.width().max(0) as usize,
+                        rect.height().max(0) as usize,
+                        self.version,
+                        layer.write_compression(key, self.compression),
+                    )?
+                };
             channels.push(ChannelInfo {
                 id: CoreChannelId::from_index(key.index(), self.color_mode),
                 index: key.index(),
@@ -1261,5 +1625,84 @@ mod tests {
             assert_eq!(back.num_channels, document.num_channels, "{name}");
             assert!(!back.has_merged_alpha, "{name}");
         }
+    }
+
+    #[test]
+    fn duplicate_layer_channel_indices_are_rejected() {
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 2, 2).unwrap();
+        let mut layer = Layer::new_image("Duplicate", Rect::new(0, 0, 2, 2));
+        layer
+            .image_mut()
+            .unwrap()
+            .set_channel(ChannelKey::color(0), vec![1; 4]);
+        layer
+            .image_mut()
+            .unwrap()
+            .set_channel(ChannelKey::color(1), vec![2; 4]);
+        document.add_layer(layer);
+        let mut file = document.to_photoshop_file().unwrap();
+        let channels = &mut file.layer_and_mask_info.layer_info.layer_records[0].channels;
+        let first = channels[0];
+        channels[1].index = first.index;
+        channels[1].id = first.id;
+        let mut writer = BeWriter::new();
+        file.write(&mut writer).unwrap();
+
+        assert!(matches!(
+            LayeredFile::<u8>::from_bytes(&writer.into_inner()),
+            Err(PsdError::InvalidData {
+                message: "duplicate layer channel index",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn raw_float_zip_requires_prediction_before_write() {
+        let pixels = vec![0.0f32, 0.25, 0.5, 1.0];
+        let payload =
+            psd_codecs::zip::compress(&psd_codecs::endian::encode_be_bytes(&pixels)).unwrap();
+        let mut document = LayeredFile::<f32>::new(ColorMode::Rgb, 2, 2).unwrap();
+        let mut layer = Layer::new_image("Float", Rect::new(0, 0, 2, 2));
+        layer.image_mut().unwrap().channels.insert_raw(
+            ChannelKey::color(0),
+            RawChannelData::new(Compression::Zip, payload, 2, 2, Version::Psd),
+        );
+        let id = document.add_layer(layer);
+
+        assert!(matches!(
+            document.to_bytes(),
+            Err(PsdError::InvalidData {
+                message: "decode raw 32-bit ZIP channels before writing",
+                ..
+            })
+        ));
+        assert!(document
+            .layer(id)
+            .unwrap()
+            .image()
+            .unwrap()
+            .channels
+            .is_raw(ChannelKey::color(0)));
+
+        assert!(document
+            .decode_layer_channel(id, ChannelKey::color(0))
+            .unwrap());
+        let bytes = document.to_bytes().unwrap();
+        let file = PhotoshopFile::read(&mut BeReader::new(&bytes)).unwrap();
+        assert_eq!(
+            file.layer_and_mask_info.layer_info.channel_image_data[0].channels[0].compression,
+            Compression::ZipPrediction
+        );
+        let reopened = LayeredFile::<f32>::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            reopened
+                .layer_by_path("Float")
+                .unwrap()
+                .image()
+                .unwrap()
+                .channel(ChannelKey::color(0)),
+            Some(pixels.as_slice())
+        );
     }
 }

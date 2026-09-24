@@ -41,7 +41,7 @@ pub use bitdepth::BitDepth;
 pub use channels::{ChannelKey, ChannelStore};
 pub use geometry::{BezierSurface, BoundingBox, Homography, MeshVertex, Point2, QuadMesh};
 pub use layer::{GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Rect, TextLayer};
-pub use layered_file::{color_channel_count, LayeredFile};
+pub use layered_file::{color_channel_count, LayeredFile, ReadOptions, DEFAULT_TOTAL_MEMORY_LIMIT};
 pub use progress::ProgressEvent;
 pub use render::{composite_rgb, render_warped, Interpolation, Raster, WarpRenderOptions};
 pub use smart_object::LinkedStorage;

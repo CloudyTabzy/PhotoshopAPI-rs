@@ -109,12 +109,8 @@ mod _native {
             }
         };
         Ok(match depth {
-            BitDepth::Eight => {
-                Py::new(py, depth8::PyDocument::open(path, options)?)?.into_any()
-            }
-            BitDepth::Sixteen => {
-                Py::new(py, depth16::PyDocument::open(path, options)?)?.into_any()
-            }
+            BitDepth::Eight => Py::new(py, depth8::PyDocument::open(path, options)?)?.into_any(),
+            BitDepth::Sixteen => Py::new(py, depth16::PyDocument::open(path, options)?)?.into_any(),
             BitDepth::ThirtyTwo => {
                 Py::new(py, depth32::PyDocument::open(path, options)?)?.into_any()
             }

@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use psd::{ChannelKey, LayerKind, LayeredFile};
+use psd::{ChannelKey, LayerKind, LayeredFile, ReadOptions};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -40,17 +40,10 @@ fn assert_documents_match<T: psd::BitDepth + std::fmt::Debug>(
         assert_eq!(a.flags, b.flags, "{name}: flags of {}", a.name);
         match (&a.kind, &b.kind) {
             (LayerKind::Image(ia), LayerKind::Image(ib)) => {
-                let a_keys: Vec<ChannelKey> = ia.channels.keys().collect();
-                let b_keys: Vec<ChannelKey> = ib.channels.keys().collect();
-                assert_eq!(a_keys, b_keys, "{name}: channels of {}", a.name);
-                for (key, samples) in ia.channels.iter() {
-                    assert_eq!(
-                        ib.channels.get(key),
-                        Some(samples),
-                        "{name}: pixels of {} channel {key:?}",
-                        a.name
-                    );
-                }
+                assert_channel_stores_match(name, &a.name, &ia.channels, &ib.channels);
+            }
+            (LayerKind::Text(ta), LayerKind::Text(tb)) => {
+                assert_channel_stores_match(name, &a.name, &ta.channels, &tb.channels);
             }
             (LayerKind::Group(ga), LayerKind::Group(gb)) => {
                 assert_eq!(ga.open, gb.open, "{name}: group state of {}", a.name);
@@ -61,6 +54,27 @@ fn assert_documents_match<T: psd::BitDepth + std::fmt::Debug>(
             }
             _ => panic!("{name}: kind mismatch for layer {}", a.name),
         }
+    }
+}
+
+fn assert_channel_stores_match<T: PartialEq + std::fmt::Debug>(
+    document_name: &str,
+    layer_name: &str,
+    original: &psd::ChannelStore<T>,
+    reread: &psd::ChannelStore<T>,
+) {
+    let original_keys: Vec<ChannelKey> = original.keys().collect();
+    let reread_keys: Vec<ChannelKey> = reread.keys().collect();
+    assert_eq!(
+        original_keys, reread_keys,
+        "{document_name}: channels of {layer_name}"
+    );
+    for (key, samples) in original.iter() {
+        assert_eq!(
+            reread.get(key),
+            Some(samples),
+            "{document_name}: pixels of {layer_name} channel {key:?}"
+        );
     }
 }
 
@@ -234,4 +248,63 @@ fn every_fixture_parses_as_a_layered_file() {
             depth => panic!("{name}: unexpected depth {depth}"),
         }
     }
+}
+
+#[test]
+fn every_fixture_can_round_trip_with_lazy_channel_payloads() {
+    fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("psd" | "psb")
+            ) {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect(&fixture(""), &mut files);
+    for path in &files {
+        let bytes = std::fs::read(path).unwrap();
+        let name = path.display().to_string();
+        let options = ReadOptions::default().with_raw_data(true);
+        match header_depth(&bytes) {
+            8 => lazy_roundtrip::<u8>(&name, &bytes, options),
+            16 => lazy_roundtrip::<u16>(&name, &bytes, options),
+            32 => lazy_roundtrip::<f32>(&name, &bytes, options),
+            depth => panic!("{name}: unexpected depth {depth}"),
+        }
+    }
+}
+
+fn lazy_roundtrip<T: psd::BitDepth + std::fmt::Debug>(
+    name: &str,
+    bytes: &[u8],
+    options: ReadOptions,
+) {
+    let original = LayeredFile::<T>::from_bytes(bytes)
+        .unwrap_or_else(|error| panic!("{name}: eager read: {error}"));
+    let lazy = LayeredFile::<T>::from_bytes_with_options(bytes, options)
+        .unwrap_or_else(|error| panic!("{name}: lazy read: {error}"));
+    for layer in lazy.layers() {
+        if let Some(channels) = layer.channels() {
+            for key in channels.keys() {
+                assert!(
+                    channels.is_raw(key),
+                    "{name}: channel {key:?} was decoded eagerly"
+                );
+            }
+        }
+    }
+
+    let written = lazy
+        .to_bytes()
+        .unwrap_or_else(|error| panic!("{name}: lazy write: {error}"));
+    let reread = LayeredFile::<T>::from_bytes(&written)
+        .unwrap_or_else(|error| panic!("{name}: eager reread: {error}"));
+    assert_documents_match(name, &original, &reread);
 }

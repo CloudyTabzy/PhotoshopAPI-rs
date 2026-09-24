@@ -12,6 +12,45 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-24
+
+### Added
+
+- Rust readers can retain layer and mask channels in their original compressed
+  form, decode one channel or one layer on demand, and write untouched payloads
+  without decoding them.
+
+### Changed
+
+- `ReadOptions` adds `use_raw_data`. Existing eager reads remain the default;
+  callers using exhaustive struct literals must now provide the new field or
+  use struct update syntax with `ReadOptions::default()`.
+- A channel store distinguishes decoded pixels from raw payloads. Pixel access
+  returns no samples for a raw-backed key until that channel is decoded.
+
+### Fixed
+
+- Duplicate layer channel IDs now return a typed error instead of silently
+  replacing an earlier payload, as the C++ layer map does.
+- Raw 32-bit ZIP channels must be decoded before writing, so the writer can
+  emit ZIP prediction as Photoshop expects.
+
+## [0.5.3] - 2026-09-24
+
+### Added
+
+- Rust document readers accept a cumulative decoded-channel memory limit. Reads
+  default to 2 GiB; callers can set a smaller limit or explicitly choose
+  unlimited decoding.
+- Python `read` and `from_bytes` accept `memory_limit`: omit it for the Rust
+  default, pass `0` for unlimited decoding, or pass a positive byte limit.
+
+### Fixed
+
+- Invalid or over-limit layer and mask extents now return typed errors before
+  channel allocation. Empty `0×−1` vector-mask placeholders stay zero-area to
+  preserve compatibility with existing Photoshop documents.
+
 ## [0.5.2] - 2026-09-24
 
 Repository hygiene ahead of the first public push. No behavior, API or output

@@ -30,6 +30,8 @@ pub fn psd_error(error: PsdError) -> PyErr {
     match error {
         PsdError::Io(_) => PyOSError::new_err(message),
         PsdError::InvalidData { .. }
+        | PsdError::ExceededMemoryLimit { .. }
+        | PsdError::InvalidImageBounds { .. }
         | PsdError::UnsupportedBitDepth(_)
         | PsdError::UnsupportedColorMode(_)
         | PsdError::UnsupportedCompression(_)

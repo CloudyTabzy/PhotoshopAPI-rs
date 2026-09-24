@@ -474,6 +474,7 @@ impl<T: BitDepth> Layer<T> {
     }
 
     /// The pixel mask samples, row-major over [`mask_rect`](Self::mask_rect).
+    /// Returns `None` until a raw-backed mask channel is decoded.
     pub fn mask_pixels(&self) -> Option<&[T]> {
         if !self.has_mask() {
             return None;
@@ -531,7 +532,8 @@ impl<T: BitDepth> Layer<T> {
     }
 
     /// Remove the pixel mask (samples and record), returning its samples.
-    /// A vector mask, if any, is kept.
+    /// A vector mask, if any, is kept. Removing a raw-backed mask discards its
+    /// compressed payload and returns `None` because no samples were decoded.
     pub fn remove_mask(&mut self) -> Option<Vec<T>> {
         let key = self.pixel_mask_key();
         let pixels = self.channels_mut()?.remove(key);

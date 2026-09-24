@@ -1,9 +1,9 @@
 //! Planar channel storage and per-channel codec plumbing.
 //!
 //! Mirrors the channel maps of `ImageDataMixins.h` / `Core/Struct/ImageChannel.h`
-//! but reshaped: one `Vec<T>` per channel keyed by
-//! [`ChannelKey`], decompressed in memory. Compression is a write-time property,
-//! not part of the in-memory state.
+//! but reshaped: one entry per channel keyed by [`ChannelKey`]. Entries hold
+//! decoded samples by default or the original compressed payload during an
+//! opt-in lazy read. Replacing a raw-backed key with pixels discards its payload.
 
 use std::collections::BTreeMap;
 
@@ -40,10 +40,46 @@ impl ChannelKey {
     }
 }
 
-/// The planar channels of one layer, ordered by key.
+/// One layer's channels, ordered by key. Entries hold decoded samples by
+/// default or a compressed payload after an opt-in lazy read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChannelStore<T> {
-    channels: BTreeMap<ChannelKey, Vec<T>>,
+    channels: BTreeMap<ChannelKey, ChannelEntry<T>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ChannelEntry<T> {
+    Decoded(Vec<T>),
+    Raw(RawChannelData),
+}
+
+/// Compressed bytes retained by an opt-in lazy read, following the raw-channel
+/// design in ag-psd-rs (<https://github.com/Vasyanator/ag-psd-rs>).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawChannelData {
+    pub(crate) compression: Compression,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) version: Version,
+}
+
+impl RawChannelData {
+    pub(crate) fn new(
+        compression: Compression,
+        payload: Vec<u8>,
+        width: usize,
+        height: usize,
+        version: Version,
+    ) -> Self {
+        Self {
+            compression,
+            payload,
+            width,
+            height,
+            version,
+        }
+    }
 }
 
 impl<T> Default for ChannelStore<T> {
@@ -59,46 +95,96 @@ impl<T> ChannelStore<T> {
         Self::default()
     }
 
+    /// Decoded samples for `key`; returns `None` while the channel is raw.
     pub fn get(&self, key: ChannelKey) -> Option<&[T]> {
-        self.channels.get(&key).map(Vec::as_slice)
+        match self.channels.get(&key)? {
+            ChannelEntry::Decoded(samples) => Some(samples),
+            ChannelEntry::Raw(_) => None,
+        }
     }
 
+    /// Mutable decoded samples; raw-backed channels must be decoded first.
     pub fn get_mut(&mut self, key: ChannelKey) -> Option<&mut Vec<T>> {
-        self.channels.get_mut(&key)
+        match self.channels.get_mut(&key)? {
+            ChannelEntry::Decoded(samples) => Some(samples),
+            ChannelEntry::Raw(_) => None,
+        }
     }
 
+    /// Replace one channel with decoded pixels, discarding any retained raw
+    /// payload for the same key.
     pub fn insert(&mut self, key: ChannelKey, data: Vec<T>) -> Option<Vec<T>> {
-        self.channels.insert(key, data)
+        match self.channels.insert(key, ChannelEntry::Decoded(data)) {
+            Some(ChannelEntry::Decoded(previous)) => Some(previous),
+            Some(ChannelEntry::Raw(_)) | None => None,
+        }
     }
 
+    /// Remove a channel. Returns its samples when decoded; removing a raw
+    /// channel discards its payload and returns `None`.
     pub fn remove(&mut self, key: ChannelKey) -> Option<Vec<T>> {
-        self.channels.remove(&key)
+        match self.channels.remove(&key) {
+            Some(ChannelEntry::Decoded(samples)) => Some(samples),
+            Some(ChannelEntry::Raw(_)) | None => None,
+        }
     }
 
+    /// Whether the channel is present, decoded or raw-backed.
     pub fn contains(&self, key: ChannelKey) -> bool {
         self.channels.contains_key(&key)
+    }
+
+    /// Whether `key` is present only as compressed data from a lazy read.
+    pub fn is_raw(&self, key: ChannelKey) -> bool {
+        matches!(self.channels.get(&key), Some(ChannelEntry::Raw(_)))
+    }
+
+    pub(crate) fn insert_raw(&mut self, key: ChannelKey, raw: RawChannelData) {
+        self.channels.insert(key, ChannelEntry::Raw(raw));
+    }
+
+    pub(crate) fn raw(&self, key: ChannelKey) -> Option<&RawChannelData> {
+        match self.channels.get(&key)? {
+            ChannelEntry::Raw(raw) => Some(raw),
+            ChannelEntry::Decoded(_) => None,
+        }
+    }
+
+    pub(crate) fn raw_channels(&self) -> impl Iterator<Item = (ChannelKey, &RawChannelData)> {
+        self.channels.iter().filter_map(|(key, entry)| match entry {
+            ChannelEntry::Raw(raw) => Some((*key, raw)),
+            ChannelEntry::Decoded(_) => None,
+        })
     }
 
     pub fn keys(&self) -> impl Iterator<Item = ChannelKey> + '_ {
         self.channels.keys().copied()
     }
 
+    /// Iterate decoded channels. Raw-backed keys are present in [`keys`](Self::keys)
+    /// but are omitted until explicitly decoded.
     pub fn iter(&self) -> impl Iterator<Item = (ChannelKey, &[T])> + '_ {
-        self.channels
-            .iter()
-            .map(|(key, data)| (*key, data.as_slice()))
+        self.channels.iter().filter_map(|(key, entry)| match entry {
+            ChannelEntry::Decoded(samples) => Some((*key, samples.as_slice())),
+            ChannelEntry::Raw(_) => None,
+        })
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (ChannelKey, &mut [T])> + '_ {
         self.channels
             .iter_mut()
-            .map(|(key, data)| (*key, data.as_mut_slice()))
+            .filter_map(|(key, entry)| match entry {
+                ChannelEntry::Decoded(samples) => Some((*key, samples.as_mut_slice())),
+                ChannelEntry::Raw(_) => None,
+            })
     }
 
+    /// Number of present channels, including raw-backed channels.
     pub fn len(&self) -> usize {
         self.channels.len()
     }
 
+    /// Whether no decoded or raw-backed channels are present.
     pub fn is_empty(&self) -> bool {
         self.channels.is_empty()
     }
@@ -242,6 +328,22 @@ mod tests {
         assert_eq!(keys, vec![-2, -1, 0]);
         assert_eq!(store.get(ChannelKey::ALPHA), Some([2u8].as_slice()));
         assert_eq!(store.len(), 3);
+    }
+
+    #[test]
+    fn replacing_a_raw_channel_makes_decoded_samples_authoritative() {
+        let mut store = ChannelStore::<u8>::new();
+        store.insert_raw(
+            ChannelKey::color(0),
+            RawChannelData::new(Compression::Raw, vec![1, 2], 2, 1, Version::Psd),
+        );
+        assert!(store.contains(ChannelKey::color(0)));
+        assert!(store.is_raw(ChannelKey::color(0)));
+        assert_eq!(store.get(ChannelKey::color(0)), None);
+
+        assert_eq!(store.insert(ChannelKey::color(0), vec![7, 8]), None);
+        assert!(!store.is_raw(ChannelKey::color(0)));
+        assert_eq!(store.get(ChannelKey::color(0)), Some([7u8, 8].as_slice()));
     }
 
     #[test]

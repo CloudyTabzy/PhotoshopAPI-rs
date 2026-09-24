@@ -125,6 +125,7 @@ composite, and replacement is transactional.
 - 8-, 16- and 32-bit documents
 - RGB, CMYK and Grayscale color modes
 - Raw, RLE, ZIP and ZIP-with-prediction compression
+- Optional lazy layer and mask channels with compressed-payload passthrough
 - Unknown tagged blocks and image resources preserved byte-exactly
 - Photoshop-style layer path lookup
 
@@ -150,9 +151,8 @@ hand-written AVX2 path to detect.
 
 ### Rust
 
-```toml
-[dependencies]
-psd = "0.5"
+```bash
+cargo add psd
 ```
 
 The `image` feature enables JPEG/PNG decoding for smart-object sources.
@@ -216,6 +216,29 @@ fn main() -> psd::core::Result<()> {
     Ok(())
 }
 ```
+
+To inspect a document before loading its pixels, retain layer and mask
+channels in compressed form. Decode only the channels or layers you use:
+
+```rust
+use psd::{LayeredFile, ReadOptions};
+
+fn main() -> psd::core::Result<()> {
+    let options = ReadOptions::default().with_raw_data(true);
+    let mut document = LayeredFile::<u8>::read_with_options("input.psd", options)?;
+    if let Some(id) = document.find_layer("Effects/Drop Shadow") {
+        document.decode_layer_pixels(id)?;
+    }
+    document.write("output.psd")
+}
+```
+
+The default reader decodes eagerly. A lazy read keeps each compressed payload
+until its channel is decoded or replaced, and writes untouched payloads with
+their original compression. `ChannelStore::get` returns `None` for a raw channel;
+`is_raw` distinguishes it from an absent channel. The default 2 GiB decoded
+channel budget also applies when lazy channels are decoded later. The merged
+composite remains outside this read path.
 
 ### Python
 

@@ -49,6 +49,22 @@ pub enum PsdError {
     #[error("compression error: {0}")]
     Compression(String),
 
+    /// Decoding another layer channel would exceed the configured cumulative
+    /// bitmap memory budget.
+    #[error(
+        "decoded bitmap memory limit exceeded: requested {requested} bytes, {available} bytes remain"
+    )]
+    ExceededMemoryLimit { requested: usize, available: usize },
+
+    /// A layer or mask rectangle is inverted, exceeds the PSD/PSB extent limit,
+    /// or cannot be represented as an addressable bitmap.
+    #[error("invalid {kind} bounds: {width}x{height}")]
+    InvalidImageBounds {
+        kind: &'static str,
+        width: i64,
+        height: i64,
+    },
+
     /// A linked image source was unsupported or could not be decoded.
     #[error("smart object image decode failed: {0}")]
     ImageDecode(String),

@@ -1377,6 +1377,12 @@ fn ensure_supported_target_channels<T: BitDepth>(layer: &Layer<T>) -> Result<()>
             "Smart Object replacement does not support auxiliary channel layouts".to_owned(),
         ));
     }
+    if image.channels.raw_channels().any(|(key, _)| key.is_mask()) {
+        return Err(PsdError::InvalidData {
+            offset: 0,
+            message: "decode raw mask channels before replacing a Smart Object",
+        });
+    }
     Ok(())
 }
 
@@ -1679,6 +1685,30 @@ mod tests {
             bytes.extend_from_slice(raw_pixels);
         }
         bytes
+    }
+
+    #[test]
+    fn smart_object_replacement_rejects_undecoded_mask_channels() {
+        let mut layer =
+            Layer::<u8>::new_image("Masked smart object", crate::layer::Rect::default());
+        layer.image_mut().unwrap().channels.insert_raw(
+            ChannelKey::USER_MASK,
+            crate::channels::RawChannelData::new(
+                psd_core::Compression::Raw,
+                vec![255],
+                1,
+                1,
+                Version::Psd,
+            ),
+        );
+
+        assert!(matches!(
+            ensure_supported_target_channels(&layer),
+            Err(PsdError::InvalidData {
+                message: "decode raw mask channels before replacing a Smart Object",
+                ..
+            })
+        ));
     }
 
     /// A one-pixel RGB document with a transparent layer whose composite is
