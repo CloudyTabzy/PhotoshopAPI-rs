@@ -381,11 +381,21 @@ pub(crate) fn zeroed_vec(len: usize) -> Option<Vec<u8>> {
 }
 
 /// Bytes needed for `width` pixels of `bits_per_pixel` bits each.
-// `div_ceil` says this more directly but is not const-callable until Rust 1.83.
-#[allow(clippy::manual_div_ceil)]
+///
+/// The bit count is accumulated in `u64` and narrowed afterwards, because a row's byte size
+/// can fit in a `usize` while the bit count it comes from cannot: a hundred million RGBA16
+/// pixels are 800 MB, which a 32-bit `usize` holds, but the product in bits does not.
+/// Accumulating in `usize` overflowed there, which aborted on an untrusted header in debug
+/// builds and wrapped to a smaller size in release, understating every buffer and ceiling
+/// derived from it. A width whose byte size genuinely cannot be represented saturates;
+/// `Info::validate` rejects such a header before any of these sizes are used.
 #[inline]
 pub const fn row_bytes_for(width: usize, bits_per_pixel: usize) -> usize {
-    (width * bits_per_pixel + 7) / 8
+    let Some(bits) = (width as u64).checked_mul(bits_per_pixel as u64) else {
+        return usize::MAX;
+    };
+    let bytes = bits.div_ceil(8);
+    if bytes > usize::MAX as u64 { usize::MAX } else { bytes as usize }
 }
 
 #[cfg(test)]
@@ -426,5 +436,28 @@ mod tests {
             use std::hint::black_box;
             assert!(black_box(zeroed_vec(black_box(isize::MAX as usize))).is_none());
         }
+    }
+
+    #[test]
+    fn a_wide_row_keeps_its_true_byte_count() {
+        // A hundred million RGBA16 pixels is 800 MB, which a 32-bit `usize` can still hold.
+        // The bit count it is derived from cannot, so the multiplication has to happen wide
+        // and narrow afterwards; doing it in `usize` overflowed before the division by eight.
+        assert_eq!(row_bytes_for(100_000_000, 64), 800_000_000);
+
+        // Ordinary rows, including the packed ones that round up to a whole byte.
+        assert_eq!(row_bytes_for(1, 1), 1);
+        assert_eq!(row_bytes_for(3, 24), 9);
+        assert_eq!(row_bytes_for(1, 64), 8);
+    }
+
+    #[test]
+    fn row_bytes_saturates_rather_than_wrapping() {
+        // Every buffer this decoder sizes is a multiple of the row size, so a row size that
+        // wrapped would understate the allocation and the ceiling it gets checked against.
+        // The expectation is spelled in `u128` so it holds identically on 32- and 64-bit.
+        let bits = usize::MAX as u128 * 128;
+        let expected = bits.div_ceil(8).min(usize::MAX as u128) as usize;
+        assert_eq!(row_bytes_for(usize::MAX, 128), expected);
     }
 }

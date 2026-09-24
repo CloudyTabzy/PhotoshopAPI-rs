@@ -86,6 +86,20 @@ Both upstream licences (`MIT OR Apache-2.0`) and the original copyright
 
 Not supported: APNG, and writing interlaced files.
 
+## Platforms
+
+64-bit `x86_64` and `aarch64` are the supported targets, and the only ones CI builds and tests.
+The SSE2 Paeth kernel is `x86_64`-only by design: SSE2 is part of that baseline, so the kernel is
+selected at compile time rather than dispatched at run time, and every other target runs the
+scalar filters.
+
+32-bit x86 is not a target. The decoder is correct there and refuses an over-wide header earlier
+than it does on 64-bit — with `ImageTooLarge` instead of a size-limit refusal, having allocated
+nothing — but three of the size-limit tests in `tests/limits.rs` assume a 64-bit address space and
+fail on `i686`. They are test expectations, not decoder behaviour: they build a 17 GB header,
+which a 32-bit target cannot represent, and expect the size limit rather than the addressability
+ceiling to be what refuses it.
+
 ## Performance
 
 Measured against png-spark 0.2.0 on this machine, interleaved best-of-N in a single session

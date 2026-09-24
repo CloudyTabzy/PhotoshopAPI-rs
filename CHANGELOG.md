@@ -1,10 +1,17 @@
 # Changelog
 
-## 0.1.0 — in progress (unreleased)
+Releases of `psd-png` follow after the fork point. The versions it inherited from png-spark are
+listed under "Inherited from png-spark" at the end. The package is `publish = false` and carries
+no `repository` URL, so no version headings carry compare links.
 
-Derived from png-spark 0.2.0 by Stephen Berry (`MIT OR Apache-2.0`, copyright retained); see the
-README for what came from there and what is new here. Nothing here has been published: the
-package is `publish = false` and carries no `repository` URL.
+## [Unreleased]
+
+## [0.2.0] - 2026-09-25
+
+The first release of `psd-png`, the PhotoshopAPI-rs port's fork of png-spark 0.2.0 by Stephen
+Berry (`MIT OR Apache-2.0`, copyright retained; see the README for what came from there and what
+is new here). The package was numbered 0.1.0 while it was being built and was never published, so
+this crate has no 0.1.0 release.
 
 ### Added
 
@@ -32,6 +39,14 @@ package is `publish = false` and carries no `repository` URL.
   cursor by DEFLATE's 32 KiB match window, instead of walking the whole image a second time after
   inflation. Large decodes are 2–9% faster (measured on zlib-generated fixtures up to 36.9 MB,
   interleaved best-of-N), small ones take the unchanged two-pass path.
+- An SSE2 `Paeth` kernel for 3- and 4-byte strides, following libpng's filters: one row at a
+  time, one pixel per 128-bit register, with the four channels of the pixel as independent
+  lanes. It replaces the scalar two-row wavefront where it applies, which remains in use for
+  every other stride.
+- A `scalar-override` feature, off by default, under which the crate reads
+  `PSD_PNG_FORCE_SCALAR=1`. The benchmark harness enables it, and CI runs the whole suite once
+  more with it, so the scalar two-row wavefront is checked on machines whose build would
+  otherwise only ever run the kernel.
 
 ### Changed
 
@@ -40,6 +55,13 @@ package is `publish = false` and carries no `repository` URL.
 - The conversion code is one implementation parameterised by output sample width, with
   `to_rgba8` and `to_rgb8` built on it, so the whole-image and streaming paths cannot drift.
   The 8-bit output is byte-identical to what the previous implementation produced.
+- The SSE2 `Paeth` kernel is chosen at compile time. SSE2 is part of the x86-64 baseline, so
+  x86-64 builds always carry it and other targets never do; the runtime feature detection and
+  the table of function pointers are gone, and the kernel's `unsafe` shrinks to the one call
+  into it, backed by a compile-time assertion that SSE2 is enabled.
+- `PSD_PNG_FORCE_SCALAR=1` is read only when the crate is built with the `scalar-override`
+  feature. **A default build no longer lets the process environment choose which filter code
+  runs**, so a caller relying on the variable to force the scalar path must enable the feature.
 - Crate documentation, README and CI describe a decoder; the encoder inherited from png-spark
   is retained unchanged for one step and then removed.
 
@@ -55,33 +77,28 @@ package is `publish = false` and carries no `repository` URL.
   segment interface already documented. A segment that can never make progress is reported
   as an error instead of looping.
 - `decode_to` on an interlaced image ignored `max_decompressed_size`, although its buffered
-  fallback allocates the whole image just as `decode` does.
+  fallback allocates the whole image just as `decode` does. Such a decode that previously
+  succeeded on a large interlaced image now fails with `SizeLimitExceeded` instead.
 - The streaming stage and the converted row had no size ceiling, so a header naming a very
   wide image could ask for tens of gigabytes. Both are now held to `max_decompressed_size`,
   and `SizeLimitExceeded` reports the buffer that was over it.
+- A row's byte size was computed in `usize` from a bit count that can be wider than `usize`
+  even when the byte count is not, so a header naming a very wide image overflowed that
+  multiplication: a 100-million-pixel RGBA16 row is 800 MB, which a 32-bit `usize` holds, but
+  the 6.4-billion-bit count it comes from does not. Debug builds aborted on the untrusted
+  header, and release builds wrapped to a smaller size, understating the buffers and the
+  ceiling they are checked against. The bit count is now accumulated in `u64` and narrowed
+  afterwards, saturating for a width whose byte size cannot be represented at all.
 - The crate documentation credited png-spark to the wrong author; it is Stephen Berry's.
 - The SIMD kernel's unit tests did not compile on any target but x86-64, so `cargo test`
   failed to build on AArch64. They are now compiled only where the kernel exists.
 
-### Changed
-
-- The SSE2 `Paeth` kernel is chosen at compile time. SSE2 is part of the x86-64 baseline, so
-  x86-64 builds always carry it and other targets never do; the runtime feature detection and
-  the table of function pointers are gone, and the kernel's `unsafe` shrinks to the one call
-  into it, backed by a compile-time assertion that SSE2 is enabled.
-- `PSD_PNG_FORCE_SCALAR=1` is read only when the crate is built with the new
-  `scalar-override` feature, which the benchmark harness and the scalar CI run enable. A
-  default build no longer lets the process environment choose which code runs.
-
 ### Performance
 
-- `Paeth` scanline reversal has an SSE2 kernel for 3- and 4-byte strides, following libpng's
-  filters: one row at a time, one pixel per 128-bit register, with the four channels of the
-  pixel as independent lanes. It replaces the scalar two-row wavefront where it applies, which
-  remains in use for every other stride. Measured against it with
-  `PSD_PNG_FORCE_SCALAR=1`: 8–22% faster where images have `Paeth` rows (mean 12% on both the
-  large fixtures and the port's own corpus), and unchanged where the filter mix has none. The
-  two paths are byte-identical, and the suite passes with either in force.
+- `Paeth` scanline reversal measures 8–22% faster than the scalar two-row wavefront where
+  images have `Paeth` rows (mean 12% on both the large fixtures and the port's own corpus), and
+  unchanged within noise where the filter mix has none. The two paths are byte-identical, and
+  the suite passes with either in force.
 - A converting stream whose requested layout is the file's own — RGBA to RGBA or RGB to RGB,
   at the file's sample width — hands each row straight to the sink instead of copying it into
   a scratch row first: 1–4% off `decode_to_rgba8` on 8-bit RGBA sources.
@@ -91,14 +108,21 @@ package is `publish = false` and carries no `repository` URL.
   the same table serves `to_rgba8`. The `tRNS` key of a greyscale or RGB image is likewise
   read once per image rather than once per row.
 
-## 0.2.0
+---
+
+## Inherited from png-spark
+
+These entries describe png-spark itself and are kept for continuity. They are not releases of
+`psd-png`; the fork point is png-spark 0.2.0.
+
+### 0.2.0
 
 - `Encoder::encode_to` writes a PNG to any `io::Write`, filtering and compressing a band at a time. Peak working memory grows with the image's width but not its height, against the whole file plus a filtered copy of every row before.
 - `WriteError` carries either an encoding fault or the sink's `io::Error`. `Error` is unchanged and still `Clone + PartialEq + Eq`.
 - `Deflater::zlib_start` and `zlib_push` compress a zlib stream in pieces.
 - `Encoder::encode` now goes through the same banded path. Output is a fraction of a percent larger, and a large image is split across several `IDAT` chunks instead of one.
 
-## 0.1.0
+### 0.1.0
 
 First release.
 
