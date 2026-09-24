@@ -50,6 +50,14 @@ jobs:
       # an optimiser can remove.
       - name: Test (release)
         run: cargo test --release --all-targets
+      # The SIMD Paeth kernel and the scalar two-row wavefront are two implementations of one
+      # filter, and only one of them runs on any given machine. Running the suite against both
+      # is what holds them to the same bytes; without this, the machine's own dispatch decides
+      # which one the corpus ever checks.
+      - name: Test (scalar filters)
+        run: cargo test --all-targets
+        env:
+          PSD_PNG_FORCE_SCALAR: "1"
 
   fmt:
     runs-on: ubuntu-latest

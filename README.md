@@ -64,7 +64,8 @@ The PhotoshopAPI-rs port team added:
 
 - **fused reconstruction** — the scanline filters are reversed as inflation writes, lagging the
   output cursor by the match window, instead of walking the whole image a second time afterwards;
-- **`decode_to`** — the resumable, budget-paused streaming decoder above.
+- **`decode_to`** — the resumable, budget-paused streaming decoder above;
+- **an SSE2 `Paeth` kernel** — one pixel per register, for 3- and 4-byte strides.
 
 Both upstream licences (`MIT OR Apache-2.0`) and the original copyright
 (`Copyright (c) 2026 Stephen Berry`) are retained unchanged; see [Licence](#licence).
@@ -183,7 +184,9 @@ cargo clippy --all-targets
 cargo fmt --all --check
 ```
 
-Rust 1.96 or newer, edition 2024. The inherited suite covers the format; the added tests cover
+Rust 1.96 or newer, edition 2024. CI runs the suite three ways — as built, in release, and once
+more with `PSD_PNG_FORCE_SCALAR=1` so the scalar filters are checked on a machine whose dispatch
+would otherwise never exercise them. The inherited suite covers the format; the added tests cover
 what is new here:
 
 - `tests/fused_reconstruction.rs` — fused output byte-identical to the two-pass path on
