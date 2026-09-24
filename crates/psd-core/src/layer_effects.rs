@@ -6,6 +6,7 @@
 //! block remains authoritative for writing, so reading effects changes no bytes.
 
 use crate::descriptor::{Descriptor, DescriptorKey};
+use crate::enums::BlendMode;
 use crate::error::{PsdError, Result};
 use crate::io::BeReader;
 use crate::tagged_blocks::{TaggedBlock, TaggedBlockKey};
@@ -88,6 +89,12 @@ impl EffectDescriptor<'_> {
     /// Raw blend-mode enumerator. Unknown and long-form values remain intact.
     pub fn blend_mode(&self) -> Option<(&DescriptorKey, &DescriptorKey)> {
         self.descriptor.get("Md  ")?.as_enum()
+    }
+
+    /// The blend mode decoded from either the historical ID (`Mltp`) or the
+    /// Photoshop 2026 ID (`multiply`); `None` when absent or unrecognized.
+    pub fn blend_mode_value(&self) -> Option<BlendMode> {
+        BlendMode::from_descriptor_enum(self.blend_mode()?.1.as_bytes())
     }
 
     /// Nested color descriptor, when this effect has a direct `Clr ` field.
@@ -444,6 +451,48 @@ mod tests {
             assert_eq!(effects[0].enabled(), Some(true));
             assert_eq!(effects[0].opacity_percent(), Some(72.5));
         }
+    }
+
+    #[test]
+    fn effect_blend_modes_decode_historical_and_2026_ids() {
+        let effect = |value: DescriptorKey| {
+            descriptor(vec![item(
+                "Md  ",
+                DescriptorValue::Enumerated {
+                    type_id: DescriptorKey::char_id(*b"BlnM"),
+                    value,
+                },
+            )])
+        };
+        let historical = effect(DescriptorKey::char_id(*b"CBrn"));
+        let current = effect(DescriptorKey::new("colorBurn"));
+        let unknown = effect(DescriptorKey::new("futureMode"));
+        let root = descriptor(vec![
+            item("DrSh", DescriptorValue::Descriptor(historical)),
+            item("IrSh", DescriptorValue::Descriptor(current)),
+            item("OrGl", DescriptorValue::Descriptor(unknown)),
+        ]);
+        let modern = ModernLayerEffects {
+            descriptor: root,
+            trailing_bytes: Vec::new(),
+        };
+        let modes: Vec<_> = modern
+            .effects()
+            .unwrap()
+            .iter()
+            .map(EffectDescriptor::blend_mode_value)
+            .collect();
+        assert_eq!(
+            modes,
+            [
+                Some(BlendMode::COLOR_BURN),
+                Some(BlendMode::COLOR_BURN),
+                None
+            ]
+        );
+        // The raw enumerator stays available for the unknown value.
+        let effects = modern.effects().unwrap();
+        assert_eq!(effects[2].blend_mode().unwrap().1.as_bytes(), b"futureMode");
     }
 
     #[test]

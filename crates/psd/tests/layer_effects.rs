@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use psd::core::{EffectKind, LayerEffectsData, TaggedBlockKey};
+use psd::core::{BlendMode, EffectKind, LayerEffectsData, TaggedBlockKey};
 use psd::LayeredFile;
 
 fn fixture() -> std::path::PathBuf {
@@ -42,6 +42,23 @@ fn reads_modern_and_legacy_effects_without_changing_blocks() {
             );
         }
         assert!(entries.iter().any(|effect| effect.enabled().is_some()));
+        // Every blend mode in this Photoshop 2022 file uses a historical ID
+        // (`Mltp`, `linearBurn`), and each one decodes.
+        for effect in &entries {
+            if let Some((_, raw)) = effect.blend_mode() {
+                assert!(effect.blend_mode_value().is_some(), "{raw:?}");
+            }
+        }
+        let shadow = entries
+            .iter()
+            .find(|effect| effect.kind == EffectKind::DropShadow)
+            .unwrap();
+        let expected = match shadow.blend_mode().unwrap().1.as_bytes() {
+            b"Nrml" => BlendMode::NORMAL,
+            b"Mltp" => BlendMode::MULTIPLY,
+            other => panic!("unexpected shadow mode {other:?}"),
+        };
+        assert_eq!(shadow.blend_mode_value(), Some(expected));
         assert!(entries
             .iter()
             .any(|effect| effect.opacity_percent().is_some()));

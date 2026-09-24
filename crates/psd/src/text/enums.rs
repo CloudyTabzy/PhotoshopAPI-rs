@@ -238,10 +238,13 @@ pub enum TextWarpRotation {
 }
 
 impl TextWarpRotation {
+    /// Accepts the char IDs `Hrzn`/`Vrtc` and the string IDs
+    /// `horizontal`/`vertical`, the long form newer Photoshop versions write
+    /// for some enumerated values.
     pub(crate) fn from_identifier(bytes: &[u8]) -> Self {
         match bytes {
-            b"Hrzn" => Self::Horizontal,
-            b"Vrtc" => Self::Vertical,
+            b"Hrzn" | b"horizontal" => Self::Horizontal,
+            b"Vrtc" | b"vertical" => Self::Vertical,
             other => Self::Other(other.to_vec()),
         }
     }

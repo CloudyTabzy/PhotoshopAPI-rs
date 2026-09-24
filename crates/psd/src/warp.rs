@@ -380,11 +380,12 @@ impl Warp {
         let (rotate_type, rotate_value) = match descriptor.get("warpRotate") {
             Some(DescriptorValue::Enumerated { type_id, value }) => (
                 rekey_preserving_form(type_id, "Ornt")?,
-                rekey_preserving_form(value, &self.warp_rotate)?,
+                rotation_key(Some(value), &self.warp_rotate),
             ),
+            // Upstream writes `Ornt` and `Hrzn`/`Vrtc` as zero-length char IDs.
             _ => (
-                DescriptorKey::new("Ornt"),
-                DescriptorKey::new(self.warp_rotate.clone()),
+                DescriptorKey::char_id(*b"Ornt"),
+                rotation_key(None, &self.warp_rotate),
             ),
         };
         descriptor.insert(
@@ -751,16 +752,25 @@ impl Warp {
         Ok(())
     }
 
+    /// Set the warp orientation: the char IDs `Hrzn`/`Vrtc`, or the string
+    /// IDs `horizontal`/`vertical` that newer Photoshop versions can write in
+    /// their place.
     pub fn set_warp_rotate(&mut self, rotate: impl Into<String>) -> Result<()> {
         let rotate = rotate.into();
-        if rotate != "Hrzn" && rotate != "Vrtc" {
+        if !matches!(rotate.as_str(), "Hrzn" | "Vrtc" | "horizontal" | "vertical") {
             return Err(PsdError::InvalidData {
                 offset: 0,
-                message: "warp rotation must be Hrzn or Vrtc",
+                message: "warp rotation must be Hrzn, Vrtc, horizontal, or vertical",
             });
         }
         self.warp_rotate = rotate;
         Ok(())
+    }
+
+    /// Whether the warp is oriented vertically, in either spelling of the
+    /// rotation (`Vrtc` or `vertical`).
+    pub fn is_vertical(&self) -> bool {
+        matches!(self.warp_rotate.as_str(), "Vrtc" | "vertical")
     }
 
     pub fn set_source_bounds(&mut self, bounds: BoundingBox) -> Result<()> {
@@ -1406,6 +1416,21 @@ fn remove_item(descriptor: &mut Descriptor, key: &str) {
         .retain(|item| item.key.as_bytes() != key.as_bytes());
 }
 
+/// A `warpRotate` value: an unchanged value keeps its original encoding, and
+/// a new char ID (`Hrzn`/`Vrtc`) is always written with the zero-length
+/// encoding. Keeping the encoding of a replaced long-form value
+/// (`horizontal`) would instead write `Vrtc` as an explicit-length string
+/// ID, which Photoshop does not define.
+fn rotation_key(existing: Option<&DescriptorKey>, rotate: &str) -> DescriptorKey {
+    match existing {
+        Some(existing) if existing.as_bytes() == rotate.as_bytes() => existing.clone(),
+        _ => match <[u8; 4]>::try_from(rotate.as_bytes()) {
+            Ok(code) => DescriptorKey::char_id(code),
+            Err(_) => DescriptorKey::new(rotate),
+        },
+    }
+}
+
 fn rekey_preserving_form(existing: &DescriptorKey, text: &str) -> Result<DescriptorKey> {
     if existing.as_bytes() == text.as_bytes() {
         Ok(existing.clone())
@@ -1854,6 +1879,51 @@ mod tests {
         let identity = Warp::identity(40, 30).unwrap();
         let identity_back = Warp::from_descriptor(&identity.to_descriptor().unwrap()).unwrap();
         assert!(identity.approximately_eq(&identity_back, 1e-9));
+    }
+
+    #[test]
+    fn warp_rotation_reads_long_form_ids_and_writes_char_ids() {
+        // A descriptor built from scratch uses zero-length char IDs, as
+        // upstream writes them.
+        let warp = Warp::generate_default(40, 30).unwrap();
+        let written = warp.to_descriptor().unwrap();
+        let (type_id, value) = written.get("warpRotate").unwrap().as_enum().unwrap();
+        assert_eq!(
+            (type_id.as_bytes(), value.as_bytes()),
+            (&b"Ornt"[..], &b"Hrzn"[..])
+        );
+        assert!(type_id.uses_implicit_length() && value.uses_implicit_length());
+
+        // The long-form string ID newer Photoshop versions can write instead.
+        let mut long_form = written.clone();
+        long_form.insert(
+            "warpRotate",
+            DescriptorValue::Enumerated {
+                type_id: DescriptorKey::char_id(*b"Ornt"),
+                value: DescriptorKey::new("vertical"),
+            },
+        );
+        let mut parsed = Warp::from_descriptor(&long_form).unwrap();
+        assert_eq!(parsed.warp_rotate(), "vertical");
+        assert!(parsed.is_vertical());
+
+        // Unchanged, the long form keeps its encoding.
+        let mut unchanged = long_form.clone();
+        parsed.update_warp_descriptor(&mut unchanged).unwrap();
+        assert_eq!(unchanged.get("warpRotate"), long_form.get("warpRotate"));
+
+        // A char ID replacing it is written with the zero-length encoding,
+        // never as an explicit-length `Hrzn` string ID.
+        parsed.set_warp_rotate("Hrzn").unwrap();
+        assert!(!parsed.is_vertical());
+        let mut replaced = long_form.clone();
+        parsed.update_warp_descriptor(&mut replaced).unwrap();
+        let (_, value) = replaced.get("warpRotate").unwrap().as_enum().unwrap();
+        assert_eq!(value.as_bytes(), b"Hrzn");
+        assert!(value.uses_implicit_length());
+
+        parsed.set_warp_rotate("horizontal").unwrap();
+        assert!(parsed.set_warp_rotate("sideways").is_err());
     }
 
     #[test]

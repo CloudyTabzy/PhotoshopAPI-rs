@@ -5,6 +5,7 @@
 //! (blend modes, channel IDs, tagged-block keys come with the sections that
 //! need them).
 
+use crate::descriptor::DescriptorKey;
 use crate::error::{PsdError, Result};
 
 /// Container version. Drives every variable length marker in the format:
@@ -358,7 +359,73 @@ impl BlendMode {
     pub fn as_str(&self) -> String {
         String::from_utf8_lossy(&self.0).into_owned()
     }
+
+    /// Decode a descriptor `BlnM` enumerator, as layer effects and vector
+    /// strokes store it. Descriptors spell blend modes differently from layer
+    /// records (`Mltp` rather than `mul `). Both the historical ID (a char ID
+    /// such as `Mltp`, or a string ID such as `linearBurn` for newer modes)
+    /// and the string ID Photoshop 2026 writes instead (`multiply`,
+    /// `colorBurn`) are accepted. Other values return `None`.
+    pub fn from_descriptor_enum(value: &[u8]) -> Option<Self> {
+        DESCRIPTOR_BLEND_MODES
+            .iter()
+            .find(|(historical, current, _)| *historical == value || *current == value)
+            .map(|(_, _, mode)| *mode)
+    }
+
+    /// This mode's historical descriptor enumerator, which every Photoshop
+    /// version reads: a zero-length char ID (`Mltp`) or, for modes without
+    /// one, an explicit string ID (`linearBurn`). `None` for keys that have
+    /// no descriptor spelling.
+    pub fn to_descriptor_enum(self) -> Option<DescriptorKey> {
+        let (historical, _, _) = DESCRIPTOR_BLEND_MODES
+            .iter()
+            .find(|(_, _, mode)| *mode == self)?;
+        Some(match <[u8; 4]>::try_from(*historical) {
+            Ok(code) => DescriptorKey::char_id(code),
+            Err(_) => DescriptorKey::from_bytes(*historical),
+        })
+    }
 }
+
+/// Descriptor blend modes as `(historical ID, Photoshop 2026 ID, record key)`.
+/// The historical IDs follow the public ag-psd-rs table
+/// (<https://github.com/Vasyanator/ag-psd-rs>); the 2026 IDs are the ones a
+/// Photoshop 2026 document writes for every layer-record blend mode.
+const DESCRIPTOR_BLEND_MODES: [(&[u8], &[u8], BlendMode); 28] = [
+    (b"Nrml", b"normal", BlendMode::NORMAL),
+    (b"Dslv", b"dissolve", BlendMode::DISSOLVE),
+    (b"Drkn", b"darken", BlendMode::DARKEN),
+    (b"Mltp", b"multiply", BlendMode::MULTIPLY),
+    (b"CBrn", b"colorBurn", BlendMode::COLOR_BURN),
+    (b"linearBurn", b"linearBurn", BlendMode::LINEAR_BURN),
+    (b"darkerColor", b"darkerColor", BlendMode::DARKER_COLOR),
+    (b"Lghn", b"lighten", BlendMode::LIGHTEN),
+    (b"Scrn", b"screen", BlendMode::SCREEN),
+    (b"CDdg", b"colorDodge", BlendMode::COLOR_DODGE),
+    (b"linearDodge", b"linearDodge", BlendMode::LINEAR_DODGE),
+    (b"lighterColor", b"lighterColor", BlendMode::LIGHTER_COLOR),
+    (b"Ovrl", b"overlay", BlendMode::OVERLAY),
+    (b"SftL", b"softLight", BlendMode::SOFT_LIGHT),
+    (b"HrdL", b"hardLight", BlendMode::HARD_LIGHT),
+    (b"vividLight", b"vividLight", BlendMode::VIVID_LIGHT),
+    (b"linearLight", b"linearLight", BlendMode::LINEAR_LIGHT),
+    (b"pinLight", b"pinLight", BlendMode::PIN_LIGHT),
+    (b"hardMix", b"hardMix", BlendMode::HARD_MIX),
+    (b"Dfrn", b"difference", BlendMode::DIFFERENCE),
+    (b"Xclu", b"exclusion", BlendMode::EXCLUSION),
+    (
+        b"blendSubtraction",
+        b"blendSubtraction",
+        BlendMode::SUBTRACT,
+    ),
+    (b"blendDivide", b"blendDivide", BlendMode::DIVIDE),
+    (b"H   ", b"hue", BlendMode::HUE),
+    (b"Strt", b"saturation", BlendMode::SATURATION),
+    (b"Clr ", b"color", BlendMode::COLOR),
+    (b"Lmns", b"luminosity", BlendMode::LUMINOSITY),
+    (b"passThrough", b"passThrough", BlendMode::PASSTHROUGH),
+];
 
 impl Default for BlendMode {
     fn default() -> Self {
@@ -442,6 +509,43 @@ impl LayerColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_blend_modes_accept_historical_and_2026_ids() {
+        // Pairs a Photoshop 2026 document writes for the same modes.
+        for (historical, current, mode) in [
+            (&b"Nrml"[..], &b"normal"[..], BlendMode::NORMAL),
+            (b"Mltp", b"multiply", BlendMode::MULTIPLY),
+            (b"CBrn", b"colorBurn", BlendMode::COLOR_BURN),
+            (b"linearBurn", b"linearBurn", BlendMode::LINEAR_BURN),
+            (b"CDdg", b"colorDodge", BlendMode::COLOR_DODGE),
+            (b"SftL", b"softLight", BlendMode::SOFT_LIGHT),
+            (b"Xclu", b"exclusion", BlendMode::EXCLUSION),
+            (
+                b"blendSubtraction",
+                b"blendSubtraction",
+                BlendMode::SUBTRACT,
+            ),
+            (b"H   ", b"hue", BlendMode::HUE),
+            (b"Lmns", b"luminosity", BlendMode::LUMINOSITY),
+        ] {
+            assert_eq!(BlendMode::from_descriptor_enum(historical), Some(mode));
+            assert_eq!(BlendMode::from_descriptor_enum(current), Some(mode));
+            assert_eq!(mode.to_descriptor_enum().unwrap().as_bytes(), historical);
+        }
+        // Every record mode except the record-only keys has both spellings.
+        for (historical, current, mode) in DESCRIPTOR_BLEND_MODES {
+            assert_eq!(BlendMode::from_descriptor_enum(historical), Some(mode));
+            assert_eq!(BlendMode::from_descriptor_enum(current), Some(mode));
+        }
+        let char_id = BlendMode::MULTIPLY.to_descriptor_enum().unwrap();
+        assert!(char_id.uses_implicit_length());
+        let string_id = BlendMode::VIVID_LIGHT.to_descriptor_enum().unwrap();
+        assert!(!string_id.uses_implicit_length());
+        assert_eq!(BlendMode::from_descriptor_enum(b"mul "), None);
+        assert_eq!(BlendMode::from_descriptor_enum(b"Hght"), None);
+        assert_eq!(BlendMode::from_bytes(*b"xxxx").to_descriptor_enum(), None);
+    }
 
     #[test]
     fn layer_color_round_trips_known_and_unknown_values() {

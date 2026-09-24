@@ -22,6 +22,7 @@
 
 use crate::adjustments::{AdjustmentKind, FillSettings};
 use crate::descriptor::{Descriptor, DescriptorKey, DescriptorValue};
+use crate::enums::BlendMode;
 use crate::error::{PsdError, Result};
 use crate::io::BeReader;
 use crate::tagged_blocks::{TaggedBlock, TaggedBlockKey};
@@ -348,6 +349,12 @@ impl VectorStroke {
     /// Raw blend-mode enumerator (`BlnM`).
     pub fn blend_mode(&self) -> Option<&DescriptorKey> {
         enumerator(&self.descriptor, "strokeStyleBlendMode")
+    }
+
+    /// The blend mode decoded from either the historical ID (`Nrml`) or the
+    /// Photoshop 2026 ID (`normal`).
+    pub fn blend_mode_value(&self) -> Option<BlendMode> {
+        BlendMode::from_descriptor_enum(self.blend_mode()?.as_bytes())
     }
 
     /// Opacity in percent.
@@ -815,6 +822,13 @@ mod tests {
                     "strokeStyleContent",
                     DescriptorValue::Descriptor(descriptor("solidColorLayer", vec![])),
                 ),
+                (
+                    "strokeStyleBlendMode",
+                    DescriptorValue::Enumerated {
+                        type_id: key("BlnM"),
+                        value: key("multiply"),
+                    },
+                ),
             ],
         )
         .write(&mut writer)
@@ -831,6 +845,7 @@ mod tests {
             b"strokeStyleRoundCap"
         );
         assert_eq!(stroke.dash_set(), Some(vec![4.0, 2.0]));
+        assert_eq!(stroke.blend_mode_value(), Some(BlendMode::MULTIPLY));
         assert_eq!(
             stroke.content().unwrap().class_id.as_bytes(),
             b"solidColorLayer"

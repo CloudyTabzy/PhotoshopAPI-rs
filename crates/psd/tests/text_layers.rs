@@ -396,6 +396,52 @@ fn semantic_text_warp_readers_cover_warped_unwarped_and_round_trip_layers() {
 }
 
 #[test]
+fn long_form_enum_ids_read_and_orientation_edits_write_char_ids() {
+    // Newer Photoshop versions can write an enumerated value as its long-form
+    // string ID (`horizontal`) instead of the char ID (`Hrzn`).
+    let mut file = LayeredFile::<u8>::read(fixture("TextLayers/TextLayers_Warp.psd")).unwrap();
+    let id = file
+        .layers()
+        .position(|layer| layer.name == "WarpArc")
+        .unwrap();
+    let layer = file.layer_mut(id).unwrap();
+    let tysh = layer.blocks.get_mut(TaggedBlockKey::new(*b"TySh")).unwrap();
+    let mut parsed = TypeToolTaggedBlock::read(&mut BeReader::new(&tysh.data)).unwrap();
+    let long_form = |descriptor: &mut Descriptor, key: &str, id: &str| {
+        let Some(DescriptorValue::Enumerated { value, .. }) = descriptor.get_mut(key) else {
+            panic!("fixture {key} must be an enumerated value");
+        };
+        *value = DescriptorKey::new(id);
+    };
+    long_form(&mut parsed.warp, "warpRotate", "vertical");
+    long_form(&mut parsed.text, "Ornt", "horizontal");
+    long_form(&mut parsed.text, "AntA", "antiAliasSmooth");
+    let mut writer = BeWriter::new();
+    parsed.write(&mut writer).unwrap();
+    tysh.data = writer.into_inner();
+
+    assert_eq!(layer.text_warp_rotation(), Some(TextWarpRotation::Vertical));
+    assert_eq!(layer.anti_alias(), Some(psd::AntiAliasMethod::Smooth));
+
+    layer
+        .set_orientation(TextWritingDirection::Vertical)
+        .unwrap();
+    let tysh = layer.blocks.get(TaggedBlockKey::new(*b"TySh")).unwrap();
+    let edited = TypeToolTaggedBlock::read(&mut BeReader::new(&tysh.data)).unwrap();
+    let (_, ornt) = edited.text.get("Ornt").unwrap().as_enum().unwrap();
+    assert_eq!(ornt.as_bytes(), b"Vrtc");
+    assert!(ornt.uses_implicit_length());
+    let (_, rotate) = edited.warp.get("warpRotate").unwrap().as_enum().unwrap();
+    assert_eq!(rotate.as_bytes(), b"vertical");
+
+    let reread = LayeredFile::<u8>::from_bytes(&file.to_bytes().unwrap()).unwrap();
+    let layer = reread.layer(id).unwrap();
+    assert_eq!(layer.text_warp_rotation(), Some(TextWarpRotation::Vertical));
+    assert_eq!(layer.orientation(), Some(TextWritingDirection::Vertical));
+    assert_eq!(layer.anti_alias(), Some(psd::AntiAliasMethod::Smooth));
+}
+
+#[test]
 fn unknown_text_warp_identifiers_are_exposed_without_rewriting_raw_tysh() {
     let mut file = LayeredFile::<u8>::read(fixture("TextLayers/TextLayers_Warp.psd")).unwrap();
     let id = file

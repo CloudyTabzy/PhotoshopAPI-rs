@@ -462,8 +462,8 @@ impl<T: BitDepth> Layer<T> {
     /// holds it, and skipped otherwise; EngineData is the authority.
     pub fn set_orientation(&mut self, direction: TextWritingDirection) -> psd_core::Result<()> {
         let (ornt, procession) = match direction {
-            TextWritingDirection::Horizontal => ("Hrzn", 0.0),
-            TextWritingDirection::Vertical => ("Vrtc", 1.0),
+            TextWritingDirection::Horizontal => (*b"Hrzn", 0.0),
+            TextWritingDirection::Vertical => (*b"Vrtc", 1.0),
             TextWritingDirection::Other(_) => {
                 return Err(invalid(
                     "only horizontal and vertical orientations can be written",
@@ -496,8 +496,13 @@ impl<T: BitDepth> Layer<T> {
             Ok(true)
         })?;
         let ornt_result = self.edit_tysh_descriptors(warp::TyShDescriptor::Text, |text| {
+            // Always a zero-length char ID: keeping the encoding of a long-form
+            // value (`horizontal`) would write `Hrzn` as an explicit-length
+            // string ID, which Photoshop does not define.
             if let Some(DescriptorValue::Enumerated { value, .. }) = text.get_mut("Ornt") {
-                *value = value.replace_text_preserving_encoding(ornt)?;
+                if value.as_bytes() != ornt {
+                    *value = psd_core::DescriptorKey::char_id(ornt);
+                }
             }
             Ok(())
         });

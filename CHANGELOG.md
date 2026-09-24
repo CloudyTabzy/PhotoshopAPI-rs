@@ -12,6 +12,33 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-09-24
+
+### Added
+
+- `BlendMode::from_descriptor_enum` decodes the descriptor blend modes that
+  layer effects and vector strokes store. It accepts both the historical IDs
+  (`Mltp`, `linearBurn`) and the string IDs that Photoshop 2026 writes instead
+  (`multiply`, `colorBurn`). `BlendMode::to_descriptor_enum` returns the
+  historical ID, which every Photoshop version reads. Effect and stroke views
+  add `blend_mode_value()`.
+- `Warp::is_vertical` reports a vertical warp in either spelling of the
+  rotation.
+
+### Fixed
+
+- A text-warp rotation stored as the long-form string ID `horizontal` or
+  `vertical` now reads as horizontal or vertical instead of an unknown value.
+  The fix applies to Rust and to Python's `warp_rotation`.
+- If a text layer's `Ornt` value used the long form, changing its orientation
+  wrote `Hrzn`/`Vrtc` as an explicit-length string ID, which Photoshop does
+  not define. It now always writes the zero-length char ID.
+- The smart-object warp's `set_warp_rotate` accepts the long forms. A char ID
+  that replaces a long-form value is written with the zero-length encoding.
+  Warp descriptors built from scratch now write `Ornt` and `Hrzn`/`Vrtc` as
+  zero-length char IDs, as upstream does, instead of as explicit-length string
+  IDs.
+
 ## [0.6.3] - 2026-09-24
 
 ### Added
