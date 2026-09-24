@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # The crate has no dependencies, so nothing drifts underneath it except the toolchain
+  # itself. Clippy runs at `-D warnings` on stable, and a new stable ships roughly every six
+  # weeks, so this surfaces a new lint on a quiet Monday rather than mid-change.
+  schedule:
+    - cron: "0 6 * * 1"
+
+# A new push to a pull request makes the run in flight for it redundant. Everything else
+# gets its own group via `run_id`, so a run on `main` is never cancelled: every commit on the
+# default branch of a released library deserves validation, and a manual dispatch is a
+# separate intent rather than a replacement for the push already running.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86-64 and AArch64 on both Linux and macOS, because the checksums have
+        # architecture-specific paths and the portable fallbacks must agree with them.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      # The corpus is generated, not committed. Without this step the tests that read it
+      # skip themselves and the run passes having checked far less than it appears to.
+      - name: Generate the reference corpus
+        run: python tools/gen_testdata.py
+      - name: Test (debug)
+        run: cargo test --all-targets
+      - name: Doc tests
+        run: cargo test --doc
+      # Release is a separate gate, not a repeat: the debug build hides anything that only
+      # an optimiser can remove.
+      - name: Test (release)
+        run: cargo test --release --all-targets
+      # The SIMD Paeth kernel and the scalar two-row wavefront are two implementations of one
+      # filter, and only one of them runs on any given machine. Running the suite against both
+      # is what holds them to the same bytes; without this, the target alone decides which one
+      # the corpus ever checks. The override is compiled in only under its feature.
+      - name: Test (scalar filters)
+        run: cargo test --all-targets --features scalar-override
+        env:
+          PSD_PNG_FORCE_SCALAR: "1"
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # Settings live in rustfmt.toml, which states the crate's own style rather than
+      # accepting rustfmt's default line-breaking heuristics.
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build documentation
+        run: cargo doc --no-deps
+        env:
+          # Broken intra-doc links and private links from public items fail the build here
+          # rather than surfacing as a bad page on docs.rs.
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: msrv (1.96)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to the `rust-version` in Cargo.toml. Raising one means raising the other.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96"
+      - run: cargo check --all-targets
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      # The unsafe is confined to the library's own unit tests; the integration tests go
+      # through the same code far more slowly.
+      - run: cargo miri test --lib
+
+  cross-check:
+    name: cross-check against png and fdeflate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Round-tripping through our own code only proves self-consistency. This hands the
+      # output to independent implementations of both formats.
+      - run: cargo test -p psd-png-bench
+
+  # A crates.io publish dry run used to sit here, and it cannot while the package is
+  # unpublished by design. Restore it the day the crate gets a `repository` to point at.
+
+  fuzz:
+    # Weekly and on demand only. Fuzzing is a search with no point at which it is finished,
+    # so it does not belong on the path between a push and a green tick.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # Starting from real images of every colour type and bit depth, rather than making the
+      # fuzzer rediscover the PNG signature before it can reach any of the interesting code.
+      - name: Seed the corpus
+        run: |
+          python tools/gen_testdata.py
+          mkdir -p fuzz/corpus/decode fuzz/corpus/roundtrip
+          cp tmp/png/*.png fuzz/corpus/decode/
+          cp tmp/png/*.png fuzz/corpus/roundtrip/
+      - run: cargo fuzz run decode -- -max_total_time=300
+      - run: cargo fuzz run roundtrip -- -max_total_time=300
+      - run: cargo fuzz run inflate -- -max_total_time=300
+      - name: Save the input that failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts

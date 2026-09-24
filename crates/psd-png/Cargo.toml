@@ -1,0 +1,34 @@
+[package]
+name = "psd-png"
+version = "0.2.2"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+description = "Streaming, memory-bounded PNG decoder with no dependencies, built for the PhotoshopAPI-rs port."
+# No `repository` until this lives somewhere that is not the author's GitHub. The crate is
+# vendored into the PhotoshopAPI-rs workspace, not fetched from a registry.
+publish = false
+keywords = ["png", "image", "decode", "inflate", "streaming"]
+categories = ["multimedia::images", "compression"]
+exclude = ["bench/", "fuzz/", ".github/"]
+
+[dependencies]
+
+[features]
+# Lets `PSD_PNG_FORCE_SCALAR=1` switch the SIMD filter kernel off for the whole process, so the
+# kernel and the scalar path can be measured and tested against each other in one build. Off
+# by default: without it the process environment has no say in which code runs.
+scalar-override = []
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[workspace]
+members = [".", "bench"]
