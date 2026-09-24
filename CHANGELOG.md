@@ -82,6 +82,14 @@ package is `publish = false` and carries no `repository` URL.
   `PSD_PNG_FORCE_SCALAR=1`: 8–22% faster where images have `Paeth` rows (mean 12% on both the
   large fixtures and the port's own corpus), and unchanged where the filter mix has none. The
   two paths are byte-identical, and the suite passes with either in force.
+- A converting stream whose requested layout is the file's own — RGBA to RGBA or RGB to RGB,
+  at the file's sample width — hands each row straight to the sink instead of copying it into
+  a scratch row first: 1–4% off `decode_to_rgba8` on 8-bit RGBA sources.
+- Palettes are resolved once per image into a 256-entry RGBA table with the `tRNS` alpha
+  folded in, so a pixel costs one range check and one load instead of a lookup into `PLTE`
+  and another into `tRNS`: 10–12% off `decode_to_rgba8` on a 2048×2048 palette image, and
+  the same table serves `to_rgba8`. The `tRNS` key of a greyscale or RGB image is likewise
+  read once per image rather than once per row.
 
 ## 0.2.0
 

@@ -370,6 +370,11 @@ impl Decoder {
     {
         let parsed = self.parse(png, Plan::Stream { converted_pixel: CHANNELS * S::WIDTH })?;
         let converter = RowConverter::new(&parsed.info)?;
+        // Rows already in the requested layout go to the sink as they are: copying each one
+        // into a scratch row first would only move bytes that come out the same.
+        if converter.passes_through::<CHANNELS, S>() {
+            return self.dispatch_rows(parsed, sink);
+        }
         let scratch_len = parsed.info.width as usize * CHANNELS * S::WIDTH;
         let mut scratch =
             zeroed_vec(scratch_len).ok_or(Error::OutOfMemory { bytes: scratch_len })?;

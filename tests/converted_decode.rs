@@ -293,3 +293,59 @@ fn converted_streaming_passes_a_ceiling_the_image_exceeds() {
     assert_eq!(rows, height as usize);
     assert_eq!(converted, (width * height * 4) as usize);
 }
+
+/// When the requested layout is the file's own — RGBA to RGBA, RGB to RGB, at the file's
+/// sample width — the rows are handed over without a scratch copy, and must still be exactly
+/// the rows `decode` produces. RGB passes through even with a `tRNS` colour, since the alpha
+/// it would decide is dropped from a three-channel row.
+#[test]
+fn rows_already_in_the_requested_layout_pass_through() {
+    let (width, height) = (5u32, 3u32);
+    let bytes = |len: usize| -> Vec<u8> { (0..len).map(|i| (i * 37 + 11) as u8).collect() };
+
+    let mut rgb_keyed = Info::new(width, height, ColorType::Rgb, BitDepth::Eight);
+    rgb_keyed.transparency = Some(vec![0, 11, 0, 48, 0, 85]);
+    let cases = [
+        (
+            Info::new(width, height, ColorType::Rgba, BitDepth::Eight),
+            rows_rgba8 as fn(&[u8]) -> Vec<u8>,
+        ),
+        (Info::new(width, height, ColorType::Rgba, BitDepth::Sixteen), rows_rgba16),
+        (Info::new(width, height, ColorType::Rgb, BitDepth::Eight), rows_rgb8),
+        (Info::new(width, height, ColorType::Rgb, BitDepth::Sixteen), rows_rgb16),
+        (rgb_keyed, rows_rgb8),
+    ];
+    for (info, stream) in cases {
+        let data = bytes(info.output_size());
+        let png = psd_png::encode(&info, &data).unwrap();
+        assert_eq!(stream(&png), data, "{:?} {:?}", info.color_type, info.bit_depth);
+    }
+}
+
+/// A palette index past the end of `PLTE` fails a converting decode, as it fails `decode`,
+/// rather than reading a colour the file never defined.
+#[test]
+fn an_index_past_the_palette_fails_a_converting_decode() {
+    // Two-bit indices 0, 1, 2, 3 against a two-entry palette: the last two are out of range.
+    let idat = psd_png::deflate::compress_zlib(&[0u8, 0b00_01_10_11]);
+
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let mut chunk = |kind: &[u8; 4], data: &[u8]| {
+        png.extend((data.len() as u32).to_be_bytes());
+        let start = png.len();
+        png.extend(kind);
+        png.extend(data);
+        let crc = psd_png::crc32::crc32(&png[start..]);
+        png.extend(crc.to_be_bytes());
+    };
+    chunk(b"IHDR", &[0, 0, 0, 4, 0, 0, 0, 1, 2, 3, 0, 0, 0]);
+    chunk(b"PLTE", &[10, 20, 30, 40, 50, 60]);
+    chunk(b"IDAT", &idat);
+    chunk(b"IEND", &[]);
+
+    assert_eq!(Decoder::new().decode(&png).unwrap_err(), psd_png::Error::PaletteIndexOutOfRange);
+    let streamed = Decoder::new().decode_to_rgba8(&png, |_: Row<'_>| Ok::<(), psd_png::Error>(()));
+    assert_eq!(streamed, Err(psd_png::Error::PaletteIndexOutOfRange));
+    let streamed = Decoder::new().decode_to_rgb16(&png, |_: Row<'_>| Ok::<(), psd_png::Error>(()));
+    assert_eq!(streamed, Err(psd_png::Error::PaletteIndexOutOfRange));
+}
