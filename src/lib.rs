@@ -7,16 +7,18 @@
 //!
 //! Its reason to exist is [`Decoder::decode_to`]: a decode that hands out one reconstructed
 //! scanline at a time while holding only DEFLATE's 32 KiB match window, a segment of
-//! filtered rows, and the row being worked on. Memory is a few hundred kilobytes whatever
-//! the image's size, which is what lets a raster the whole-image path must refuse — the
-//! 512 MiB ceiling exists precisely so that a seventy-byte file cannot make a decoder
-//! allocate for a petabyte — be decoded row by row into the caller's own storage.
-//! [`decode`] remains for the ordinary case.
+//! filtered rows, and a few rows of headroom. Memory follows the row width and not the
+//! height — a few hundred kilobytes for ordinary images, however tall — which is what lets
+//! a raster the whole-image path must refuse (the 512 MiB ceiling exists precisely so that
+//! a seventy-byte file cannot make a decoder allocate for a petabyte) be decoded row by row
+//! into the caller's own storage. The ceiling still bounds that working memory, so a header
+//! naming rows gigabytes wide is refused on either path. [`decode`] remains for the
+//! ordinary case.
 //!
 //! # Provenance
 //!
 //! This crate began as [png-spark](https://github.com/stephenberry/png-spark) 0.2.0 by
-//! Emil Dohne, which contributed the format coverage, the DEFLATE codec, the checksums,
+//! Stephen Berry, which contributed the format coverage, the DEFLATE codec, the checksums,
 //! the scanline filters, and the encoder still inherited below. The PhotoshopAPI-rs port
 //! team added the fused reconstruction and the streaming decoder, and is removing the
 //! encoder, which the port has no use for. Both licences (`MIT OR Apache-2.0`) and the
@@ -61,8 +63,9 @@
 //!
 //! A sink error aborts the decode and is returned; rows already delivered stay delivered.
 //! Interlaced images need a scatter target the callback does not have, so they are decoded
-//! into a buffer first and emitted from there — the memory bound is the non-interlaced
-//! case, which is what every raster in the port's corpus is.
+//! into a buffer first and emitted from there, under the same size ceiling as [`decode`] —
+//! the memory bound is the non-interlaced case, which is what every raster in the port's
+//! corpus is.
 //!
 //! # Converting while streaming
 //!
@@ -99,7 +102,9 @@
 //! therefore name a size in petabytes, so the decoder carries a ceiling on it, of
 //! [`DEFAULT_MAX_DECOMPRESSED_SIZE`]; a header over
 //! it is an error rather than an allocation. Raise it with
-//! [`Decoder::max_decompressed_size`] where the images really are that large.
+//! [`Decoder::max_decompressed_size`] where the images really are that large. The
+//! streaming methods apply the same ceiling to the buffers they allocate, which depend on
+//! the row width rather than the whole image.
 //!
 //! [`read_info`] parses the header and colour chunks and stops at the image data, for a
 //! caller that wants to decide something about a file before decoding it.

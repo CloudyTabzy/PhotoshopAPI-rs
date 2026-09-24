@@ -4,10 +4,12 @@ A streaming PNG decoder with **zero dependencies**, built to decode smart-object
 PhotoshopAPI-rs, the Rust port of PhotoshopAPI.
 
 `decode_to` hands out one reconstructed scanline at a time while holding only DEFLATE's 32 KiB
-match window, a segment of filtered rows, and the row being worked on — a few hundred kilobytes
-whatever the image's size. That is the whole point of the crate: a raster larger than the
-whole-image path's 512 MiB ceiling, or larger than the memory you want to spend on someone
-else's pixels, still decodes row by row straight into your own buffer.
+match window, a segment of filtered rows, and a few rows of headroom — a few hundred kilobytes
+for ordinary images, however tall, since the stage follows the row width and not the height.
+That is the whole point of the crate: a raster larger than the whole-image path's 512 MiB
+ceiling, or larger than the memory you want to spend on someone else's pixels, still decodes
+row by row straight into your own buffer. The ceiling bounds the stage instead, so a header
+naming rows gigabytes wide is still refused.
 
 ```rust
 use psd_png::Decoder;
@@ -194,6 +196,9 @@ what is new here:
 - `tests/streaming_decode.rs` — row-exact parity with `decode` across large fixtures, corpus
   files and interlaced images; sink-error abort; a 1.07 GB image past the ceiling; corrupt
   streams agreeing between the two paths
+- `tests/streaming_bounds.rs` — hand-built streams that end a match on every position a segment
+  can pause at, for rows narrow enough to test the stage's headroom; the ceiling applied to the
+  stage, to a converted row and to the interlaced fallback
 - unit tests in `filter.rs`, `inflate.rs` and `simd.rs` — the frontier's lag invariant, the slide
   rule, segmented-versus-one-shot parity over 224 reference zlib vectors at a stage barely larger than
   the window, and the SIMD `Paeth` kernel against the scalar predictor at every stride it claims

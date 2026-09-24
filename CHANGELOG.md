@@ -9,9 +9,12 @@ package is `publish = false` and carries no `repository` URL.
 ### Added
 
 - `Decoder::decode_to` decodes a PNG one scanline at a time through a sink, in file order and
-  the file's native layout, holding only the match window plus a segment of filtered rows — a
-  few hundred kilobytes whatever the decompressed size. `max_decompressed_size` does not bound
-  it: images `decode` must refuse stream row by row. Within a few percent of `decode()` in
+  the file's native layout, holding only the match window, a segment of filtered rows and a few
+  rows of headroom — a few hundred kilobytes for ordinary images whatever their height.
+  `max_decompressed_size` bounds that stage (and, when converting, the one converted row)
+  rather than the image, so images `decode` must refuse stream row by row while a header
+  naming rows gigabytes wide is refused on both paths. Interlaced images stream from a
+  whole-image buffer and are limited exactly as `decode` limits them. Within a few percent of `decode()` in
   speed, and faster than it against a sink that does not retain the rows. Under
   `Checks::Full` the Adler-32 is verified over the *filtered* bytes, hashed ahead of each
   in-place reconstruction rather than over a buffer that has already been rewritten.
@@ -39,6 +42,24 @@ package is `publish = false` and carries no `repository` URL.
   The 8-bit output is byte-identical to what the previous implementation produced.
 - Crate documentation, README and CI describe a decoder; the encoder inherited from png-spark
   is retained unchanged for one step and then removed.
+
+### Fixed
+
+- `decode_to` and its converting variants could panic ("budget must leave OUTPUT_SLACK") on
+  valid non-interlaced images with rows narrower than about 130 bytes — greyscale under 128
+  pixels wide, RGBA under 32 — when a DEFLATE match ended exactly where a segment paused. The
+  reconstruction frontier was only told of progress at the top of each decode iteration, so
+  at such a pause it trailed the cursor by up to a whole match, and the stage slide kept more
+  than its headroom. A paused segment now reports its final position before returning, and
+  segments pause at the driver's budget for compressed blocks as well as stored ones, as the
+  segment interface already documented. A segment that can never make progress is reported
+  as an error instead of looping.
+- `decode_to` on an interlaced image ignored `max_decompressed_size`, although its buffered
+  fallback allocates the whole image just as `decode` does.
+- The streaming stage and the converted row had no size ceiling, so a header naming a very
+  wide image could ask for tens of gigabytes. Both are now held to `max_decompressed_size`,
+  and `SizeLimitExceeded` reports the buffer that was over it.
+- The crate documentation credited png-spark to the wrong author; it is Stephen Berry's.
 
 ### Performance
 

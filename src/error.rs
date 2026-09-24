@@ -48,13 +48,15 @@ pub enum Error {
     EmptyImage,
     /// The image is too large to address on this platform.
     ImageTooLarge,
-    /// The image's decompressed size exceeds the decoder's limit.
+    /// A buffer the decode needs exceeds the decoder's limit.
     ///
     /// `IHDR` states how large an image expands to before any of it has been read, so a
     /// thirteen-byte header can ask for a buffer of any size the platform can address. See
     /// [`Decoder::max_decompressed_size`](crate::Decoder::max_decompressed_size).
     SizeLimitExceeded {
-        /// Bytes the header says the image expands to.
+        /// Bytes in the largest buffer the header implies: the decompressed image for a
+        /// whole-image or interlaced decode, and the stage or one converted row for a
+        /// streaming one.
         size: usize,
         /// The decoder's ceiling on that figure.
         limit: usize,
@@ -126,7 +128,7 @@ impl core::fmt::Display for Error {
             Error::EmptyImage => f.write_str("image has zero width or height"),
             Error::ImageTooLarge => f.write_str("image dimensions exceed the addressable range"),
             Error::SizeLimitExceeded { size, limit } => {
-                write!(f, "image expands to {size} bytes, over the {limit} byte limit")
+                write!(f, "image needs a {size} byte buffer, over the {limit} byte limit")
             }
             Error::OutOfMemory { bytes } => {
                 write!(f, "could not allocate {bytes} bytes for the image")

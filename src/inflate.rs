@@ -708,6 +708,16 @@ impl Inflater {
     /// `Filled`, `pause` carries everything needed to continue with the same `input` slice
     /// after the caller has made room via the next call.
     ///
+    /// The cursor stops at `budget` or short of it — a match that would cross it waits for
+    /// the next call — except that the literal run in flight when it is reached may finish
+    /// up to five bytes past it. `written` is the exact position either way.
+    ///
+    /// On `Filled`, `hook` has observed `written` itself before the call returns. The decode
+    /// loop reports progress at the top of each iteration, so without that final report an
+    /// iteration that lands on the budget would leave the hook as much as a whole match
+    /// behind the cursor, and a caller sizing its next step from the hook's state (the
+    /// streaming decoder slides its stage to the frontier) would size it from stale data.
+    ///
     /// `resume_at` overrides the checkpoint's output position before decoding. The
     /// streaming decoder passes `None` on the first call, the previous `Filled` position
     /// while extending a segment, and `window` after relocating the match window to the
@@ -761,7 +771,14 @@ impl Inflater {
             self.inflate::<H, true>(&input[2..], output, budget, hook, pause)?;
 
         match pause {
-            Some(_) => Ok(SegmentOutcome::Filled { written }),
+            Some(_) => {
+                // Every byte below `written` is final, and no match copy is in flight at a
+                // pause, so this is a boundary the hook contract allows.
+                if H::ENABLED {
+                    hook.on_progress(output, written);
+                }
+                Ok(SegmentOutcome::Filled { written })
+            }
             None => Ok(SegmentOutcome::StreamEnd { written, consumed }),
         }
     }
@@ -780,6 +797,12 @@ impl Inflater {
         hook: &mut H,
         pause: &mut Option<SegmentPause>,
     ) -> Result<(usize, usize), InflateError> {
+        // `decode_block`'s unchecked stores rely on this: every write it makes lands below
+        // `limit + OUTPUT_SLACK`.
+        assert!(
+            limit <= output.len().saturating_sub(OUTPUT_SLACK),
+            "limit must leave OUTPUT_SLACK in the output buffer"
+        );
         let mut reader = BitReader::new(input);
         let mut out_pos = 0usize;
 
@@ -800,6 +823,7 @@ impl Inflater {
                     &mut reader,
                     output,
                     out_pos,
+                    limit,
                     hook,
                     pause,
                     state.last_block,
@@ -864,6 +888,7 @@ impl Inflater {
                         &mut reader,
                         output,
                         out_pos,
+                        limit,
                         hook,
                         pause,
                         last_block,
@@ -875,6 +900,7 @@ impl Inflater {
                         &mut reader,
                         output,
                         out_pos,
+                        limit,
                         hook,
                         pause,
                         last_block,
@@ -1036,8 +1062,8 @@ impl Inflater {
     ///
     /// # Safety
     /// `pos + 2 <= output.len()` must hold. The decode loop establishes this by refusing to
-    /// enter an iteration unless `pos <= output.len() - OUTPUT_SLACK`, and by advancing `pos`
-    /// by at most six over the literals it then writes speculatively.
+    /// enter an iteration unless `pos <= limit`, where `limit + OUTPUT_SLACK <= output.len()`,
+    /// and by advancing `pos` by at most six over the literals it then writes speculatively.
     #[inline(always)]
     unsafe fn store_literals(output: &mut [u8], pos: usize, entry: u32) {
         unsafe {
@@ -1092,16 +1118,23 @@ impl Inflater {
     /// compiles out entirely (see [`ProgressHook`]), leaving the loop identical to a
     /// hook-free decoder.
     ///
+    /// `limit` is where output stops: the end of the buffer less [`OUTPUT_SLACK`] for a
+    /// one-shot decode, and the caller's budget for a segmented one. The caller guarantees
+    /// `limit + OUTPUT_SLACK <= output.len()`, which is what the unchecked stores below rely
+    /// on.
+    ///
     /// With `SEGMENTED` the two output-limit checks pause instead of erroring: the bit
     /// reader and the cursor are stored in `pause` and the caller resumes from them after
     /// making room. `Ok` therefore means "block end or pause"; the caller distinguishes
     /// through `pause.is_some()`. `last_block` is recorded so a mid-block pause resumed
     /// into the stream's final block does not decode past it.
+    #[allow(clippy::too_many_arguments)]
     fn decode_block<H: ProgressHook, const SEGMENTED: bool>(
         &mut self,
         reader: &mut BitReader,
         output: &mut [u8],
         start_pos: usize,
+        limit: usize,
         hook: &mut H,
         pause: &mut Option<SegmentPause>,
         last_block: bool,
@@ -1114,7 +1147,7 @@ impl Inflater {
         let litlen_secondary = &self.litlen_secondary[..];
         let dist_secondary = &self.dist_secondary[..];
 
-        let limit = output.len() - OUTPUT_SLACK;
+        debug_assert!(limit + OUTPUT_SLACK <= output.len());
         let mut pos = start_pos;
         let mut r = *reader;
 
@@ -1167,8 +1200,8 @@ impl Inflater {
                     let code_bits2 = entry2 & 0xff;
                     let code_bits3 = entry3 & 0xff;
 
-                    // SAFETY: `pos <= limit` was checked above, so `pos + 2 <=
-                    // output.len() - 14`. Each store below advances `pos` by at most two and
+                    // SAFETY: `pos <= limit` was checked above and `limit + OUTPUT_SLACK <=
+                    // output.len()`, so `pos + 2 <= output.len() - 14`. Each store below advances `pos` by at most two and
                     // there are at most three of them, keeping every access in bounds.
                     unsafe { Self::store_literals(output, pos, entry) };
                     pos += ((entry >> 8) & 0xf) as usize;
@@ -1305,8 +1338,8 @@ impl Inflater {
                 if distance == 1 {
                     // Byte runs are the most common match in filtered image data.
                     // SAFETY: `source < pos <= limit` by the two checks above, so the byte
-                    // is inside the buffer. Indexing keeps the check: `limit` is a wrapping
-                    // subtraction and `pos + length` a wrapping add as far as the compiler
+                    // is inside the buffer. Indexing keeps the check: `limit` is an opaque
+                    // parameter and `pos + length` a wrapping add as far as the compiler
                     // can tell, so it cannot rebuild the invariant the note above states.
                     // The panic edge also spills `limit` back onto the hottest literal path.
                     let byte = unsafe { *output.get_unchecked(source) };
@@ -1496,6 +1529,47 @@ mod tests {
         assert_eq!(output.len(), expected.len());
         assert!(output.len() > budget, "resume path not exercised");
         assert_eq!(output, expected);
+    }
+
+    /// A hook that remembers the last cursor position it was shown.
+    struct LastSeen(usize);
+
+    impl ProgressHook for LastSeen {
+        const ENABLED: bool = true;
+
+        fn on_progress(&mut self, _output: &mut [u8], pos: usize) {
+            self.0 = pos;
+        }
+    }
+
+    /// A paused segment must have shown the hook the exact position it paused at.
+    ///
+    /// The decode loop reports progress at the top of each iteration, so the iteration that
+    /// reaches the budget writes bytes the hook has not been told about. When that iteration
+    /// is a match, the gap is up to 258 bytes, and the streaming decoder — which slides its
+    /// stage to wherever the hook's frontier stands — once kept that much more than its
+    /// headroom allowed and panicked on narrow images. Sweeping the budget across runs of
+    /// long matches lands the pause after every kind of iteration: literal chains, matches
+    /// that end exactly on the budget, and matches refused for crossing it.
+    #[test]
+    fn a_paused_segment_has_reported_its_position_to_the_hook() {
+        let data: Vec<u8> = (0..20_000u32).map(|i| (i / 700) as u8).collect();
+        let compressed = crate::deflate::compress_zlib(&data);
+
+        for budget in 1..3_000 {
+            let mut stage = vec![0u8; budget + OUTPUT_SLACK];
+            let mut pause = None;
+            let mut hook = LastSeen(usize::MAX);
+            let outcome = Inflater::new()
+                .zlib_segment(&compressed, &mut stage, budget, None, &mut pause, &mut hook)
+                .unwrap();
+            let SegmentOutcome::Filled { written } = outcome else {
+                panic!("budget {budget}: a stream of {} bytes cannot end here", data.len());
+            };
+            assert_eq!(hook.0, written, "budget {budget}: the hook was left behind the cursor");
+            assert!(written <= budget + 5, "budget {budget}: overran to {written}");
+            assert_eq!(&stage[..written], &data[..written], "budget {budget}");
+        }
     }
 
     /// Drives `zlib_segment` with a small stage over every reference vector and requires

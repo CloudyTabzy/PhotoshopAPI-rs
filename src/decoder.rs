@@ -210,6 +210,15 @@ impl Decoder {
     /// unfiltered pass by pass into a second buffer of its own, so Adam7 holds close to
     /// twice the limit at once; every other image holds it once.
     ///
+    /// The streaming methods ([`decode_to`](Self::decode_to) and its converting variants)
+    /// are held to the same rule, applied to what they allocate instead. A non-interlaced
+    /// image streams through a stage whose size follows the row width, not the height —
+    /// the match window, a 256 KiB segment and a few rows — plus, when converting, one
+    /// converted row; each of those must fit. So a tall image far over the ceiling still
+    /// streams, while a header naming rows gigabytes wide is refused as it is by
+    /// [`decode`](Self::decode). An interlaced image streams from a whole-image buffer and
+    /// is limited exactly as `decode` limits it.
+    ///
     /// A header over the limit is [`Error::SizeLimitExceeded`], reported before anything
     /// image-sized is allocated. Raising it for a caller who really does read hundred-
     /// megapixel images is a one-liner, and passing `None` restores the unbounded behaviour
@@ -232,19 +241,20 @@ impl Decoder {
 
     /// Decodes a PNG into its native pixel format.
     pub fn decode(&mut self, png: &[u8]) -> Result<Image, Error> {
-        let parsed = self.parse(png, true)?;
+        let parsed = self.parse(png, Plan::Whole)?;
         self.decode_parsed(parsed)
     }
 
     /// Decodes a PNG one scanline at a time, in file order, in the file's native layout.
     ///
     /// `sink` receives each row as it is reconstructed. For a non-interlaced image the
-    /// decoder holds only a bounded stage — the DEFLATE match window plus a segment of
-    /// filtered rows, a few hundred kilobytes for ordinary images — so images far beyond
+    /// decoder holds only a stage sized by the row width — the DEFLATE match window, a
+    /// segment of filtered rows and a few rows of headroom, a few hundred kilobytes for
+    /// ordinary images — whatever the height, so images far beyond
     /// [`max_decompressed_size`](Self::max_decompressed_size) decode here that
-    /// [`decode`](Self::decode) must refuse; the ceiling does not apply to streaming.
-    /// Interlaced images are decoded into a buffer first, as they are by `decode`, and
-    /// emitted from there.
+    /// [`decode`](Self::decode) must refuse. The ceiling bounds the stage instead: see
+    /// `max_decompressed_size`. Interlaced images are decoded into a buffer first, as they
+    /// are by `decode`, emitted from there, and limited as `decode` limits them.
     ///
     /// A sink error aborts the decode and is returned. Rows already delivered stay
     /// delivered.
@@ -265,7 +275,7 @@ impl Decoder {
         F: FnMut(Row<'_>) -> Result<(), E>,
         E: From<Error>,
     {
-        let parsed = self.parse(png, false)?;
+        let parsed = self.parse(png, Plan::Stream { converted_pixel: 0 })?;
         self.dispatch_rows(parsed, sink)
     }
 
@@ -277,8 +287,9 @@ impl Decoder {
     /// truncated to their high byte, palette indices are resolved, and `tRNS` becomes real
     /// alpha. Rows are `width * 4` bytes, interleaved, in file order.
     ///
-    /// The size ceiling does not apply, and neither does the memory a whole-image decode
-    /// needs: see [`decode_to`](Self::decode_to).
+    /// Neither the memory a whole-image decode needs nor its size ceiling applies: see
+    /// [`decode_to`](Self::decode_to). The ceiling bounds the stage and the one converted
+    /// row instead of the image.
     ///
     /// ```no_run
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -357,7 +368,7 @@ impl Decoder {
         F: FnMut(Row<'_>) -> Result<(), E>,
         E: From<Error>,
     {
-        let parsed = self.parse(png, false)?;
+        let parsed = self.parse(png, Plan::Stream { converted_pixel: CHANNELS * S::WIDTH })?;
         let converter = RowConverter::new(&parsed.info)?;
         let scratch_len = parsed.info.width as usize * CHANNELS * S::WIDTH;
         let mut scratch =
@@ -407,21 +418,14 @@ impl Decoder {
         F: FnMut(Row<'_>) -> Result<(), E>,
         E: From<Error>,
     {
-        const SEGMENT_TARGET: usize = 256 * 1024;
-
         let info = parsed.info;
         let row_bytes = info.row_bytes();
         let height = info.height as usize;
-        let pitch = 1 + row_bytes;
         let window = crate::filter::MAX_MATCH_DISTANCE;
 
-        let rows_per_segment = (SEGMENT_TARGET / pitch).max(1);
-        // A segment after a slide must be able to hold a whole stored block (at most
-        // 65535 bytes) beyond the retained region, however narrow the rows are.
-        let cap = (rows_per_segment * pitch).max(65536 + pitch);
-        // The retained region is the match window plus less than a row beyond the
-        // frontier (see the slide below); four rows of headroom cover the extension.
-        let stage_len = window + cap + 4 * pitch + crate::inflate::OUTPUT_SLACK;
+        let StageLayout { pitch, cap, len: stage_len } = StageLayout::new(row_bytes);
+        // The furthest any segment may inflate to: the stage less the copy slack.
+        let max_budget = stage_len - OUTPUT_SLACK;
         let mut stage = zeroed_vec(stage_len).ok_or(Error::OutOfMemory { bytes: stage_len })?;
 
         let mut wrapped =
@@ -445,6 +449,9 @@ impl Decoder {
         let mut budget = window + cap;
         let mut seg_start = 0usize;
         let mut resume_at: Option<usize> = None;
+        // Consecutive segments that ended where the previous one did.
+        let mut stalls = 0u32;
+        let mut last_written = 0usize;
         let written_total;
 
         loop {
@@ -515,6 +522,20 @@ impl Decoder {
             }
 
             let abs_written = base + end;
+            // A segment can legitimately end without new output (a stored block waiting
+            // for room, or a segment extended by a row), but only a couple of times in a
+            // row: the slide and the runway below always make room. Should the sizing
+            // ever fail to, report a stream that does not fit rather than spin.
+            if abs_written == last_written {
+                stalls += 1;
+                if stalls > 4 {
+                    return Err(Error::from(InflateError::OutputOverflow).into());
+                }
+            } else {
+                stalls = 0;
+                last_written = abs_written;
+            }
+
             let floor = frontier.done_floor();
             if floor >= base + pitch {
                 // Slide, but keep the reconstructed lookback row (row `rows_done - 1`)
@@ -522,7 +543,14 @@ impl Decoder {
                 // below its first byte. The match window rides along automatically,
                 // because the frontier trails the cursor by the window plus less than a
                 // row: done_floor >= abs_written - window - pitch + 1, so the retained
-                // region [new_base, abs_written) is at least the window.
+                // region [new_base, abs_written) is at least the window and less than the
+                // window plus two rows.
+                //
+                // That bound holds because `zlib_segment` reports the paused position to
+                // the frontier before returning `Filled`. Were the frontier left at the
+                // top of the last decode iteration, it could trail by a whole match (up to
+                // 258 bytes), and for rows narrower than about 130 bytes the retained
+                // region would outgrow the four rows of headroom the stage carries.
                 let new_base = (floor - pitch + 1).min(abs_written);
                 let delta = new_base - base;
                 stage.copy_within(delta..end, 0);
@@ -530,12 +558,13 @@ impl Decoder {
                 let resume = end - delta;
                 seg_start = resume;
                 resume_at = Some(resume);
-                budget = resume + cap;
+                debug_assert!(resume + cap <= max_budget, "retained region outgrew the stage");
+                budget = (resume + cap).min(max_budget);
             } else {
                 // Row zero (or a row wider than the retained region) is not reconstructed
                 // yet; nothing can be dropped. Extend the segment by up to four rows of
                 // runway, by which point readiness always arrives.
-                budget = (budget + 2 * pitch).min(window + cap + 4 * pitch);
+                budget = (budget + 2 * pitch).min(max_budget);
                 seg_start = end;
                 resume_at = Some(end);
             }
@@ -620,14 +649,13 @@ impl Decoder {
         Ok(Image { info, data })
     }
 
-    fn parse<'a>(&self, png: &'a [u8], enforce_limit: bool) -> Result<Parsed<'a>, Error> {
+    fn parse<'a>(&self, png: &'a [u8], plan: Plan) -> Result<Parsed<'a>, Error> {
         let (mut info, mut chunks) = open(png, self.checks)?;
 
         // Checked here rather than at the allocation, so a header naming a petabyte costs
         // the thirty-three bytes already read and not a scan of whatever follows it.
-        // Streaming decode does not allocate by the size, so it does not enforce it.
-        if enforce_limit && let Some(limit) = self.max_decompressed_size {
-            let size = info.decompressed_size();
+        if let Some(limit) = self.max_decompressed_size {
+            let size = plan.largest_buffer(&info);
             if size > limit {
                 return Err(Error::SizeLimitExceeded { size, limit });
             }
@@ -786,6 +814,70 @@ fn read_header(png: &[u8], checks: Checks, keep: &Keep) -> Result<Info, Error> {
     }
 
     Err(Error::MissingImageData)
+}
+
+/// Which buffers a decode is about to allocate, so that [`Decoder::parse`] can hold the
+/// largest of them to the ceiling before reading past the header.
+#[derive(Clone, Copy)]
+enum Plan {
+    /// [`Decoder::decode`]: the whole decompressed image.
+    Whole,
+    /// A streaming decode. `converted_pixel` is the bytes per pixel of a converted row, or
+    /// zero when rows go out in the file's own layout and no scratch row exists.
+    Stream { converted_pixel: usize },
+}
+
+impl Plan {
+    /// Bytes in the largest single buffer this decode allocates for `info`.
+    fn largest_buffer(self, info: &Info) -> usize {
+        match self {
+            Plan::Whole => info.decompressed_size(),
+            Plan::Stream { converted_pixel } => {
+                // An interlaced image falls back to a whole-image decode (see
+                // `dispatch_rows`), so it needs what `decode` needs.
+                let working = match info.interlacing {
+                    Interlacing::None => StageLayout::new(info.row_bytes()).len,
+                    Interlacing::Adam7 => info.decompressed_size(),
+                };
+                let scratch = (info.width as usize).saturating_mul(converted_pixel);
+                working.max(scratch)
+            }
+        }
+    }
+}
+
+/// How the streaming decoder sizes its stage for rows of a given width.
+///
+/// The stage holds the match window, a segment of filtered rows, and four rows of headroom
+/// for the slide to keep. Its size depends on the row width and not on the height, so it is
+/// the memory a streaming decode needs whatever the image's height — and, for a very wide
+/// image, what the size ceiling has to bound.
+struct StageLayout {
+    /// Bytes per filtered row, filter byte included.
+    pitch: usize,
+    /// Bytes of filtered rows one segment inflates beyond the retained region.
+    cap: usize,
+    /// Bytes in the whole stage, [`OUTPUT_SLACK`] included.
+    len: usize,
+}
+
+impl StageLayout {
+    fn new(row_bytes: usize) -> Self {
+        const SEGMENT_TARGET: usize = 256 * 1024;
+
+        let pitch = row_bytes.saturating_add(1);
+        let rows_per_segment = (SEGMENT_TARGET / pitch).max(1);
+        // A segment after a slide must be able to hold a whole stored block (at most
+        // 65535 bytes) beyond the retained region, however narrow the rows are.
+        let cap = (rows_per_segment * pitch).max(pitch.saturating_add(65536));
+        // The retained region is the match window plus less than two rows (see the slide
+        // in `stream_rows`); four rows of headroom cover it and the segment extension.
+        let len = crate::filter::MAX_MATCH_DISTANCE
+            .saturating_add(cap)
+            .saturating_add(pitch.saturating_mul(4))
+            .saturating_add(OUTPUT_SLACK);
+        Self { pitch, cap, len }
+    }
 }
 
 struct Parsed<'a> {

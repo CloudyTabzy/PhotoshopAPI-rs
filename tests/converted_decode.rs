@@ -263,9 +263,10 @@ fn a_failing_sink_aborts_a_converting_decode() {
 }
 
 #[test]
-fn converted_streaming_ignores_the_decompressed_size_ceiling() {
+fn converted_streaming_passes_a_ceiling_the_image_exceeds() {
     // 512x512 RGBA8 is 1 MiB filtered, well over the ceiling set here. A converting decode
-    // holds one converted row and a bounded stage, so the ceiling cannot apply to it.
+    // holds one converted row and a stage of about 300 KiB, and those are what the ceiling
+    // bounds when streaming, so the image streams although `decode` must refuse it.
     let width = 512u32;
     let height = 512u32;
     let data = vec![0x5Au8; (width * height * 4) as usize];
@@ -273,13 +274,13 @@ fn converted_streaming_ignores_the_decompressed_size_ceiling() {
         .unwrap();
 
     let mut decoder = Decoder::new();
-    decoder.max_decompressed_size(Some(1024));
+    decoder.max_decompressed_size(Some(512 << 10));
     assert!(decoder.decode(&png).is_err(), "decode must respect the ceiling");
 
     let mut rows = 0usize;
     let mut converted = 0usize;
     let mut decoder = Decoder::new();
-    decoder.max_decompressed_size(Some(1024));
+    decoder.max_decompressed_size(Some(512 << 10));
     decoder
         .decode_to_rgba8(&png, |row: Row<'_>| -> Result<(), psd_png::Error> {
             rows += 1;
