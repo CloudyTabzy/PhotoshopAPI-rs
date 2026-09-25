@@ -6,6 +6,22 @@ no `repository` URL, so no version headings carry compare links.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-25
+
+### Removed
+
+- The PNG encoder, the DEFLATE compressor under it, `FilterStrategy`, `WriteError` and the
+  ancillary-chunk retention (`Keep`, `Info::metadata`, `Info::chunk`, the public `Chunk`).
+  The port decodes PNG rasters and never writes one, so the crate now carries only what a
+  reader needs, and the public surface no longer names anything the decode path never
+  touched. With it went the encode half of `filter.rs` (the forward filters live on as
+  test-local helpers beside the round-trip pins that need them), the encode benches and the
+  encode-side corpus mode of the bench harness, the encoder cross-check test, the
+  `roundtrip` fuzz target, and the tests that built fixtures through the encoder — replaced
+  by a hand-built fixture module that writes every scanline stored, which needs no
+  compressor and keeps the decode tests honest about the format. The decode suite, the
+  corpus sweep and the zlib vectors are unchanged.
+
 ## [0.2.2] - 2026-09-25
 
 ### Changed

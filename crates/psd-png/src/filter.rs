@@ -701,59 +701,58 @@ impl<'a, E, S: FnMut(usize, &[u8]) -> Result<(), E>> StreamingFrontier<'a, E, S>
     }
 }
 
-// ---------------------------------------------------------------------------------------
-// Encoding
-// ---------------------------------------------------------------------------------------
-
-/// Applies `filter` to `row`, writing the residuals to `out`.
-///
-/// `prev` is the unfiltered row above, or an all-zero slice for the first row.
-pub fn filter_row<const BPP: usize>(filter: Filter, prev: &[u8], row: &[u8], out: &mut [u8]) {
-    debug_assert_eq!(row.len(), out.len());
-    debug_assert_eq!(prev.len(), row.len());
-    let len = row.len();
-    let head = BPP.min(len);
-
-    match filter {
-        Filter::None => out.copy_from_slice(row),
-        Filter::Sub => {
-            out[..head].copy_from_slice(&row[..head]);
-            for i in BPP..len {
-                out[i] = row[i].wrapping_sub(row[i - BPP]);
-            }
-        }
-        Filter::Up => {
-            for i in 0..len {
-                out[i] = row[i].wrapping_sub(prev[i]);
-            }
-        }
-        Filter::Average => {
-            for i in 0..head {
-                out[i] = row[i].wrapping_sub(prev[i] >> 1);
-            }
-            for i in BPP..len {
-                let sum = row[i - BPP] as u16 + prev[i] as u16;
-                out[i] = row[i].wrapping_sub((sum >> 1) as u8);
-            }
-        }
-        Filter::Paeth => {
-            for i in 0..head {
-                out[i] = row[i].wrapping_sub(prev[i]);
-            }
-            for i in BPP..len {
-                out[i] = row[i].wrapping_sub(paeth(
-                    row[i - BPP] as i16,
-                    prev[i] as i16,
-                    prev[i - BPP] as i16,
-                ));
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Applies `filter` to `row`, writing the residuals to `out`, the way the forward
+    /// direction of the format defines it. The encoder is gone from the crate, so the
+    /// round-trip tests compute the filtered stream themselves: this is the specification's
+    /// own arithmetic, kept beside the pins that use it.
+    ///
+    /// `prev` is the unfiltered row above, or an all-zero slice for the first row.
+    fn filter_forward<const BPP: usize>(filter: Filter, prev: &[u8], row: &[u8], out: &mut [u8]) {
+        debug_assert_eq!(row.len(), out.len());
+        debug_assert_eq!(prev.len(), row.len());
+        let len = row.len();
+        let head = BPP.min(len);
+
+        match filter {
+            Filter::None => out.copy_from_slice(row),
+            Filter::Sub => {
+                out[..head].copy_from_slice(&row[..head]);
+                for i in BPP..len {
+                    out[i] = row[i].wrapping_sub(row[i - BPP]);
+                }
+            }
+            Filter::Up => {
+                for i in 0..len {
+                    out[i] = row[i].wrapping_sub(prev[i]);
+                }
+            }
+            Filter::Average => {
+                for i in 0..head {
+                    out[i] = row[i].wrapping_sub(prev[i] >> 1);
+                }
+                for i in BPP..len {
+                    let sum = row[i - BPP] as u16 + prev[i] as u16;
+                    out[i] = row[i].wrapping_sub((sum >> 1) as u8);
+                }
+            }
+            Filter::Paeth => {
+                for i in 0..head {
+                    out[i] = row[i].wrapping_sub(prev[i]);
+                }
+                for i in BPP..len {
+                    out[i] = row[i].wrapping_sub(paeth(
+                        row[i - BPP] as i16,
+                        prev[i] as i16,
+                        prev[i - BPP] as i16,
+                    ));
+                }
+            }
+        }
+    }
 
     fn round_trip<const BPP: usize>(filter: Filter, width_pixels: usize, height: usize) {
         let row_bytes = width_pixels * BPP;
@@ -774,7 +773,7 @@ mod tests {
             stream[base] = filter as u8;
             let (before, after) = stream.split_at_mut(base + 1);
             let _ = before;
-            filter_row::<BPP>(
+            filter_forward::<BPP>(
                 filter,
                 prev,
                 &image[row * row_bytes..(row + 1) * row_bytes],
@@ -830,7 +829,7 @@ mod tests {
             let base = row * (1 + row_bytes);
             stream[base] = filter as u8;
             let (_, after) = stream.split_at_mut(base + 1);
-            filter_row::<BPP>(
+            filter_forward::<BPP>(
                 filter,
                 prev,
                 &image[row * row_bytes..(row + 1) * row_bytes],
@@ -944,7 +943,7 @@ mod tests {
             let base = row * (1 + row_bytes);
             stream[base] = filter as u8;
             let (_, after) = stream.split_at_mut(base + 1);
-            filter_row::<BPP>(
+            filter_forward::<BPP>(
                 filter,
                 prev,
                 &image[row * row_bytes..(row + 1) * row_bytes],

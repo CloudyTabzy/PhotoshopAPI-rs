@@ -1,8 +1,8 @@
 //! PNG decoding.
 
 use crate::common::{
-    ADAM7_PASSES, BitDepth, Chunk, ColorType, Info, Interlacing, SIGNATURE, adam7_pass_size,
-    row_bytes_for, writable_kind, zeroed_vec,
+    ADAM7_PASSES, BitDepth, ColorType, Info, Interlacing, SIGNATURE, adam7_pass_size,
+    row_bytes_for, zeroed_vec,
 };
 use crate::crc32::crc32;
 use crate::error::Error;
@@ -13,7 +13,7 @@ use crate::transform::{RowConverter, RowSample};
 /// A decoded image and the description of its pixel layout.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Image {
-    /// The image's dimensions and layout, along with any chunks the decoder was asked to keep.
+    /// The image's dimensions and layout, including its palette and `tRNS` payload.
     pub info: Info,
     /// Pixel data in the image's own format, tightly packed, with no filter bytes and no
     /// padding between rows beyond what a sub-byte bit depth requires.
@@ -90,35 +90,6 @@ pub enum Checks {
 /// payload, which is why it is asked for rather than assumed.
 ///
 /// A chunk that fails its CRC is dropped before this is consulted, so a retained chunk has
-/// been verified unless [`Checks::None`] is in force.
-///
-/// A chunk whose type the encoder would refuse is dropped too, however it was asked for: a
-/// type that is not four ASCII letters is malformed, and `tRNS` is read into
-/// [`Info::transparency`] instead. Everything retained can therefore be written back out.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub enum Keep {
-    /// Retain nothing. This is the default.
-    #[default]
-    None,
-    /// Retain the ancillary chunks whose type appears in this list.
-    Only(Vec<[u8; 4]>),
-    /// Retain every ancillary chunk the file carries.
-    ///
-    /// The retained payloads are bounded by the size of the file they came from.
-    All,
-}
-
-impl Keep {
-    #[inline]
-    fn wants(&self, kind: [u8; 4]) -> bool {
-        match self {
-            Keep::None => false,
-            Keep::Only(kinds) => kinds.contains(&kind),
-            Keep::All => true,
-        }
-    }
-}
-
 /// The decoder's default ceiling on [`Info::decompressed_size`], in bytes.
 ///
 /// Half a gigabyte admits any photograph or screen capture a caller is likely to have meant
@@ -133,7 +104,6 @@ pub const DEFAULT_MAX_DECOMPRESSED_SIZE: usize = 512 << 20;
 pub struct Decoder {
     inflater: Inflater,
     checks: Checks,
-    keep: Keep,
     max_decompressed_size: Option<usize>,
 }
 
@@ -141,7 +111,6 @@ impl core::fmt::Debug for Decoder {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Decoder")
             .field("checks", &self.checks)
-            .field("keep", &self.keep)
             .field("max_decompressed_size", &self.max_decompressed_size)
             .finish_non_exhaustive()
     }
@@ -154,13 +123,12 @@ impl Default for Decoder {
 }
 
 impl Decoder {
-    /// A decoder that checks chunk CRCs, keeps no metadata, and refuses an image declaring
-    /// more than [`DEFAULT_MAX_DECOMPRESSED_SIZE`] bytes.
+    /// A decoder that checks chunk CRCs and refuses an image declaring more than
+    /// [`DEFAULT_MAX_DECOMPRESSED_SIZE`] bytes.
     pub fn new() -> Self {
         Self {
             inflater: Inflater::new(),
             checks: Checks::Crc,
-            keep: Keep::None,
             max_decompressed_size: Some(DEFAULT_MAX_DECOMPRESSED_SIZE),
         }
     }
@@ -168,25 +136,6 @@ impl Decoder {
     /// Selects which integrity checks to perform. See [`Checks`].
     pub fn checks(&mut self, checks: Checks) -> &mut Self {
         self.checks = checks;
-        self
-    }
-
-    /// Selects which ancillary chunks to retain. See [`Keep`].
-    ///
-    /// Retained chunks arrive in [`Info::metadata`], in file order, and are written back out
-    /// by [`Encoder`](crate::Encoder) if that `Info` is handed to it again.
-    ///
-    /// ```no_run
-    /// use psd_png::{Decoder, Keep};
-    ///
-    /// let mut decoder = Decoder::new();
-    /// decoder.keep(Keep::Only(vec![*b"apPd"]));
-    /// let image = decoder.decode(&std::fs::read("asset.png")?)?;
-    /// let payload = image.info.chunk(b"apPd");
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn keep(&mut self, keep: Keep) -> &mut Self {
-        self.keep = keep;
         self
     }
 
@@ -684,7 +633,7 @@ impl Decoder {
                     }
                     (None, None) => first_idat = Some(chunk.data),
                 },
-                _ => absorb(&mut info, &chunk, &self.keep, first_idat.is_none())?,
+                _ => absorb(&mut info, &chunk, first_idat.is_none())?,
             }
         }
 
@@ -721,15 +670,15 @@ impl Decoder {
     /// the image data. A header this accepts can still fail to decode. A file this rejects
     /// would never have decoded.
     ///
-    /// ```
-    /// # let png = psd_png::encode_rgba8(2, 2, &[0; 16])?;
+    /// ```no_run
+    /// # let png: Vec<u8> = Vec::new(); // pretend this came from a file
     /// let info = psd_png::Decoder::new().read_info(&png)?;
     /// assert_eq!((info.width, info.height), (2, 2));
     /// assert!(info.has_alpha());
     /// # Ok::<(), psd_png::Error>(())
     /// ```
     pub fn read_info(&self, png: &[u8]) -> Result<Info, Error> {
-        read_header(png, self.checks, &self.keep)
+        read_header(png, self.checks)
     }
 }
 
@@ -759,12 +708,7 @@ fn open(png: &[u8], checks: Checks) -> Result<(Info, ChunkReader<'_>), Error> {
 /// are dropped rather than recorded: the specification puts both ahead of the image data,
 /// and honouring a late one would mean the pixels depended on an ordering this decoder does
 /// not otherwise respect.
-fn absorb(
-    info: &mut Info,
-    chunk: &RawChunk<'_>,
-    keep: &Keep,
-    before_idat: bool,
-) -> Result<(), Error> {
+fn absorb(info: &mut Info, chunk: &RawChunk<'_>, before_idat: bool) -> Result<(), Error> {
     match &chunk.kind {
         b"PLTE" => {
             if chunk.data.len() > 256 * 3 || !chunk.data.len().is_multiple_of(3) {
@@ -788,9 +732,6 @@ fn absorb(
             // interpreted, so decoding cannot safely continue.
             return Err(Error::UnknownCriticalChunk { chunk: *kind });
         }
-        kind if keep.wants(*kind) && writable_kind(*kind) => {
-            info.metadata.push(Chunk { kind: *kind, data: chunk.data.to_vec() });
-        }
         _ => {}
     }
     Ok(())
@@ -802,7 +743,7 @@ fn absorb(
 /// Free of the [`Decoder`] so that the standalone [`read_info`] can call it without building
 /// one: a `Decoder` owns an [`Inflater`], and reading a header should not cost the twenty
 /// kilobytes of Huffman tables that decoding one does.
-fn read_header(png: &[u8], checks: Checks, keep: &Keep) -> Result<Info, Error> {
+fn read_header(png: &[u8], checks: Checks) -> Result<Info, Error> {
     let (mut info, mut chunks) = open(png, checks)?;
 
     while let Some(chunk) = chunks.next()? {
@@ -814,7 +755,7 @@ fn read_header(png: &[u8], checks: Checks, keep: &Keep) -> Result<Info, Error> {
                 return Ok(info);
             }
             b"IEND" => break,
-            _ => absorb(&mut info, &chunk, keep, true)?,
+            _ => absorb(&mut info, &chunk, true)?,
         }
     }
 
@@ -1133,5 +1074,5 @@ pub fn decode(png: &[u8]) -> Result<Image, Error> {
 ///
 /// See [`Decoder::read_info`].
 pub fn read_info(png: &[u8]) -> Result<Info, Error> {
-    read_header(png, Checks::Crc, &Keep::None)
+    read_header(png, Checks::Crc)
 }

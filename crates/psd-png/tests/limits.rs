@@ -6,10 +6,12 @@
 
 use psd_png::{BitDepth, ColorType, Decoder, Error, Info};
 
+mod common;
+
 fn valid_png() -> Vec<u8> {
     let info = Info::new(23, 17, ColorType::Rgba, BitDepth::Eight);
     let data: Vec<u8> = (0..info.output_size()).map(|i| (i * 7) as u8).collect();
-    psd_png::encode(&info, &data).unwrap()
+    common::build_png(&info, &data, 1)
 }
 
 /// The same file with `IHDR` rewritten to claim `width` by `height`, checksum repaired.
@@ -76,7 +78,7 @@ fn an_interlaced_image_is_bounded_too() {
     let mut info = Info::new(40, 30, ColorType::Rgba, BitDepth::Eight);
     info.interlacing = psd_png::Interlacing::Adam7;
     let data: Vec<u8> = (0..info.output_size()).map(|i| (i * 11) as u8).collect();
-    let png = psd_png::encode(&info, &data).unwrap();
+    let png = common::build_png(&info, &data, 1);
 
     let size = psd_png::read_info(&png).unwrap().decompressed_size();
     assert!(size > info.output_size(), "the passes carry their own filter bytes");

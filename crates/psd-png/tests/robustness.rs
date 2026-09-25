@@ -3,13 +3,16 @@
 //! A decoder is usually pointed at data from somewhere untrusted, so every corruption of a
 //! valid file has to come back as an `Err`.
 
-use psd_png::common::{BitDepth, Chunk, ColorType, Info};
+mod common;
+
+use common::build_png;
+use psd_png::common::{BitDepth, ColorType, Info};
 
 fn valid_png() -> Vec<u8> {
     let info = Info::new(23, 17, ColorType::Rgba, BitDepth::Eight);
     let data: Vec<u8> =
         (0..info.output_size()).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
-    psd_png::encode(&info, &data).unwrap()
+    build_png(&info, &data, 1)
 }
 
 #[test]
@@ -36,28 +39,6 @@ fn single_byte_corruption_is_rejected_or_decoded() {
             let _ = decoder.decode(&damaged);
         }
     }
-}
-
-#[test]
-fn corruption_of_a_file_carrying_metadata_is_rejected_or_decoded() {
-    // Retaining ancillary chunks copies attacker-controlled lengths and payloads, so the
-    // corruption sweep has to cover that path too.
-    let mut info = Info::new(23, 17, ColorType::Rgba, BitDepth::Eight);
-    info.metadata = vec![Chunk::new(*b"apPd", (0..=255u8).collect())];
-    let data: Vec<u8> =
-        (0..info.output_size()).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
-    let png = psd_png::encode(&info, &data).unwrap();
-
-    let mut decoder = psd_png::Decoder::new();
-    decoder.keep(psd_png::Keep::All);
-    for index in 0..png.len() {
-        for bit in [0u8, 3, 7] {
-            let mut damaged = png.clone();
-            damaged[index] ^= 1 << bit;
-            let _ = decoder.decode(&damaged);
-        }
-    }
-    assert_eq!(decoder.decode(&png).unwrap().info.metadata, info.metadata);
 }
 
 #[test]

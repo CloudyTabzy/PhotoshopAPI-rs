@@ -4,6 +4,8 @@
 
 use std::path::Path;
 
+mod common;
+
 use psd_png::common::{BitDepth, ColorType, Info, Interlacing};
 use psd_png::{Decoder, Row};
 
@@ -56,7 +58,7 @@ collect!(rows_rgb16, decode_to_rgb16);
 /// Builds a one-row PNG of the given colour type and depth.
 fn one_row_png(info: Info, data: &[u8]) -> Vec<u8> {
     assert_eq!(info.height, 1, "these fixtures are one row tall");
-    psd_png::encode(&info, data).unwrap()
+    common::build_png(&info, data, 1)
 }
 
 fn info(width: u32, color_type: ColorType, bit_depth: BitDepth) -> Info {
@@ -270,8 +272,8 @@ fn converted_streaming_passes_a_ceiling_the_image_exceeds() {
     let width = 512u32;
     let height = 512u32;
     let data = vec![0x5Au8; (width * height * 4) as usize];
-    let png = psd_png::encode(&Info::new(width, height, ColorType::Rgba, BitDepth::Eight), &data)
-        .unwrap();
+    let png =
+        common::build_png(&Info::new(width, height, ColorType::Rgba, BitDepth::Eight), &data, 1);
 
     let mut decoder = Decoder::new();
     decoder.max_decompressed_size(Some(512 << 10));
@@ -317,7 +319,7 @@ fn rows_already_in_the_requested_layout_pass_through() {
     ];
     for (info, stream) in cases {
         let data = bytes(info.output_size());
-        let png = psd_png::encode(&info, &data).unwrap();
+        let png = common::build_png(&info, &data, 1);
         assert_eq!(stream(&png), data, "{:?} {:?}", info.color_type, info.bit_depth);
     }
 }
@@ -327,7 +329,10 @@ fn rows_already_in_the_requested_layout_pass_through() {
 #[test]
 fn an_index_past_the_palette_fails_a_converting_decode() {
     // Two-bit indices 0, 1, 2, 3 against a two-entry palette: the last two are out of range.
-    let idat = psd_png::deflate::compress_zlib(&[0u8, 0b00_01_10_11]);
+    // The stream is a single stored block carrying one row of one byte: zlib header, the
+    // final-block byte, length and its one's complement, the filter byte and the row byte,
+    // then the Adler-32 of those two data bytes.
+    let idat = [0x78u8, 0x01, 0x01, 0x02, 0x00, 0xFD, 0xFF, 0x00, 0x1B, 0x00, 0x1D, 0x00, 0x1C];
 
     let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     let mut chunk = |kind: &[u8; 4], data: &[u8]| {

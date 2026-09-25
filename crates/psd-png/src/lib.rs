@@ -19,10 +19,10 @@
 //!
 //! This crate began as [png-spark](https://github.com/stephenberry/png-spark) 0.2.0 by
 //! Stephen Berry, which contributed the format coverage, the DEFLATE codec, the checksums,
-//! the scanline filters, and the encoder still inherited below. The PhotoshopAPI-rs port
-//! team added the fused reconstruction and the streaming decoder, and is removing the
-//! encoder, which the port has no use for. Both licences (`MIT OR Apache-2.0`) and the
-//! original copyright are retained unchanged.
+//! the scanline filters and the encoder. The PhotoshopAPI-rs port team added the fused
+//! reconstruction and the streaming decoder, and removed the encoder and the ancillary-
+//! chunk retention, which the port has no use for. Both licences (`MIT OR Apache-2.0`) and
+//! the original copyright are retained unchanged.
 //!
 //! # Decoding
 //!
@@ -109,60 +109,24 @@
 //! [`read_info`] parses the header and colour chunks and stops at the image data, for a
 //! caller that wants to decide something about a file before decoding it.
 //!
-//! # Inherited encoder
+//! # What the fork removed
 //!
-//! The encoder, the DEFLATE compressor under it, and [`FilterStrategy`] arrived with the
-//! fork and are on their way out: the port decodes PNG rasters and never writes one, so
-//! carrying an encoder would mean maintaining a capability nothing calls. They are still
-//! here, unchanged and still tested, so that this change is one of identity and nothing
-//! else; the removal is the next step, and the README says so where a reader will see it.
-//! The decode path does not touch any of it.
-//!
-//! # Carrying your own data in a PNG
-//!
-//! PNG stores everything in typed chunks, and a decoder must skip any *ancillary* chunk it
-//! does not recognise. An ancillary chunk of your own is therefore a place to keep
-//! application data inside the image file: arbitrary bytes, up to `i32::MAX` of them, with
-//! no escaping and no encoding, which every other PNG reader ignores.
-//!
-//! Decoding keeps nothing by default, because retaining a chunk means copying it and
-//! nothing the decoder returns depends on one. [`Decoder::keep`] asks for what a caller
-//! actually wants, and what is kept travels on [`Info`]:
-//!
-//! ```no_run
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let png = std::fs::read("asset.png")?;
-//! let image = psd_png::Decoder::new()
-//!     .keep(psd_png::Keep::Only(vec![*b"apPd"]))
-//!     .decode(&png)?;
-//! if let Some(asset_id) = image.info.chunk(b"apPd") {
-//!     // use the carried bytes
-//! }
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! [`Keep::All`] takes everything the file carries. A chunk that fails its CRC is dropped
-//! rather than returned. What is checked is the type bytes and the placement relative to
-//! `PLTE`, not what a *registered* type means: two `gAMA` chunks are the caller's mistake
-//! to avoid, and private types have no such rules to break.
-//!
-//! Ignoring a chunk is not the same as preserving it. A tool that rewrites the file may
-//! well drop it: libpng discards unknown chunks unless the application asks for them, and
-//! optimisers such as oxipng and pngcrush strip ancillary chunks by default. Data that
-//! must survive an arbitrary third-party tool does not belong here; data that must
-//! survive your own pipeline does.
+//! The encoder, the DEFLATE compressor under it, `FilterStrategy` and `WriteError` arrived
+//! with the fork and are gone: the port decodes PNG rasters and never writes one, so
+//! carrying an encoder would mean maintaining a capability nothing calls. The ancillary-
+//! chunk retention (`Keep`, `Info::metadata`) went with it — the decoder skips every chunk
+//! it does not read, which is what a conforming reader does anyway. The decode path never
+//! touched any of it, and the fork's decode suite is unchanged.
 //!
 //! # Layout
 //!
-//! The pieces are public in their own right, so the DEFLATE and checksum implementations can
+//! The pieces are public in their own right, so the zlib and checksum implementations can
 //! be used on their own:
 //!
 //! - [`inflate`] — zlib streams, independent of PNG; the streaming decoder's engine
 //! - [`crc32`] and [`adler32`] — the two checksums, with SIMD paths where they exist
-//! - [`filter`] — the five PNG scanline filters, forward and reverse
+//! - [`filter`] — the five PNG scanline filters, reversed
 //! - [`decoder`] and [`common`] — the PNG layer itself
-//! - [`deflate`] and [`encoder`] — inherited, on their way out (see above)
 
 #![warn(missing_docs, missing_debug_implementations)]
 
@@ -170,8 +134,6 @@ pub mod adler32;
 pub mod common;
 pub mod crc32;
 pub mod decoder;
-pub mod deflate;
-pub mod encoder;
 pub mod error;
 pub mod filter;
 pub mod huffman;
@@ -180,10 +142,7 @@ mod simd;
 pub mod tables;
 pub mod transform;
 
-pub use common::{BitDepth, Chunk, ColorType, Info, Interlacing};
-pub use decoder::{
-    Checks, DEFAULT_MAX_DECOMPRESSED_SIZE, Decoder, Image, Keep, Row, decode, read_info,
-};
-pub use encoder::{Encoder, FilterStrategy, encode, encode_rgb8, encode_rgba8};
-pub use error::{Error, WriteError};
+pub use common::{BitDepth, ColorType, Info, Interlacing};
+pub use decoder::{Checks, DEFAULT_MAX_DECOMPRESSED_SIZE, Decoder, Image, Row, decode, read_info};
+pub use error::Error;
 pub use filter::Filter;

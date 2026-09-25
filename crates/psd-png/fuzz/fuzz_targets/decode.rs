@@ -13,10 +13,9 @@ const MAX_DECOMPRESSED: usize = 16 << 20;
 fuzz_target!(|data: &[u8]| {
     let mut decoder = psd_png::Decoder::new();
     decoder
-        // Both are off or minimal by default, and both are code the fuzzer should reach:
-        // `Full` runs the Adler-32 verification, `All` runs chunk retention and copying.
+        // `Full` runs the Adler-32 verification as well as the chunk CRCs; both are code the
+        // fuzzer should reach.
         .checks(psd_png::Checks::Full)
-        .keep(psd_png::Keep::All)
         .max_decompressed_size(Some(MAX_DECOMPRESSED));
 
     let _ = decoder.decode(data);

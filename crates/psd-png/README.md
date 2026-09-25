@@ -122,13 +122,14 @@ Every PNG in the port's own fixture corpus (12 files, 512×512 and 200×108 RGBA
 fusion threshold, so the fused path is the one that runs in production rather than a benchmark
 shape.
 
-## Inherited encoder, being removed
+## What the fork removed
 
-The PNG **encoder** and the DEFLATE compressor under it are still present, unchanged and still
-tested — this repository's history is one of identity first, subtraction second. The port
-decodes rasters and never writes one, so the encoder is not part of the plan: it is removed in
-the next step, and the README, crate docs and API are written as though it is already gone.
-Until then it carries no support commitment.
+The PNG **encoder** and the DEFLATE compressor under it came with the fork and are gone, along
+with the ancillary-chunk retention (`Keep`, `Info::metadata`). The port decodes rasters and
+never writes one, and every retained chunk is a copy of attacker-controlled bytes, so the
+crate now carries only what a reader needs. The decode suite — the corpus sweep, the zlib
+vectors, the streaming bounds — is unchanged, and its fixtures are built by hand rather than
+by the encoder that used to sit opposite it.
 
 ## Design notes
 

@@ -4,11 +4,12 @@ How this decoder is put together, and why each piece is shaped the way it is.
 
 **Provenance.** Written by the PhotoshopAPI-rs port team; not an upstream png-spark document.
 This crate began as png-spark 0.2.0 by Stephen Berry (`MIT OR Apache-2.0`, copyright
-retained), which contributed the format coverage, the DEFLATE codec, the checksums, the
-scanline filters, and an encoder that is retained for now and scheduled for removal. The port
-team added the fused reconstruction, the streaming decoder, the fused conversion, the SIMD
-filter kernel, and the size accounting described here. Measurements for every claim below
-are in [`benchmarks.md`](benchmarks.md).
+retained), which contributed the format coverage, the DEFLATE codec, the checksums and the
+scanline filters. The port team added the fused reconstruction, the streaming decoder, the
+fused conversion, the SIMD filter kernel and the size accounting described here, and removed
+the encoder, the compressor under it and the ancillary-chunk retention, none of which the
+decode path ever touched. Measurements for every claim below are in
+[`benchmarks.md`](benchmarks.md).
 
 **Status.** Implemented and measured. The crate is unpublished and vendored into the
 PhotoshopAPI-rs workspace as `crates/psd-png` when smart-object PNG decode lands there; that
@@ -28,8 +29,8 @@ parse header ──► allocate ──► inflate ──► reconstruct ──�
 The inherited decoder did stages 3 and 4 as **two separate passes over the whole image**:
 inflate wrote N bytes, then unfilter read N and wrote N. For a 4K RGBA8 image that is roughly
 110 MB of memory traffic where 74 MB would do, and the second pass read rows long after they
-had left cache. The encoder in the same crate already streamed in bands, so the read side was
-the asymmetric half.
+had left cache. The encoder in the same crate already streamed in bands (since removed), so
+the read side was the asymmetric half.
 
 Everything below follows from closing that asymmetry.
 
