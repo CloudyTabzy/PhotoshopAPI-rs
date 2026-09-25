@@ -1030,6 +1030,14 @@ fn decode_source_raster<T: BitDepth>(bytes: &[u8]) -> Result<DecodedSource<T>> {
     }
     #[cfg(feature = "image")]
     {
+        // PNG goes to the vendored decoder, which streams rows into the planar
+        // channels instead of materialising the whole decoded image, so the
+        // per-format whole-image preflight below does not apply to it — the
+        // streaming path caps the planar output it actually builds
+        // (`checked_raster_sample_count`) and the decoder's bounded stage.
+        if bytes.starts_with(&psd_png::common::SIGNATURE) {
+            return decode_raster_png_streaming(bytes);
+        }
         decode_raster_image(bytes)
     }
     #[cfg(not(feature = "image"))]
@@ -1307,6 +1315,132 @@ fn decode_raster_image<T: BitDepth>(bytes: &[u8]) -> Result<DecodedSource<T>> {
         }
     };
     Ok(DecodedSource { raster, file_type })
+}
+
+/// The production PNG raster path: the destination channels are allocated once and each
+/// reconstructed row is de-interleaved straight into them, so no interleaved image ever
+/// exists. Non-interlaced RGBA sources — the corpus's own shape and, in practice,
+/// Photoshop-placed PNGs — take native rows: `decode_to` hands back the file's own
+/// samples, each widened once through `BitDepth::widen_eight` / `widen_sixteen`, the cheap
+/// exact rules pinned exhaustively in `bitdepth.rs`. For a `u8` document from an 8-bit
+/// source that is four plain copies per pixel; for 16-bit it is four big-endian reads.
+/// Anything else (gray, palette, RGB, interlaced) keeps the rgba16 route below, whose
+/// grayscale/palette/tRNS semantics the differential tests pin.
+///
+/// Unlike the `image`-crate path, no whole-image preflight runs: the cap applies to the
+/// planar output actually built (`checked_raster_sample_count`, 4 samples of `T` per
+/// pixel) and to the decoder's bounded stage.
+#[cfg(feature = "image")]
+fn decode_raster_png_streaming<T: BitDepth>(bytes: &[u8]) -> Result<DecodedSource<T>> {
+    let info =
+        psd_png::read_info(bytes).map_err(|error| PsdError::ImageDecode(error.to_string()))?;
+    let sample_count = checked_raster_sample_count::<T>(info.width, info.height)?;
+    let mut channels = Vec::new();
+    for _ in 0..4 {
+        let mut channel = Vec::new();
+        channel.try_reserve_exact(sample_count).map_err(|error| {
+            PsdError::ImageDecode(format!("could not allocate decoded channel: {error}"))
+        })?;
+        channels.push(channel);
+    }
+    let [mut red, mut green, mut blue, mut alpha] = <[Vec<T>; 4]>::try_from(channels)
+        .map_err(|_| PsdError::ImageDecode("expected four decoded channels".to_owned()))?;
+
+    match (info.color_type, info.bit_depth, info.interlacing) {
+        (psd_png::ColorType::Rgba, psd_png::BitDepth::Eight, psd_png::Interlacing::None) => {
+            // Native RGBA8: four bytes per pixel, the file's own samples.
+            psd_png::Decoder::new()
+                .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
+                .decode_to(bytes, |row| {
+                    for pixel in row.bytes.chunks_exact(4) {
+                        red.push(T::widen_eight(pixel[0]));
+                        green.push(T::widen_eight(pixel[1]));
+                        blue.push(T::widen_eight(pixel[2]));
+                        alpha.push(T::widen_eight(pixel[3]));
+                    }
+                    Ok::<(), psd_png::Error>(())
+                })
+                .map_err(|error| PsdError::ImageDecode(error.to_string()))?;
+        }
+        (psd_png::ColorType::Rgba, psd_png::BitDepth::Sixteen, psd_png::Interlacing::None) => {
+            // Native RGBA16: four big-endian samples per pixel.
+            psd_png::Decoder::new()
+                .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
+                .decode_to(bytes, |row| {
+                    for pixel in row.bytes.chunks_exact(8) {
+                        let sample =
+                            |offset: usize| u16::from_be_bytes([pixel[offset], pixel[offset + 1]]);
+                        red.push(T::widen_sixteen(sample(0)));
+                        green.push(T::widen_sixteen(sample(2)));
+                        blue.push(T::widen_sixteen(sample(4)));
+                        alpha.push(T::widen_sixteen(sample(6)));
+                    }
+                    Ok::<(), psd_png::Error>(())
+                })
+                .map_err(|error| PsdError::ImageDecode(error.to_string()))?;
+        }
+        // The pre-N1 route, kept for every RGBA shape the native legs do not cover:
+        // gray (incl. tRNS alpha), palette, RGB, sub-8-bit depths, interlaced. Its
+        // grayscale-as-neutral-RGB and tRNS semantics are pinned by the differential
+        // tests and must not regress.
+        _ => stream_rgba16_rows_into::<T>(bytes, &mut red, &mut green, &mut blue, &mut alpha)?,
+    }
+
+    build_png_planar(info.width, info.height, red, green, blue, alpha)
+}
+
+/// The shared rgba16 body: asks psd-png for converted 16-bit RGBA rows and widens each
+/// sample through `T::widen_sixteen`, which for a `u8` destination applies the port's
+/// narrowing rule (`from_f32`, NOT the high byte — see the 51 200 counter-example).
+#[cfg(feature = "image")]
+fn stream_rgba16_rows_into<T: BitDepth>(
+    bytes: &[u8],
+    red: &mut Vec<T>,
+    green: &mut Vec<T>,
+    blue: &mut Vec<T>,
+    alpha: &mut Vec<T>,
+) -> Result<()> {
+    psd_png::Decoder::new()
+        .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
+        .decode_to_rgba16(bytes, |row| {
+            // A 16-bit converted row is big-endian bytes, four samples per pixel.
+            for pixel in row.bytes.chunks_exact(8) {
+                let wide = |offset: usize| u16::from_be_bytes([pixel[offset], pixel[offset + 1]]);
+                red.push(T::widen_sixteen(wide(0)));
+                green.push(T::widen_sixteen(wide(2)));
+                blue.push(T::widen_sixteen(wide(4)));
+                alpha.push(T::widen_sixteen(wide(6)));
+            }
+            Ok::<(), psd_png::Error>(())
+        })
+        .map_err(|error| PsdError::ImageDecode(error.to_string()))?;
+    Ok(())
+}
+
+/// Stacks four filled planar channels into the raster a `DecodedSource` carries.
+#[cfg(feature = "image")]
+fn build_png_planar<T: BitDepth>(
+    width: u32,
+    height: u32,
+    red: Vec<T>,
+    green: Vec<T>,
+    blue: Vec<T>,
+    alpha: Vec<T>,
+) -> Result<DecodedSource<T>> {
+    let raster = raster_from_planar(
+        width as usize,
+        height as usize,
+        vec![
+            (ChannelKey::color(0), red),
+            (ChannelKey::color(1), green),
+            (ChannelKey::color(2), blue),
+            (ChannelKey::ALPHA, alpha),
+        ],
+    )?;
+    Ok(DecodedSource {
+        raster,
+        file_type: *b"png ",
+    })
 }
 
 #[cfg(feature = "image")]
@@ -2044,16 +2178,22 @@ mod tests {
 
     #[cfg(feature = "image")]
     fn assert_png_parity<T: BitDepth + std::fmt::Debug>(bytes: &[u8], what: &str) {
-        let image_crate = decode_source_raster::<T>(bytes)
+        // Since the production switch, `decode_source_raster` routes PNG through psd-png,
+        // so the incumbent reference is `decode_raster_image` — the same `image`-crate
+        // body production still uses for JPEG, called here with PNG bytes.
+        let image_crate = decode_raster_image::<T>(bytes)
             .unwrap_or_else(|error| panic!("{what}: image-crate path failed: {error}"));
-        let psd_png = decode_raster_png_psd_png::<T>(bytes)
-            .unwrap_or_else(|error| panic!("{what}: psd-png path failed: {error}"));
+        let production = decode_source_raster::<T>(bytes)
+            .unwrap_or_else(|error| panic!("{what}: production path failed: {error}"));
         assert_eq!(
             image_crate.file_type, *b"png ",
             "{what}: unexpected file type"
         );
-        assert_eq!(psd_png.file_type, *b"png ", "{what}: unexpected file type");
-        assert_same_raster(&image_crate.raster, &psd_png.raster, what);
+        assert_eq!(
+            production.file_type, *b"png ",
+            "{what}: unexpected file type"
+        );
+        assert_same_raster(&image_crate.raster, &production.raster, what);
     }
 
     #[cfg(feature = "image")]
@@ -2100,6 +2240,45 @@ mod tests {
             assert_png_parity::<u16>(&bytes, &format!("{what} as u16"));
             assert_png_parity::<f32>(&bytes, &format!("{what} as f32"));
         }
+    }
+
+    /// The production route, pinned by a behaviour the two decoders differ on: psd-png
+    /// validates chunk CRCs, and its failure text ("CRC mismatch in `X` chunk") is not the
+    /// png crate's phrasing. So a corrupted CRC both routes apart, deterministically —
+    /// no timing, no allocator state that parallel tests can pollute. The corpus parity
+    /// gate proves the bytes are the same; this proves the bytes come from psd-png.
+    /// The contrast assertion keeps the pin honest: if the incumbent's message ever
+    /// matched psd-png's phrasing, this test could no longer tell the routes apart.
+    #[cfg(feature = "image")]
+    #[test]
+    fn png_smart_objects_route_to_psd_png_in_production() {
+        let files = corpus_pngs();
+        let path = files
+            .first()
+            .expect("no PNG fixtures found: the route pin would pass without comparing anything");
+        let mut bytes = read_source_file(path).unwrap();
+        // The IHDR chunk's CRC: eight bytes of signature, an eight-byte chunk header, a
+        // thirteen-byte IHDR payload, then the four CRC bytes.
+        let crc_offset = 8 + 8 + 13;
+        bytes[crc_offset] ^= 0xFF;
+
+        let production_error = decode_source_raster::<u8>(&bytes)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unexpectedly decoded OK".to_owned());
+        assert!(
+            production_error.contains("CRC mismatch in"),
+            "production error is not psd-png's wording: {production_error}"
+        );
+
+        let incumbent_error = decode_raster_image::<u8>(&bytes)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unexpectedly decoded OK".to_owned());
+        assert!(
+            !incumbent_error.contains("CRC mismatch in"),
+            "the incumbent's message is not distinguishable from psd-png's: {incumbent_error}"
+        );
     }
 
     /// Greyscale is the case the port deliberately treats differently from upstream: it is
@@ -2192,10 +2371,10 @@ mod tests {
             )
         }
 
-        /// Routes through the streaming helper (the production shape) and asserts bit
-        /// parity against the `image` crate at every destination depth.
+        /// Routes through the streaming helper (the production PNG body) and asserts bit
+        /// parity against the `image`-crate reference at every destination depth.
         fn assert_streaming_parity<T: BitDepth + std::fmt::Debug>(bytes: &[u8], what: &str) {
-            let image_crate = decode_source_raster::<T>(bytes)
+            let image_crate = decode_raster_image::<T>(bytes)
                 .unwrap_or_else(|error| panic!("{what}: image-crate path failed: {error}"));
             let streaming = decode_raster_png_streaming::<T>(bytes)
                 .unwrap_or_else(|error| panic!("{what}: psd-png streaming failed: {error}"));
@@ -2262,10 +2441,13 @@ mod tests {
     #[cfg(feature = "image")]
     mod allocation {
         use std::alloc::{GlobalAlloc, Layout, System};
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Mutex;
 
         pub static LARGEST: AtomicUsize = AtomicUsize::new(0);
         pub static TOTAL: AtomicUsize = AtomicUsize::new(0);
+        static RECORDING: AtomicBool = AtomicBool::new(false);
+        static MEASURE_LOCK: Mutex<()> = Mutex::new(());
 
         pub struct Counting;
 
@@ -2293,15 +2475,28 @@ mod tests {
         }
 
         fn record(size: usize) {
+            // Only the window's own thread's allocations count: the harness runs other
+            // tests' bodies in parallel, and their buffers (whole decoded images, Vec
+            // growth) would otherwise inflate LARGEST inside somebody else's window.
+            if !RECORDING.load(Ordering::Relaxed) {
+                return;
+            }
             TOTAL.fetch_add(size, Ordering::Relaxed);
             LARGEST.fetch_max(size, Ordering::Relaxed);
         }
 
         /// Runs `body` with the counters open, returning its result alongside what it allocated.
+        /// Serialised so two measuring windows never overlap; non-measuring tests' allocations
+        /// are excluded by the gate above.
         pub fn measure<R>(body: impl FnOnce() -> R) -> (R, usize, usize) {
+            let _guard = MEASURE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             LARGEST.store(0, Ordering::Relaxed);
             TOTAL.store(0, Ordering::Relaxed);
+            RECORDING.store(true, Ordering::Relaxed);
             let result = body();
+            RECORDING.store(false, Ordering::Relaxed);
             (
                 result,
                 LARGEST.load(Ordering::Relaxed),
@@ -2314,80 +2509,11 @@ mod tests {
     #[global_allocator]
     static ALLOCATION_COUNTER: allocation::Counting = allocation::Counting;
 
-    /// The shape the production switch would use: the destination channels are allocated once
-    /// and each reconstructed row is de-interleaved straight into them, so no interleaved
-    /// image ever exists. Non-interlaced RGBA sources — the corpus's own shape and, in
-    /// practice, Photoshop-placed PNGs — take native rows: `decode_to` hands back the
-    /// file's own samples, each widened once through `BitDepth::widen_eight` /
-    /// `widen_sixteen`, the cheap exact rules pinned exhaustively in `bitdepth.rs`. For a
-    /// `u8` document from an 8-bit source that is four plain copies per pixel; for 16-bit
-    /// it is four big-endian reads. Anything else (gray, palette, RGB, interlaced) keeps
-    /// the rgba16 route below, whose grayscale/palette/tRNS semantics the differential
-    /// test pins.
-    #[cfg(feature = "image")]
-    fn decode_raster_png_streaming<T: BitDepth>(bytes: &[u8]) -> Result<DecodedSource<T>> {
-        let info =
-            psd_png::read_info(bytes).map_err(|error| PsdError::ImageDecode(error.to_string()))?;
-        let sample_count = checked_raster_sample_count::<T>(info.width, info.height)?;
-        let mut channels = Vec::new();
-        for _ in 0..4 {
-            let mut channel = Vec::new();
-            channel.try_reserve_exact(sample_count).map_err(|error| {
-                PsdError::ImageDecode(format!("could not allocate decoded channel: {error}"))
-            })?;
-            channels.push(channel);
-        }
-        let [mut red, mut green, mut blue, mut alpha] = <[Vec<T>; 4]>::try_from(channels)
-            .map_err(|_| PsdError::ImageDecode("expected four decoded channels".to_owned()))?;
-
-        match (info.color_type, info.bit_depth, info.interlacing) {
-            (psd_png::ColorType::Rgba, psd_png::BitDepth::Eight, psd_png::Interlacing::None) => {
-                // Native RGBA8: four bytes per pixel, the file's own samples.
-                psd_png::Decoder::new()
-                    .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
-                    .decode_to(bytes, |row| {
-                        for pixel in row.bytes.chunks_exact(4) {
-                            red.push(T::widen_eight(pixel[0]));
-                            green.push(T::widen_eight(pixel[1]));
-                            blue.push(T::widen_eight(pixel[2]));
-                            alpha.push(T::widen_eight(pixel[3]));
-                        }
-                        Ok::<(), psd_png::Error>(())
-                    })
-                    .map_err(|error| PsdError::ImageDecode(error.to_string()))?;
-            }
-            (psd_png::ColorType::Rgba, psd_png::BitDepth::Sixteen, psd_png::Interlacing::None) => {
-                // Native RGBA16: four big-endian samples per pixel.
-                psd_png::Decoder::new()
-                    .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
-                    .decode_to(bytes, |row| {
-                        for pixel in row.bytes.chunks_exact(8) {
-                            let sample = |offset: usize| {
-                                u16::from_be_bytes([pixel[offset], pixel[offset + 1]])
-                            };
-                            red.push(T::widen_sixteen(sample(0)));
-                            green.push(T::widen_sixteen(sample(2)));
-                            blue.push(T::widen_sixteen(sample(4)));
-                            alpha.push(T::widen_sixteen(sample(6)));
-                        }
-                        Ok::<(), psd_png::Error>(())
-                    })
-                    .map_err(|error| PsdError::ImageDecode(error.to_string()))?;
-            }
-            // The pre-N1 route, kept for every RGBA shape the native legs do not cover:
-            // gray (incl. tRNS alpha), palette, RGB, sub-8-bit depths, interlaced. Its
-            // grayscale-as-neutral-RGB and tRNS semantics are pinned by the differential
-            // tests and must not regress.
-            _ => stream_rgba16_rows_into::<T>(bytes, &mut red, &mut green, &mut blue, &mut alpha)?,
-        }
-
-        build_png_planar(info.width, info.height, red, green, blue, alpha)
-    }
-
-    /// The rgba16 fallback route that `decode_raster_png_streaming` used before native
-    /// rows: every source is converted to 16-bit RGBA and narrowed through `from_f32`.
-    /// Kept as a benchmark arm and as the dispatch's fallback for the shapes native rows
-    /// do not cover.
+    /// The pre-N1 rgba16 route as its own benchmark arm: every source is converted to
+    /// 16-bit RGBA and narrowed through `from_f32`. Production now routes non-interlaced
+    /// RGBA to native rows in `decode_raster_png_streaming`; this arm measures what the
+    /// conversion step costs, and the shapes production's fallback covers still flow
+    /// through the shared body in production.
     #[cfg(feature = "image")]
     fn decode_raster_png_streaming_rgba16<T: BitDepth>(bytes: &[u8]) -> Result<DecodedSource<T>> {
         psd_png::read_info(bytes)
@@ -2413,74 +2539,20 @@ mod tests {
             })
     }
 
-    /// The shared rgba16 body: asks psd-png for converted 16-bit RGBA rows and widens each
-    /// sample through `T::widen_sixteen`, which for a `u8` destination applies the port's
-    /// narrowing rule (`from_f32`, NOT the high byte — see the 51 200 counter-example).
-    #[cfg(feature = "image")]
-    fn stream_rgba16_rows_into<T: BitDepth>(
-        bytes: &[u8],
-        red: &mut Vec<T>,
-        green: &mut Vec<T>,
-        blue: &mut Vec<T>,
-        alpha: &mut Vec<T>,
-    ) -> Result<()> {
-        psd_png::Decoder::new()
-            .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
-            .decode_to_rgba16(bytes, |row| {
-                // A 16-bit converted row is big-endian bytes, four samples per pixel.
-                for pixel in row.bytes.chunks_exact(8) {
-                    let wide =
-                        |offset: usize| u16::from_be_bytes([pixel[offset], pixel[offset + 1]]);
-                    red.push(T::widen_sixteen(wide(0)));
-                    green.push(T::widen_sixteen(wide(2)));
-                    blue.push(T::widen_sixteen(wide(4)));
-                    alpha.push(T::widen_sixteen(wide(6)));
-                }
-                Ok::<(), psd_png::Error>(())
-            })
-            .map_err(|error| PsdError::ImageDecode(error.to_string()))?;
-        Ok(())
-    }
-
-    /// Stacks four filled planar channels into the raster a `DecodedSource` carries.
-    #[cfg(feature = "image")]
-    fn build_png_planar<T: BitDepth>(
-        width: u32,
-        height: u32,
-        red: Vec<T>,
-        green: Vec<T>,
-        blue: Vec<T>,
-        alpha: Vec<T>,
-    ) -> Result<DecodedSource<T>> {
-        let raster = raster_from_planar(
-            width as usize,
-            height as usize,
-            vec![
-                (ChannelKey::color(0), red),
-                (ChannelKey::color(1), green),
-                (ChannelKey::color(2), blue),
-                (ChannelKey::ALPHA, alpha),
-            ],
-        )?;
-        Ok(DecodedSource {
-            raster,
-            file_type: *b"png ",
-        })
-    }
-
     /// V2: what the two decoders cost in the port's own pipeline, on the port's own corpus.
     ///
-    /// Five arms, because three questions are being asked at once. `image` against `psd-png`
-    /// through the parity helper answers whether the decoder itself is faster, with the
-    /// pipeline shape held fixed on both sides. The two streaming arms answer the next
-    /// question: what the production shape costs with native rows versus the pre-N1
-    /// rgba16 route, i.e. how much the conversion step is worth. The final arm re-runs
-    /// `image` as a control, so the day's noise floor is measured rather than assumed —
-    /// this machine throttles, and several of these deltas are small enough that an
-    /// unmeasured floor would be meaningless.
+    /// Five arms. The incumbent arm is the `image`-crate body production still uses for
+    /// JPEG, called with PNG bytes — what `decode_source_raster` did before the switch.
+    /// The production arm is the real read path, which now routes PNG through psd-png's
+    /// native-rows streaming. The parity arm holds the pipeline shape fixed on psd-png's
+    /// converted route so the decoder itself stays attributable; the r16 arm measures the
+    /// conversion step on top. The final arm re-runs the incumbent as a control, so the
+    /// day's noise floor is measured rather than assumed — this machine throttles, and
+    /// several of these deltas are small enough that an unmeasured floor would be
+    /// meaningless.
     ///
     /// Memory is reported as the largest single allocation during a decode, which is the
-    /// number that separates the two designs: the `image` crate allocates the whole decoded
+    /// number that separates the two designs: the incumbent allocates the whole decoded
     /// image in one buffer, a streaming decode allocates a bounded stage. It is not peak
     /// resident memory and is not labelled as such.
     ///
@@ -2507,11 +2579,11 @@ mod tests {
 
         type Arm = fn(&[u8]) -> Result<DecodedSource<u8>>;
         let arms: [Arm; ARMS] = [
+            decode_raster_image::<u8>,
             decode_source_raster::<u8>,
             decode_raster_png_psd_png::<u8>,
-            decode_raster_png_streaming::<u8>,
             decode_raster_png_streaming_rgba16::<u8>,
-            decode_source_raster::<u8>, // control: the same binary as arm 0
+            decode_raster_image::<u8>, // control: the same binary as arm 0
         ];
 
         for (_, bytes) in &files {
@@ -2543,50 +2615,54 @@ mod tests {
         }
 
         println!(
-            "\n{:<32} {:>9} {:>9} {:>10} {:>11} {:>9} {:>9} {:>8} {:>17}",
+            "\n{:<32} {:>9} {:>11} {:>9} {:>9} {:>9} {:>9} {:>7} {:>8} {:>17}",
             "fixture",
-            "image",
+            "incumbent",
+            "production",
             "parity",
-            "stream nat",
-            "stream r16",
-            "nat d",
+            "r16",
+            "prod d",
+            "parity d",
             "r16 d",
             "ctrl d",
-            "largest MiB img/psd"
+            "largest MiB inc/prod"
         );
         let mut totals = [0.0f64; ARMS];
         for (index, (name, _)) in files.iter().enumerate() {
             let row = best[index];
-            let (image, parity, native, legacy, control) = (row[0], row[1], row[2], row[3], row[4]);
-            let percent = |value: f64| (value - image) / image * 100.0;
+            let (incumbent, production, parity, legacy, control) =
+                (row[0], row[1], row[2], row[3], row[4]);
+            let percent = |value: f64| (value - incumbent) / incumbent * 100.0;
             println!(
-                "{:<32} {:>9.3} {:>9.3} {:>10.3} {:>11.3} {:>8.1}% {:>8.1}% {:>7.1}% {:>7.2}/{:.2}",
+                "{:<32} {:>9.3} {:>11.3} {:>9.3} {:>9.3} {:>8.1}% {:>8.1}% {:>7.1}% {:>7.1}% {:>7.2}/{:.2}",
                 name,
-                image,
+                incumbent,
+                production,
                 parity,
-                native,
                 legacy,
-                percent(native),
+                percent(production),
+                percent(parity),
                 percent(legacy),
                 percent(control),
                 largest[index][0] as f64 / (1024.0 * 1024.0),
-                largest[index][2] as f64 / (1024.0 * 1024.0),
+                largest[index][1] as f64 / (1024.0 * 1024.0),
             );
             for (slot, value) in row.iter().enumerate() {
                 totals[slot] += value;
             }
         }
-        let (image, parity, native, legacy, control) =
+        let (incumbent, production, parity, legacy, control) =
             (totals[0], totals[1], totals[2], totals[3], totals[4]);
-        let percent = |value: f64| (value - image) / image * 100.0;
+        let percent = |value: f64| (value - incumbent) / incumbent * 100.0;
         println!(
-            "{:<32} {:>9.3} {:>9.3} {:>10.3} {:>11.3} {:>8.1}% {:>8.1}% {:>7.1}%",
+            "{:<32} {:>9.3} {:>11.3} {:>9.3} {:>9.3} {:>8.1}% {:>8.1}% {:>7.1}% {:>7.1}%",
             "TOTAL",
-            image,
+            incumbent,
+            production,
             parity,
-            native,
             legacy,
-            percent(native),
+            percent(production),
+            percent(parity),
             percent(legacy),
             percent(control),
         );

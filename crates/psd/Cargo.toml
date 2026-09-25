@@ -7,7 +7,7 @@ version.workspace = true
 
 [features]
 default = ["image"]
-image = ["dep:image"]
+image = ["dep:image", "dep:psd-png"]
 # Forwards `psd-core/serde`: `Serialize` views of descriptors and EngineData.
 serde = ["psd-core/serde"]
 
@@ -20,10 +20,5 @@ rayon.workspace = true
 memmap2.workspace = true
 nalgebra.workspace = true
 image = { workspace = true, optional = true }
+psd-png = { workspace = true, optional = true }
 uuid.workspace = true
-
-# `psd-png` is not a production dependency yet. It is here so the differential test can
-# prove it agrees with the `image`-crate path byte for byte before the smart-object decoder
-# is switched over; see `smart_object.rs`'s module tests.
-[dev-dependencies]
-psd-png.workspace = true
