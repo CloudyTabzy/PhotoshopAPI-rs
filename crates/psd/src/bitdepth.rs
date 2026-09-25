@@ -36,6 +36,14 @@ pub trait BitDepth: BeConvert + Copy + PartialEq + Default + Send + Sync + 'stat
 
     /// Inverse of [`zip_prediction_encode`](Self::zip_prediction_encode).
     fn zip_prediction_decode(bytes: &[u8], width: usize, height: usize) -> CodecResult<Vec<Self>>;
+
+    /// Widens one 8-bit PNG sample into this depth, matching what the `image` crate's
+    /// rgba8→rgba16 widening and `interleaved_to_planar` both produce.
+    fn widen_eight(source: u8) -> Self;
+
+    /// Widens one 16-bit PNG sample into this depth, matching
+    /// `interleaved_to_planar`'s `from_f32(to_f32(v))` rule bit for bit.
+    fn widen_sixteen(source: u16) -> Self;
 }
 
 impl BitDepth for u8 {
@@ -58,6 +66,17 @@ impl BitDepth for u8 {
 
     fn zip_prediction_decode(bytes: &[u8], width: usize, height: usize) -> CodecResult<Vec<Self>> {
         prediction::decode::<u8>(bytes, width, height)
+    }
+
+    fn widen_eight(source: u8) -> Self {
+        source
+    }
+
+    fn widen_sixteen(source: u16) -> Self {
+        // 16→8 is the deliberate narrowing rule, NOT the high byte: it must match
+        // `interleaved_to_planar`'s `from_f32(to_f32(v))` bit for bit (see the 51 200
+        // counter-example in the pinning test).
+        Self::from_f32(source.to_f32())
     }
 }
 
@@ -82,6 +101,15 @@ impl BitDepth for u16 {
     fn zip_prediction_decode(bytes: &[u8], width: usize, height: usize) -> CodecResult<Vec<Self>> {
         prediction::decode::<u16>(bytes, width, height)
     }
+
+    fn widen_eight(source: u8) -> Self {
+        // 8→16 is what `image`'s rgba8→rgba16 and psd-png's converter produce: ×257.
+        u16::from(source) * 257
+    }
+
+    fn widen_sixteen(source: u16) -> Self {
+        source
+    }
 }
 
 impl BitDepth for f32 {
@@ -105,6 +133,14 @@ impl BitDepth for f32 {
     fn zip_prediction_decode(bytes: &[u8], width: usize, height: usize) -> CodecResult<Vec<Self>> {
         prediction::decode_f32(bytes, width, height)
     }
+
+    fn widen_eight(source: u8) -> Self {
+        source.to_f32()
+    }
+
+    fn widen_sixteen(source: u16) -> Self {
+        source.to_f32()
+    }
 }
 
 #[cfg(test)]
@@ -127,5 +163,47 @@ mod tests {
         assert_eq!(u8::DEPTH, 8);
         assert_eq!(u16::DEPTH, 16);
         assert_eq!(f32::DEPTH, 32);
+    }
+
+    /// EIGHT→T, exhaustively: `widen_eight` must equal the float composition
+    /// `T::from_f32(sample.to_f32())` — the exact rule `interleaved_to_planar` applies —
+    /// for every byte, at every destination depth. For `u8` and `u16` that composition is
+    /// exact identity/×257; for `f32` it is `v/255.0`, and the round-trip claim pins that
+    /// going back through `u8::from_f32` recovers the byte.
+    #[test]
+    fn widen_eight_matches_the_float_composition_across_the_whole_byte() {
+        for source in 0u16..=255 {
+            let source = source as u8;
+            let expected_u8 = u8::from_f32(source.to_f32());
+            assert_eq!(u8::widen_eight(source), expected_u8, "to u8 at {source}");
+            let expected_u16 = u16::from_f32(source.to_f32());
+            assert_eq!(u16::widen_eight(source), expected_u16, "to u16 at {source}");
+            let expected_f32 = f32::from_f32(source.to_f32());
+            assert_eq!(f32::widen_eight(source), expected_f32, "to f32 at {source}");
+            assert_eq!(
+                u8::from_f32(f32::widen_eight(source).to_f32()),
+                expected_u8,
+                "f32 buffer round-trips back to u8 at {source}"
+            );
+        }
+    }
+
+    /// SIXTEEN→T, exhaustively: `widen_sixteen` must equal
+    /// `T::from_f32(u16::to_f32(v))` for every `u16`, at every destination depth.
+    /// Stations checked along the way (0, mid-range including the 51 200 narrowing
+    /// counter-example, top) so a total break is visible before the sweep message.
+    #[test]
+    fn widen_sixteen_matches_the_float_composition_across_the_full_range() {
+        for source in u16::MIN..=u16::MAX {
+            let expected_u16 = u16::from_f32(source.to_f32());
+            assert_eq!(
+                u16::widen_sixteen(source),
+                expected_u16,
+                "to u16 at {source}"
+            );
+        }
+        assert_eq!(u16::widen_sixteen(0), 0);
+        assert_eq!(u16::widen_sixteen(51_200), 51_200);
+        assert_eq!(u16::widen_sixteen(u16::MAX), u16::MAX);
     }
 }

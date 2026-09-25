@@ -1657,6 +1657,11 @@ mod tests {
         LayerAndMaskInformation,
     };
 
+    // The widening rules the native-rows dispatch uses live on `BitDepth` itself
+    // (`widen_eight` / `widen_sixteen`), pinned exhaustively in `bitdepth.rs`.
+    // The tests here pin the *route*: which dispatch leg a source takes and that the
+    // leg's output equals what `interleaved_to_planar` would have produced.
+
     fn photoshop_source(
         version: Version,
         depth: CoreBitDepth,
@@ -1687,6 +1692,29 @@ mod tests {
         bytes
     }
 
+    /// PIN: 16→8 narrowing must stay decided by `interleaved_to_planar` through
+    /// `from_f32(to_f32(v))`, because the port's rule (round(v / 257), arrived at as
+    /// `v·255/65535`) and the high-byte rule (v >> 8) part company: at 51 200 they give
+    /// 199 and 200. If anyone short-circuits that channel through the high byte, the
+    /// exhaustive sweep below shows the two rules really do disagree — so the pin has
+    /// teeth rather than being vacuously satisfiable.
+    #[cfg(feature = "image")]
+    #[test]
+    fn sixteen_to_eight_narrowing_stays_the_ports_rule_not_the_high_byte() {
+        // The canonical disagreement: round(51 200 / 257) = 199, high byte = 200.
+        assert_eq!(u8::from_f32(51_200u16.to_f32()), 199);
+        assert_ne!(u8::from_f32(51_200u16.to_f32()), (51_200u16 >> 8) as u8);
+        // And a value where the two rules agree, so the pin isn't readable reversed.
+        assert_eq!(u8::from_f32(65_535u16.to_f32()), (65_535u16 >> 8) as u8);
+        // How often the rules disagree, counted: far from zero.
+        let disagreements: usize = (0u32..=65_535)
+            .filter(|&value| u8::from_f32(u16::to_f32(value as u16)) != (value >> 8) as u8)
+            .count();
+        assert!(
+            disagreements > 10_000,
+            "the two narrowing rules are expected to disagree widely; counted {disagreements}"
+        );
+    }
     #[test]
     fn smart_object_replacement_rejects_undecoded_mask_channels() {
         let mut layer =
@@ -2115,6 +2143,82 @@ mod tests {
         );
     }
 
+    /// Leg coverage the corpus cannot provide — the corpus is 12/12 RGBA8 — so the native
+    /// 16-bit leg and the fallback legs each get a synthetic fixture, and each case pins
+    /// the streaming helper (the shape the production switch would use) against the
+    /// `image`-crate path bit-for-bit, at every destination depth.
+    #[cfg(feature = "image")]
+    mod native_legs {
+        use super::*;
+        use std::io::Cursor;
+
+        fn encode_image(buffer: image::DynamicImage) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            buffer
+                .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .unwrap();
+            bytes
+        }
+
+        /// Purposely uneven values: 0 anchors, a value above mid-range so widening is
+        /// observable, and the top.
+        const SAMPLES_8: [u8; 16] = [
+            255, 0, 12, 255, 4, 250, 88, 200, 13, 14, 15, 16, 17, 240, 0, 77,
+        ];
+
+        fn rgba8_fixture() -> Vec<u8> {
+            encode_image(
+                image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(4, 1, SAMPLES_8.to_vec())
+                    .unwrap()
+                    .into(),
+            )
+        }
+
+        /// RGBA16 samples whose high and low bytes differ, so a big-endian/little-endian
+        /// confusion in the row reader produces different values and a differential test
+        /// catches it. (Widening an 8-bit sample by ×257 yields `v<<8 | v`, whose halves
+        /// are equal — such values are blind to byte order.) 0 and 0xFFFF anchor; 0x1234
+        /// and 0xABCD are the asymmetric probes.
+        const SAMPLES_16: [u16; 16] = [
+            0x1234, 0xABCD, 0x0102, 0xFE01, 0, 0xFFFF, 0x1234, 0xABCD, 0x0102, 0xFE01, 0, 0xFFFF,
+            0x1234, 0xABCD, 0x0102, 0xFE01,
+        ];
+
+        fn rgba16_fixture() -> Vec<u8> {
+            encode_image(
+                image::ImageBuffer::<image::Rgba<u16>, _>::from_raw(4, 1, SAMPLES_16.to_vec())
+                    .unwrap()
+                    .into(),
+            )
+        }
+
+        /// Routes through the streaming helper (the production shape) and asserts bit
+        /// parity against the `image` crate at every destination depth.
+        fn assert_streaming_parity<T: BitDepth + std::fmt::Debug>(bytes: &[u8], what: &str) {
+            let image_crate = decode_source_raster::<T>(bytes)
+                .unwrap_or_else(|error| panic!("{what}: image-crate path failed: {error}"));
+            let streaming = decode_raster_png_streaming::<T>(bytes)
+                .unwrap_or_else(|error| panic!("{what}: psd-png streaming failed: {error}"));
+            assert_same_raster(&image_crate.raster, &streaming.raster, what);
+        }
+
+        #[test]
+        fn streaming_matches_the_image_crate_on_a_synthetic_rgba8_source() {
+            let bytes = rgba8_fixture();
+            assert_streaming_parity::<u8>(&bytes, "synthetic RGBA8 as u8");
+            assert_streaming_parity::<u16>(&bytes, "synthetic RGBA8 as u16");
+            assert_streaming_parity::<f32>(&bytes, "synthetic RGBA8 as f32");
+        }
+
+        #[test]
+        fn streaming_matches_the_image_crate_on_a_synthetic_rgba16_source() {
+            let bytes = rgba16_fixture();
+            assert_streaming_parity::<u8>(&bytes, "synthetic RGBA16 as u8");
+            assert_streaming_parity::<u16>(&bytes, "synthetic RGBA16 as u16");
+            assert_streaming_parity::<f32>(&bytes, "synthetic RGBA16 as f32");
+        }
+    }
+
     /// A 16-bit source narrowed into an 8-bit document is the one place the two decoders can
     /// silently disagree, and the corpus cannot catch it: every PNG in `fixtures/` is 8-bit.
     /// `51_200` is one of the values where the two plausible rules part company —
@@ -2212,9 +2316,14 @@ mod tests {
 
     /// The shape the production switch would use: the destination channels are allocated once
     /// and each reconstructed row is de-interleaved straight into them, so no interleaved
-    /// image ever exists. Narrowing goes through `from_f32` exactly as `interleaved_to_planar`
-    /// does, so all three benchmark arms pay the same per-sample conversion cost and the
-    /// comparison isolates the decoder and the pipeline shape.
+    /// image ever exists. Non-interlaced RGBA sources — the corpus's own shape and, in
+    /// practice, Photoshop-placed PNGs — take native rows: `decode_to` hands back the
+    /// file's own samples, each widened once through `BitDepth::widen_eight` /
+    /// `widen_sixteen`, the cheap exact rules pinned exhaustively in `bitdepth.rs`. For a
+    /// `u8` document from an 8-bit source that is four plain copies per pixel; for 16-bit
+    /// it is four big-endian reads. Anything else (gray, palette, RGB, interlaced) keeps
+    /// the rgba16 route below, whose grayscale/palette/tRNS semantics the differential
+    /// test pins.
     #[cfg(feature = "image")]
     fn decode_raster_png_streaming<T: BitDepth>(bytes: &[u8]) -> Result<DecodedSource<T>> {
         let info =
@@ -2230,25 +2339,122 @@ mod tests {
         }
         let [mut red, mut green, mut blue, mut alpha] = <[Vec<T>; 4]>::try_from(channels)
             .map_err(|_| PsdError::ImageDecode("expected four decoded channels".to_owned()))?;
+
+        match (info.color_type, info.bit_depth, info.interlacing) {
+            (psd_png::ColorType::Rgba, psd_png::BitDepth::Eight, psd_png::Interlacing::None) => {
+                // Native RGBA8: four bytes per pixel, the file's own samples.
+                psd_png::Decoder::new()
+                    .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
+                    .decode_to(bytes, |row| {
+                        for pixel in row.bytes.chunks_exact(4) {
+                            red.push(T::widen_eight(pixel[0]));
+                            green.push(T::widen_eight(pixel[1]));
+                            blue.push(T::widen_eight(pixel[2]));
+                            alpha.push(T::widen_eight(pixel[3]));
+                        }
+                        Ok::<(), psd_png::Error>(())
+                    })
+                    .map_err(|error| PsdError::ImageDecode(error.to_string()))?;
+            }
+            (psd_png::ColorType::Rgba, psd_png::BitDepth::Sixteen, psd_png::Interlacing::None) => {
+                // Native RGBA16: four big-endian samples per pixel.
+                psd_png::Decoder::new()
+                    .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
+                    .decode_to(bytes, |row| {
+                        for pixel in row.bytes.chunks_exact(8) {
+                            let sample = |offset: usize| {
+                                u16::from_be_bytes([pixel[offset], pixel[offset + 1]])
+                            };
+                            red.push(T::widen_sixteen(sample(0)));
+                            green.push(T::widen_sixteen(sample(2)));
+                            blue.push(T::widen_sixteen(sample(4)));
+                            alpha.push(T::widen_sixteen(sample(6)));
+                        }
+                        Ok::<(), psd_png::Error>(())
+                    })
+                    .map_err(|error| PsdError::ImageDecode(error.to_string()))?;
+            }
+            // The pre-N1 route, kept for every RGBA shape the native legs do not cover:
+            // gray (incl. tRNS alpha), palette, RGB, sub-8-bit depths, interlaced. Its
+            // grayscale-as-neutral-RGB and tRNS semantics are pinned by the differential
+            // tests and must not regress.
+            _ => stream_rgba16_rows_into::<T>(bytes, &mut red, &mut green, &mut blue, &mut alpha)?,
+        }
+
+        build_png_planar(info.width, info.height, red, green, blue, alpha)
+    }
+
+    /// The rgba16 fallback route that `decode_raster_png_streaming` used before native
+    /// rows: every source is converted to 16-bit RGBA and narrowed through `from_f32`.
+    /// Kept as a benchmark arm and as the dispatch's fallback for the shapes native rows
+    /// do not cover.
+    #[cfg(feature = "image")]
+    fn decode_raster_png_streaming_rgba16<T: BitDepth>(bytes: &[u8]) -> Result<DecodedSource<T>> {
+        psd_png::read_info(bytes)
+            .map_err(|error| PsdError::ImageDecode(error.to_string()))
+            .and_then(|info| {
+                let sample_count = checked_raster_sample_count::<T>(info.width, info.height)?;
+                let mut channels = Vec::new();
+                for _ in 0..4 {
+                    let mut channel = Vec::new();
+                    channel.try_reserve_exact(sample_count).map_err(|error| {
+                        PsdError::ImageDecode(format!(
+                            "could not allocate decoded channel: {error}"
+                        ))
+                    })?;
+                    channels.push(channel);
+                }
+                let [mut red, mut green, mut blue, mut alpha] = <[Vec<T>; 4]>::try_from(channels)
+                    .map_err(|_| {
+                    PsdError::ImageDecode("expected four decoded channels".to_owned())
+                })?;
+                stream_rgba16_rows_into(bytes, &mut red, &mut green, &mut blue, &mut alpha)?;
+                build_png_planar(info.width, info.height, red, green, blue, alpha)
+            })
+    }
+
+    /// The shared rgba16 body: asks psd-png for converted 16-bit RGBA rows and widens each
+    /// sample through `T::widen_sixteen`, which for a `u8` destination applies the port's
+    /// narrowing rule (`from_f32`, NOT the high byte — see the 51 200 counter-example).
+    #[cfg(feature = "image")]
+    fn stream_rgba16_rows_into<T: BitDepth>(
+        bytes: &[u8],
+        red: &mut Vec<T>,
+        green: &mut Vec<T>,
+        blue: &mut Vec<T>,
+        alpha: &mut Vec<T>,
+    ) -> Result<()> {
         psd_png::Decoder::new()
             .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
             .decode_to_rgba16(bytes, |row| {
                 // A 16-bit converted row is big-endian bytes, four samples per pixel.
                 for pixel in row.bytes.chunks_exact(8) {
-                    let wide = |offset: usize| {
-                        u16::from_be_bytes([pixel[offset], pixel[offset + 1]]).to_f32()
-                    };
-                    red.push(T::from_f32(wide(0)));
-                    green.push(T::from_f32(wide(2)));
-                    blue.push(T::from_f32(wide(4)));
-                    alpha.push(T::from_f32(wide(6)));
+                    let wide =
+                        |offset: usize| u16::from_be_bytes([pixel[offset], pixel[offset + 1]]);
+                    red.push(T::widen_sixteen(wide(0)));
+                    green.push(T::widen_sixteen(wide(2)));
+                    blue.push(T::widen_sixteen(wide(4)));
+                    alpha.push(T::widen_sixteen(wide(6)));
                 }
                 Ok::<(), psd_png::Error>(())
             })
             .map_err(|error| PsdError::ImageDecode(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Stacks four filled planar channels into the raster a `DecodedSource` carries.
+    #[cfg(feature = "image")]
+    fn build_png_planar<T: BitDepth>(
+        width: u32,
+        height: u32,
+        red: Vec<T>,
+        green: Vec<T>,
+        blue: Vec<T>,
+        alpha: Vec<T>,
+    ) -> Result<DecodedSource<T>> {
         let raster = raster_from_planar(
-            info.width as usize,
-            info.height as usize,
+            width as usize,
+            height as usize,
             vec![
                 (ChannelKey::color(0), red),
                 (ChannelKey::color(1), green),
@@ -2264,14 +2470,14 @@ mod tests {
 
     /// V2: what the two decoders cost in the port's own pipeline, on the port's own corpus.
     ///
-    /// Four arms, because two questions are being asked at once. `image` against `psd-png`
+    /// Five arms, because three questions are being asked at once. `image` against `psd-png`
     /// through the parity helper answers whether the decoder itself is faster, with the
-    /// pipeline shape held fixed on both sides. `psd-png` streaming answers the other half:
-    /// whether routing rows straight into the destination channels, which is what the
-    /// production switch would do, is worth anything on top. The fourth arm re-runs `image` as
-    /// a control, so the day's noise floor is measured rather than assumed — this machine
-    /// throttles, and several of these deltas are small enough that an unmeasured floor would
-    /// be meaningless.
+    /// pipeline shape held fixed on both sides. The two streaming arms answer the next
+    /// question: what the production shape costs with native rows versus the pre-N1
+    /// rgba16 route, i.e. how much the conversion step is worth. The final arm re-runs
+    /// `image` as a control, so the day's noise floor is measured rather than assumed —
+    /// this machine throttles, and several of these deltas are small enough that an
+    /// unmeasured floor would be meaningless.
     ///
     /// Memory is reported as the largest single allocation during a decode, which is the
     /// number that separates the two designs: the `image` crate allocates the whole decoded
@@ -2284,7 +2490,7 @@ mod tests {
     #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
     fn benchmark_image_crate_against_psd_png() {
         const ROUNDS: usize = 5;
-        const ARMS: usize = 4;
+        const ARMS: usize = 5;
 
         let files: Vec<(String, Vec<u8>)> = corpus_pngs()
             .into_iter()
@@ -2304,6 +2510,7 @@ mod tests {
             decode_source_raster::<u8>,
             decode_raster_png_psd_png::<u8>,
             decode_raster_png_streaming::<u8>,
+            decode_raster_png_streaming_rgba16::<u8>,
             decode_source_raster::<u8>, // control: the same binary as arm 0
         ];
 
@@ -2327,38 +2534,40 @@ mod tests {
         }
 
         // Allocation is counted in its own pass so the counters never sit inside a timed one.
-        let mut largest = vec![[0usize; 3]; files.len()];
+        let mut largest = vec![[0usize; 4]; files.len()];
         for (index, (_, bytes)) in files.iter().enumerate() {
-            for (slot, arm) in arms[..3].iter().enumerate() {
+            for (slot, arm) in arms[..4].iter().enumerate() {
                 let (_, peak, _) = allocation::measure(|| arm(bytes).unwrap());
                 largest[index][slot] = peak;
             }
         }
 
         println!(
-            "\n{:<32} {:>9} {:>9} {:>10} {:>9} {:>9} {:>8} {:>17}",
+            "\n{:<32} {:>9} {:>9} {:>10} {:>11} {:>9} {:>9} {:>8} {:>17}",
             "fixture",
             "image",
             "parity",
-            "streaming",
-            "parity d",
-            "stream d",
+            "stream nat",
+            "stream r16",
+            "nat d",
+            "r16 d",
             "ctrl d",
             "largest MiB img/psd"
         );
         let mut totals = [0.0f64; ARMS];
         for (index, (name, _)) in files.iter().enumerate() {
             let row = best[index];
-            let (image, parity, streaming, control) = (row[0], row[1], row[2], row[3]);
+            let (image, parity, native, legacy, control) = (row[0], row[1], row[2], row[3], row[4]);
             let percent = |value: f64| (value - image) / image * 100.0;
             println!(
-                "{:<32} {:>9.3} {:>9.3} {:>10.3} {:>8.1}% {:>8.1}% {:>7.1}% {:>7.2}/{:.2}",
+                "{:<32} {:>9.3} {:>9.3} {:>10.3} {:>11.3} {:>8.1}% {:>8.1}% {:>7.1}% {:>7.2}/{:.2}",
                 name,
                 image,
                 parity,
-                streaming,
-                percent(parity),
-                percent(streaming),
+                native,
+                legacy,
+                percent(native),
+                percent(legacy),
                 percent(control),
                 largest[index][0] as f64 / (1024.0 * 1024.0),
                 largest[index][2] as f64 / (1024.0 * 1024.0),
@@ -2367,16 +2576,18 @@ mod tests {
                 totals[slot] += value;
             }
         }
-        let (image, parity, streaming, control) = (totals[0], totals[1], totals[2], totals[3]);
+        let (image, parity, native, legacy, control) =
+            (totals[0], totals[1], totals[2], totals[3], totals[4]);
         let percent = |value: f64| (value - image) / image * 100.0;
         println!(
-            "{:<32} {:>9.3} {:>9.3} {:>10.3} {:>8.1}% {:>8.1}% {:>7.1}%",
+            "{:<32} {:>9.3} {:>9.3} {:>10.3} {:>11.3} {:>8.1}% {:>8.1}% {:>7.1}%",
             "TOTAL",
             image,
             parity,
-            streaming,
-            percent(parity),
-            percent(streaming),
+            native,
+            legacy,
+            percent(native),
+            percent(legacy),
             percent(control),
         );
     }
