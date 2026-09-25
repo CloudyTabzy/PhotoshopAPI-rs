@@ -12,6 +12,21 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.10] - 2026-09-25
+
+### Changed
+
+- The vendored `psd-png` is synced to its 0.3.0: the crate is now a decoder only. Its PNG
+  encoder, the DEFLATE compressor under it, `FilterStrategy`, `WriteError` and the
+  ancillary-chunk retention (`Keep`, `Info::metadata`) are removed — the workspace consumes
+  the decode path, and the vendored surface no longer carries what it never calls. Its
+  decode suite, the corpus sweep and the zlib vectors are unchanged; its fixtures are now
+  built by hand rather than by the encoder that used to sit opposite them.
+- The PNG decode's decompressed-size ceiling is now stated as the planar raster budget
+  (`MAX_RASTER_BYTES`) rather than the encoded-source cap. The two carry the same value
+  today, so behaviour is unchanged; the decode now has one budget — the raster the port
+  builds — instead of two coincidentally equal policies.
+
 ## [0.6.9] - 2026-09-25
 
 ### Changed
