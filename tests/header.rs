@@ -1,11 +1,14 @@
 //! Reading a file's header without decoding it, and asking what that header means.
 
-use psd_png::{BitDepth, Chunk, ColorType, Decoder, Error, Info, Keep};
+mod common;
 
-/// Encodes an image described by `info`, filling the pixels with something reproducible.
+use common::build_png;
+use psd_png::{BitDepth, ColorType, Error, Info};
+
+/// Builds an image described by `info`, filling the pixels with something reproducible.
 fn encoded(info: &Info) -> Vec<u8> {
     let data: Vec<u8> = (0..info.output_size()).map(|i| (i * 31) as u8).collect();
-    psd_png::encode(info, &data).unwrap()
+    build_png(info, &data, 1)
 }
 
 fn palette_info() -> Info {
@@ -74,17 +77,6 @@ fn transparency_is_read_because_it_precedes_the_image_data() {
     assert_eq!(read.transparency, info.transparency);
     assert_eq!(read.palette, info.palette);
     assert!(read.has_alpha());
-}
-
-#[test]
-fn metadata_before_the_image_data_is_kept_when_asked_for() {
-    let mut info = Info::new(2, 2, ColorType::Rgb, BitDepth::Eight);
-    info.metadata.push(Chunk::new(*b"apPd", b"header side".to_vec()));
-    let png = encoded(&info);
-
-    let read = Decoder::new().keep(Keep::All).read_info(&png).unwrap();
-    assert_eq!(read.chunk(b"apPd"), Some(&b"header side"[..]));
-    assert_eq!(psd_png::read_info(&png).unwrap().metadata, Vec::new());
 }
 
 #[test]

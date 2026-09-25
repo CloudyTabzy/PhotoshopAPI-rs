@@ -10,11 +10,15 @@
 use psd_png::common::{BitDepth, ColorType, Info};
 use psd_png::{Checks, Decoder, Row};
 
+mod common;
+
+use common::build_png;
+
 /// 512x512 RGBA8: 1 MiB of filtered data, so the frontier reconstructs mid-stream.
 fn fused_png() -> Vec<u8> {
     let (width, height) = (512u32, 512u32);
     let data: Vec<u8> = (0..(width * height * 4) as usize).map(|i| (i % 251) as u8).collect();
-    psd_png::encode(&Info::new(width, height, ColorType::Rgba, BitDepth::Eight), &data).unwrap()
+    build_png(&Info::new(width, height, ColorType::Rgba, BitDepth::Eight), &data, 1)
 }
 
 /// Damages the Adler-32 trailer inside the zlib stream and repairs the chunk CRC, so the

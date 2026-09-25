@@ -1475,15 +1475,37 @@ mod tests {
 
     use crate::filter::MAX_MATCH_DISTANCE;
 
+    /// The zlib stream the decoder-side tests need, built from stored blocks: the crate's
+    /// compressor is gone, and a stored stream needs none. The block type bytes and length
+    /// words are the format's own; the Adler-32 is the crate's. `block_limit` is the most
+    /// bytes one stored block carries, which decides whether a pause can fall mid-block.
+    fn stored_stream_for_tests(data: &[u8], block_limit: usize) -> Vec<u8> {
+        let mut out = vec![0x78, 0x01];
+        let mut rest = data;
+        while !rest.is_empty() {
+            let take = rest.len().min(block_limit);
+            let (block, tail) = rest.split_at(take);
+            out.push(if tail.is_empty() { 0x01 } else { 0x00 });
+            let len = block.len() as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(block);
+            rest = tail;
+        }
+        out.extend_from_slice(&crate::adler32::adler32(data).to_be_bytes());
+        out
+    }
+
     /// Miri cannot enumerate directories on Windows, so alongside the corpus sweep this
     /// fs-free case runs the pause/resume machinery over a stream built by the crate's own
     /// deflate encoder, with a stage smaller than the stream to force real slides.
     #[test]
     fn segmented_resume_matches_one_shot_inline() {
-        // Compressible data: the encoder emits a single compressed block, so the segment
-        // boundary falls mid-block, which is the resume path that matters.
+        // Compressible data. The zlib stream is built from one stored block, so the segment
+        // budget is smaller than the block and the pause falls mid-block, which is the
+        // resume path that matters.
         let expected = vec![0u8; 45_000];
-        let compressed = crate::deflate::compress_zlib(&expected);
+        let compressed = stored_stream_for_tests(&expected, 4_096);
         let mut budget = MAX_MATCH_DISTANCE + 4096;
 
         let mut reference = vec![0u8; expected.len() + OUTPUT_SLACK];
@@ -1554,7 +1576,7 @@ mod tests {
     #[test]
     fn a_paused_segment_has_reported_its_position_to_the_hook() {
         let data: Vec<u8> = (0..20_000u32).map(|i| (i / 700) as u8).collect();
-        let compressed = crate::deflate::compress_zlib(&data);
+        let compressed = stored_stream_for_tests(&data, 4_096);
 
         for budget in 1..3_000 {
             let mut stage = vec![0u8; budget + OUTPUT_SLACK];

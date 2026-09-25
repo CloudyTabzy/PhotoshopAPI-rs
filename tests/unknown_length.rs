@@ -4,7 +4,9 @@
 //! that number must not invent one by trusting a length field in an untrusted file, which
 //! is the same instruction to over-allocate wearing different clothes.
 
-use psd_png::deflate::compress_zlib;
+mod common;
+
+use common::compress_zlib;
 use psd_png::inflate::{InflateError, decompress_zlib_to_vec};
 
 /// Something that compresses, at a few different scales relative to the first guess.
@@ -36,12 +38,94 @@ fn the_ceiling_is_a_ceiling() {
     assert_eq!(decompress_zlib_to_vec(&compressed, 0), Err(InflateError::OutputOverflow));
 }
 
+/// A fixed-Huffman stream that decodes to eight megabytes of zeros.
+///
+/// One block: 254 literal zeros, then 32,513 matches of (length 258, distance 1), which is
+/// 254 + 32,513 × 258 = 8 MiB exactly. Huffman codes go into the stream MSB-first, the
+/// block header LSB-first, which is why the two pushes differ.
+///
+/// ```text
+/// literal 0   fixed code 00110000, 8 bits
+/// length 258  fixed code 11000101, 8 bits, no extra bits
+/// distance 1  fixed code 00000,    5 bits, no extra bits
+/// ```
+fn eight_megabytes_of_zeros() -> Vec<u8> {
+    const LITERAL_ZERO: u32 = 0b0011_0000;
+    const LENGTH_258: u32 = 0b1100_0101;
+    const DISTANCE_1: u32 = 0;
+
+    struct Bits {
+        byte: u8,
+        used: u32,
+        out: Vec<u8>,
+    }
+
+    impl Bits {
+        /// Adds `count` bits of `value`, least-significant bit first: the order every
+        /// non-Huffman field is written in.
+        fn push(&mut self, value: u32, count: u32) {
+            for i in 0..count {
+                if (value >> i) & 1 != 0 {
+                    self.byte |= 1 << self.used;
+                }
+                self.used += 1;
+                if self.used == 8 {
+                    self.out.push(self.byte);
+                    self.byte = 0;
+                    self.used = 0;
+                }
+            }
+        }
+
+        /// Adds a Huffman code, most significant bit of the code first.
+        fn push_code(&mut self, code: u32, count: u32) {
+            for i in (0..count).rev() {
+                if (code >> i) & 1 != 0 {
+                    self.byte |= 1 << self.used;
+                }
+                self.used += 1;
+                if self.used == 8 {
+                    self.out.push(self.byte);
+                    self.byte = 0;
+                    self.used = 0;
+                }
+            }
+        }
+
+        fn flush(mut self) -> Vec<u8> {
+            if self.used > 0 {
+                self.out.push(self.byte);
+            }
+            self.out
+        }
+    }
+
+    let mut bits = Bits { byte: 0, used: 0, out: Vec::new() };
+    bits.push(1, 1); // BFINAL
+    bits.push(1, 2); // BTYPE = fixed Huffman
+    for _ in 0..254 {
+        bits.push_code(LITERAL_ZERO, 8);
+    }
+    for _ in 0..32_513 {
+        bits.push_code(LENGTH_258, 8);
+        bits.push_code(DISTANCE_1, 5);
+    }
+    // End of block: symbol 256, the seven-bit all-zero code.
+    bits.push_code(0, 7);
+
+    // zlib header, the block, then the Adler-32 of eight megabytes of zero bytes.
+    let mut stream = vec![0x78, 0x01];
+    stream.extend(bits.flush());
+    stream.extend_from_slice(&0x0780_0001u32.to_be_bytes());
+    stream
+}
+
 #[test]
 fn a_highly_compressible_stream_cannot_talk_its_way_past_the_ceiling() {
-    // Four kilobytes of input expanding to eight megabytes: the case a guess drawn from the
-    // compressed size gets wrong, and the case where the ceiling has to be the thing that
-    // holds.
-    let compressed = compress_zlib(&vec![0u8; 8 << 20]);
+    // About sixteen kilobytes of stream expanding to eight megabytes: the case a guess
+    // drawn from the compressed size gets wrong, and the case where the ceiling has to be
+    // the thing that holds.
+    let compressed = eight_megabytes_of_zeros();
     assert!(compressed.len() < 64 * 1024, "the premise: this compresses hard");
 
     assert_eq!(decompress_zlib_to_vec(&compressed, 1 << 20), Err(InflateError::OutputOverflow));

@@ -5,8 +5,6 @@ pub struct TestImage {
     pub name: String,
     /// The original PNG file.
     pub png: Vec<u8>,
-    /// Decoded pixels in the image's native format.
-    pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub color_type: psd_png::common::ColorType,
@@ -43,7 +41,6 @@ pub fn load_images() -> Vec<TestImage> {
             TestImage {
                 name: path.file_stem().unwrap().to_string_lossy().into_owned(),
                 png,
-                pixels: image.data,
                 width: image.info.width,
                 height: image.info.height,
                 color_type: image.info.color_type,
