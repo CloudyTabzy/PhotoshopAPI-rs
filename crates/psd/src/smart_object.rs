@@ -2151,4 +2151,233 @@ mod tests {
             samples
         );
     }
+
+    /// Counts the largest single allocation and the total requested while a counter window is
+    /// open. The largest is the number that matters here: the `image` crate allocates the whole
+    /// decoded image in one buffer, where a streaming decode allocates a bounded stage.
+    #[cfg(feature = "image")]
+    mod allocation {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        pub static LARGEST: AtomicUsize = AtomicUsize::new(0);
+        pub static TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+        pub struct Counting;
+
+        // SAFETY: every method forwards to `System` unchanged; the counters are atomics that
+        // only observe, so the allocator's contract is untouched.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                record(layout.size());
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(pointer, layout) }
+            }
+
+            unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                record(new_size);
+                unsafe { System.realloc(pointer, layout, new_size) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                record(layout.size());
+                unsafe { System.alloc_zeroed(layout) }
+            }
+        }
+
+        fn record(size: usize) {
+            TOTAL.fetch_add(size, Ordering::Relaxed);
+            LARGEST.fetch_max(size, Ordering::Relaxed);
+        }
+
+        /// Runs `body` with the counters open, returning its result alongside what it allocated.
+        pub fn measure<R>(body: impl FnOnce() -> R) -> (R, usize, usize) {
+            LARGEST.store(0, Ordering::Relaxed);
+            TOTAL.store(0, Ordering::Relaxed);
+            let result = body();
+            (
+                result,
+                LARGEST.load(Ordering::Relaxed),
+                TOTAL.load(Ordering::Relaxed),
+            )
+        }
+    }
+
+    #[cfg(feature = "image")]
+    #[global_allocator]
+    static ALLOCATION_COUNTER: allocation::Counting = allocation::Counting;
+
+    /// The shape the production switch would use: the destination channels are allocated once
+    /// and each reconstructed row is de-interleaved straight into them, so no interleaved
+    /// image ever exists. Narrowing goes through `from_f32` exactly as `interleaved_to_planar`
+    /// does, so all three benchmark arms pay the same per-sample conversion cost and the
+    /// comparison isolates the decoder and the pipeline shape.
+    #[cfg(feature = "image")]
+    fn decode_raster_png_streaming<T: BitDepth>(bytes: &[u8]) -> Result<DecodedSource<T>> {
+        let info =
+            psd_png::read_info(bytes).map_err(|error| PsdError::ImageDecode(error.to_string()))?;
+        let sample_count = checked_raster_sample_count::<T>(info.width, info.height)?;
+        let mut channels = Vec::new();
+        for _ in 0..4 {
+            let mut channel = Vec::new();
+            channel.try_reserve_exact(sample_count).map_err(|error| {
+                PsdError::ImageDecode(format!("could not allocate decoded channel: {error}"))
+            })?;
+            channels.push(channel);
+        }
+        let [mut red, mut green, mut blue, mut alpha] = <[Vec<T>; 4]>::try_from(channels)
+            .map_err(|_| PsdError::ImageDecode("expected four decoded channels".to_owned()))?;
+        psd_png::Decoder::new()
+            .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
+            .decode_to_rgba16(bytes, |row| {
+                // A 16-bit converted row is big-endian bytes, four samples per pixel.
+                for pixel in row.bytes.chunks_exact(8) {
+                    let wide = |offset: usize| {
+                        u16::from_be_bytes([pixel[offset], pixel[offset + 1]]).to_f32()
+                    };
+                    red.push(T::from_f32(wide(0)));
+                    green.push(T::from_f32(wide(2)));
+                    blue.push(T::from_f32(wide(4)));
+                    alpha.push(T::from_f32(wide(6)));
+                }
+                Ok::<(), psd_png::Error>(())
+            })
+            .map_err(|error| PsdError::ImageDecode(error.to_string()))?;
+        let raster = raster_from_planar(
+            info.width as usize,
+            info.height as usize,
+            vec![
+                (ChannelKey::color(0), red),
+                (ChannelKey::color(1), green),
+                (ChannelKey::color(2), blue),
+                (ChannelKey::ALPHA, alpha),
+            ],
+        )?;
+        Ok(DecodedSource {
+            raster,
+            file_type: *b"png ",
+        })
+    }
+
+    /// V2: what the two decoders cost in the port's own pipeline, on the port's own corpus.
+    ///
+    /// Four arms, because two questions are being asked at once. `image` against `psd-png`
+    /// through the parity helper answers whether the decoder itself is faster, with the
+    /// pipeline shape held fixed on both sides. `psd-png` streaming answers the other half:
+    /// whether routing rows straight into the destination channels, which is what the
+    /// production switch would do, is worth anything on top. The fourth arm re-runs `image` as
+    /// a control, so the day's noise floor is measured rather than assumed — this machine
+    /// throttles, and several of these deltas are small enough that an unmeasured floor would
+    /// be meaningless.
+    ///
+    /// Memory is reported as the largest single allocation during a decode, which is the
+    /// number that separates the two designs: the `image` crate allocates the whole decoded
+    /// image in one buffer, a streaming decode allocates a bounded stage. It is not peak
+    /// resident memory and is not labelled as such.
+    ///
+    /// Ignored by default: this is a measurement, not an assertion, and it takes minutes.
+    #[cfg(feature = "image")]
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn benchmark_image_crate_against_psd_png() {
+        const ROUNDS: usize = 5;
+        const ARMS: usize = 4;
+
+        let files: Vec<(String, Vec<u8>)> = corpus_pngs()
+            .into_iter()
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                (name, read_source_file(&path).unwrap())
+            })
+            .collect();
+        assert!(!files.is_empty(), "no PNG fixtures found");
+
+        type Arm = fn(&[u8]) -> Result<DecodedSource<u8>>;
+        let arms: [Arm; ARMS] = [
+            decode_source_raster::<u8>,
+            decode_raster_png_psd_png::<u8>,
+            decode_raster_png_streaming::<u8>,
+            decode_source_raster::<u8>, // control: the same binary as arm 0
+        ];
+
+        for (_, bytes) in &files {
+            for arm in arms {
+                arm(bytes).unwrap();
+            }
+        }
+
+        let mut best = vec![[f64::MAX; ARMS]; files.len()];
+        for _ in 0..ROUNDS {
+            for (index, (_, bytes)) in files.iter().enumerate() {
+                for (slot, arm) in arms.iter().enumerate() {
+                    let start = std::time::Instant::now();
+                    let decoded = arm(bytes).unwrap();
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    std::hint::black_box(&decoded);
+                    best[index][slot] = best[index][slot].min(elapsed);
+                }
+            }
+        }
+
+        // Allocation is counted in its own pass so the counters never sit inside a timed one.
+        let mut largest = vec![[0usize; 3]; files.len()];
+        for (index, (_, bytes)) in files.iter().enumerate() {
+            for (slot, arm) in arms[..3].iter().enumerate() {
+                let (_, peak, _) = allocation::measure(|| arm(bytes).unwrap());
+                largest[index][slot] = peak;
+            }
+        }
+
+        println!(
+            "\n{:<32} {:>9} {:>9} {:>10} {:>9} {:>9} {:>8} {:>17}",
+            "fixture",
+            "image",
+            "parity",
+            "streaming",
+            "parity d",
+            "stream d",
+            "ctrl d",
+            "largest MiB img/psd"
+        );
+        let mut totals = [0.0f64; ARMS];
+        for (index, (name, _)) in files.iter().enumerate() {
+            let row = best[index];
+            let (image, parity, streaming, control) = (row[0], row[1], row[2], row[3]);
+            let percent = |value: f64| (value - image) / image * 100.0;
+            println!(
+                "{:<32} {:>9.3} {:>9.3} {:>10.3} {:>8.1}% {:>8.1}% {:>7.1}% {:>7.2}/{:.2}",
+                name,
+                image,
+                parity,
+                streaming,
+                percent(parity),
+                percent(streaming),
+                percent(control),
+                largest[index][0] as f64 / (1024.0 * 1024.0),
+                largest[index][2] as f64 / (1024.0 * 1024.0),
+            );
+            for (slot, value) in row.iter().enumerate() {
+                totals[slot] += value;
+            }
+        }
+        let (image, parity, streaming, control) = (totals[0], totals[1], totals[2], totals[3]);
+        let percent = |value: f64| (value - image) / image * 100.0;
+        println!(
+            "{:<32} {:>9.3} {:>9.3} {:>10.3} {:>8.1}% {:>8.1}% {:>7.1}%",
+            "TOTAL",
+            image,
+            parity,
+            streaming,
+            percent(parity),
+            percent(streaming),
+            percent(control),
+        );
+    }
 }
