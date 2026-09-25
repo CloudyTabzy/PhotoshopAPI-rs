@@ -1346,11 +1346,17 @@ fn decode_raster_png_streaming<T: BitDepth>(bytes: &[u8]) -> Result<DecodedSourc
     let [mut red, mut green, mut blue, mut alpha] = <[Vec<T>; 4]>::try_from(channels)
         .map_err(|_| PsdError::ImageDecode("expected four decoded channels".to_owned()))?;
 
+    // One budget for the decode: the planar output was capped above by the raster limit,
+    // so the decoder's own working memory is capped by the same number. For a
+    // non-interlaced image the stage is a few hundred kilobytes and never approaches it;
+    // the ceiling is what stops an interlaced file from buffering more than the raster
+    // budget would allow. The encoded source has its own cap in
+    // `decode_source_raster`/`read_source_file`.
     match (info.color_type, info.bit_depth, info.interlacing) {
         (psd_png::ColorType::Rgba, psd_png::BitDepth::Eight, psd_png::Interlacing::None) => {
             // Native RGBA8: four bytes per pixel, the file's own samples.
             psd_png::Decoder::new()
-                .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
+                .max_decompressed_size(Some(MAX_RASTER_BYTES))
                 .decode_to(bytes, |row| {
                     for pixel in row.bytes.chunks_exact(4) {
                         red.push(T::widen_eight(pixel[0]));
@@ -1365,7 +1371,7 @@ fn decode_raster_png_streaming<T: BitDepth>(bytes: &[u8]) -> Result<DecodedSourc
         (psd_png::ColorType::Rgba, psd_png::BitDepth::Sixteen, psd_png::Interlacing::None) => {
             // Native RGBA16: four big-endian samples per pixel.
             psd_png::Decoder::new()
-                .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
+                .max_decompressed_size(Some(MAX_RASTER_BYTES))
                 .decode_to(bytes, |row| {
                     for pixel in row.bytes.chunks_exact(8) {
                         let sample =
@@ -1401,7 +1407,7 @@ fn stream_rgba16_rows_into<T: BitDepth>(
     alpha: &mut Vec<T>,
 ) -> Result<()> {
     psd_png::Decoder::new()
-        .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
+        .max_decompressed_size(Some(MAX_RASTER_BYTES))
         .decode_to_rgba16(bytes, |row| {
             // A 16-bit converted row is big-endian bytes, four samples per pixel.
             for pixel in row.bytes.chunks_exact(8) {
@@ -2122,7 +2128,7 @@ mod tests {
                 PsdError::ImageDecode(format!("could not allocate decoded pixels: {error}"))
             })?;
         psd_png::Decoder::new()
-            .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
+            .max_decompressed_size(Some(MAX_RASTER_BYTES))
             .decode_to_rgba16(bytes, |row| {
                 wide_bytes.extend_from_slice(row.bytes);
                 Ok::<(), psd_png::Error>(())
@@ -2666,5 +2672,165 @@ mod tests {
             percent(legacy),
             percent(control),
         );
+    }
+
+    /// V4: the large-raster regime in the port's real pipeline.
+    ///
+    /// Every other port-side number is 1 MiB, the regime where fusion and the SIMD kernel
+    /// contribute least. The rasters that motivated the vendoring are warp renders an order
+    /// of magnitude larger, so this measures one 3840x2400 RGBA8 fixture — nine megapixels,
+    /// 36.9 MB filtered — through the same five arms, three rounds. The fixture is built in
+    /// memory rather than read from anywhere: every scanline is stored and uncompressed, a
+    /// zlib form that needs no compressor, and noise is the honest worst case for the
+    /// reconstruction stages this crate is supposed to win on.
+    #[cfg(feature = "image")]
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn benchmark_the_large_raster_regime() {
+        const ROUNDS: usize = 3;
+        const ARMS: usize = 5;
+
+        let (width, height) = (3840u32, 2400u32);
+        let info = psd_png::Info::new(
+            width,
+            height,
+            psd_png::ColorType::Rgba,
+            psd_png::BitDepth::Eight,
+        );
+        let pixels: Vec<u8> = {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            (0..info.output_size())
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 24) as u8
+                })
+                .collect()
+        };
+        let bytes = large_stored_png(&info, &pixels);
+        let files = [("rgba8_noise_3840x2400", bytes)];
+
+        type Arm = fn(&[u8]) -> Result<DecodedSource<u8>>;
+        let arms: [Arm; ARMS] = [
+            decode_raster_image::<u8>,
+            decode_source_raster::<u8>,
+            decode_raster_png_psd_png::<u8>,
+            decode_raster_png_streaming_rgba16::<u8>,
+            decode_raster_image::<u8>, // control: the same binary as arm 0
+        ];
+
+        for (_, bytes) in &files {
+            for arm in arms {
+                arm(bytes).unwrap();
+            }
+        }
+
+        let mut best = vec![[f64::MAX; ARMS]; files.len()];
+        for _ in 0..ROUNDS {
+            for (index, (_, bytes)) in files.iter().enumerate() {
+                for (slot, arm) in arms.iter().enumerate() {
+                    let start = std::time::Instant::now();
+                    let decoded = arm(bytes).unwrap();
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    std::hint::black_box(&decoded);
+                    best[index][slot] = best[index][slot].min(elapsed);
+                }
+            }
+        }
+
+        // Allocation is counted in its own pass so the counters never sit inside a timed one.
+        let mut largest = vec![[0usize; 4]; files.len()];
+        for (index, (_, bytes)) in files.iter().enumerate() {
+            for (slot, arm) in arms[..4].iter().enumerate() {
+                let (_, peak, _) = allocation::measure(|| arm(bytes).unwrap());
+                largest[index][slot] = peak;
+            }
+        }
+
+        println!(
+            "\n{:<32} {:>9} {:>11} {:>9} {:>9} {:>9} {:>9} {:>7} {:>8} {:>17}",
+            "fixture",
+            "incumbent",
+            "production",
+            "parity",
+            "r16",
+            "prod d",
+            "parity d",
+            "r16 d",
+            "ctrl d",
+            "largest MiB inc/prod"
+        );
+        for (index, (name, _)) in files.iter().enumerate() {
+            let row = best[index];
+            let (incumbent, production, parity, legacy, control) =
+                (row[0], row[1], row[2], row[3], row[4]);
+            let percent = |value: f64| (value - incumbent) / incumbent * 100.0;
+            println!(
+                "{:<32} {:>9.3} {:>11.3} {:>9.3} {:>9.3} {:>8.1}% {:>8.1}% {:>7.1}% {:>7.1}% {:>7.2}/{:.2}",
+                name,
+                incumbent,
+                production,
+                parity,
+                legacy,
+                percent(production),
+                percent(parity),
+                percent(legacy),
+                percent(control),
+                largest[index][0] as f64 / (1024.0 * 1024.0),
+                largest[index][1] as f64 / (1024.0 * 1024.0),
+            );
+        }
+    }
+
+    /// Builds one RGBA8 PNG with every scanline stored and uncompressed: a zlib form that
+    /// needs no compressor. The Adler-32 over the filtered stream and the CRC-32 over each
+    /// chunk come from the crate's own implementations.
+    #[cfg(feature = "image")]
+    fn large_stored_png(info: &psd_png::Info, pixels: &[u8]) -> Vec<u8> {
+        let row_bytes = info.row_bytes();
+        let height = info.height as usize;
+        let mut filtered = Vec::with_capacity(height * (1 + row_bytes));
+        let mut rest = pixels;
+        for _ in 0..height {
+            filtered.push(0u8);
+            filtered.extend_from_slice(&rest[..row_bytes]);
+            rest = &rest[row_bytes..];
+        }
+
+        let mut zlib = vec![0x78, 0x01];
+        let mut stream = filtered.as_slice();
+        while !stream.is_empty() {
+            let take = stream.len().min(u16::MAX as usize);
+            let (block, tail) = stream.split_at(take);
+            zlib.push(if tail.is_empty() { 0x01 } else { 0x00 });
+            let len = block.len() as u16;
+            zlib.extend_from_slice(&len.to_le_bytes());
+            zlib.extend_from_slice(&(!len).to_le_bytes());
+            zlib.extend_from_slice(block);
+            stream = tail;
+        }
+        zlib.extend_from_slice(&psd_png::adler32::adler32(&filtered).to_be_bytes());
+
+        let mut png = psd_png::common::SIGNATURE.to_vec();
+        let chunk = |png: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]| {
+            png.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            png.extend_from_slice(kind);
+            png.extend_from_slice(payload);
+            let mut crc = psd_png::crc32::Crc32::new();
+            crc.update(kind);
+            crc.update(payload);
+            png.extend_from_slice(&crc.finish().to_be_bytes());
+        };
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&info.width.to_be_bytes());
+        ihdr.extend_from_slice(&info.height.to_be_bytes());
+        ihdr.push(info.bit_depth as u8);
+        ihdr.push(info.color_type as u8);
+        ihdr.extend_from_slice(&[0, 0, 0]);
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(&mut png, b"IDAT", &zlib);
+        chunk(&mut png, b"IEND", &[]);
+        png
     }
 }
