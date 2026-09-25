@@ -12,6 +12,27 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-09-25
+
+### Added
+
+- `BitDepth::widen_eight` and `BitDepth::widen_sixteen`, the widening rules a PNG-native
+  sample passes through on its way into a channel at each of the three depths. Their cheap
+  exact forms (identity, ×257, and the `round(v / 257)` narrowing which is deliberately not
+  the high byte) are pinned exhaustively — all 256 bytes and all 65536 `u16` values — against
+  the `T::from_f32(sample.to_f32())` composition `interleaved_to_planar` computes, so a
+  native-rows decode and the current conversion route provably produce the same bytes.
+- The smart-object PNG streaming helper (dev-only, behind the `image` feature) now dispatches
+  non-interlaced RGBA sources to `psd-png`'s `decode_to`: 8-bit sources take four plain
+  samples per pixel and 16-bit sources four big-endian reads, instead of the previous route
+  that widened every source to 16-bit RGBA and narrowed it back through a float round-trip.
+  Gray, palette, RGB, sub-8-bit and interlaced sources keep that converted route, whose
+  grayscale-as-neutral-RGB and `tRNS` semantics the differential tests pin. Nothing in the
+  production read path calls this yet, so decoded output is unchanged; the route is measured
+  by an ignored benchmark that now runs five arms — `image` / parity / streaming-native /
+  streaming-rgba16 / control — with the native arm at **−54.4 %** against the `image` crate
+  (2.2× faster, largest allocation 0.29 MiB against 1.00 MiB, control noise +1.6 %).
+
 ## [0.6.7] - 2026-09-25
 
 ### Added
