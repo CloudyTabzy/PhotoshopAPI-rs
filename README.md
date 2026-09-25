@@ -153,9 +153,11 @@ composite, and replacement is transactional.
 - Rust 1.96 or newer
 - A 64-bit system; Linux, Windows or macOS
 
-No CPU feature requirements. The codecs are scalar code that LLVM
-auto-vectorizes, parallelized across scanlines with `rayon`; there is no
-hand-written AVX2 path to detect.
+The codecs are scalar code that LLVM auto-vectorizes, parallelized across
+scanlines with `rayon`; there is no hand-written AVX2 path. The vendored
+`psd-png` codec is the one exception: it carries a compile-time-selected SSE2
+`Paeth` reconstruction kernel, which is x86-64 baseline, and aarch64 NEON
+kernels for checksums — no runtime CPU feature detection anywhere.
 
 ## Install
 

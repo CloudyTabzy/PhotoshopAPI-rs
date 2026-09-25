@@ -12,6 +12,28 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-09-25
+
+### Changed
+
+- PNG Smart Object rasters now decode through the vendored `psd-png` codec instead of the
+  `image` crate. The decode streams rows straight into the planar channels — no whole decoded
+  image is ever materialised — so a decode's largest allocation is a bounded ~0.29 MiB stage
+  (independent of image size) plus the planar output, against the `image` crate's whole-image
+  buffer. On this repository's corpus, interleaved benchmark sessions with a live control put
+  the new path at **−55.0 %** wall time against the old one (2.2× faster). JPEG keeps decoding
+  through the `image` crate, unchanged.
+- The whole-image 8-bytes-per-pixel preflight no longer applies to PNG, because no whole-image
+  decoder buffer exists to budget: the cap now applies to the planar raster the port builds
+  (4 samples of `T` per pixel against the 512 MiB limit) and to the decoder's bounded stage.
+  An 8-bit document therefore accepts PNGs up to twice the old pixel budget, and a 32-bit-float
+  document is capped at its true 16 bytes per pixel, which the old path never enforced on its
+  own output.
+- `psd-png` is an optional dependency behind the `image` feature rather than a dev-dependency;
+  a build without that feature compiles and reports the same error as before.
+- `psd-png` validates PNG chunk CRCs by default, so a corrupted-CRC file is rejected by either
+  decoder; the failure message wording now comes from `psd-png`.
+
 ## [0.6.8] - 2026-09-25
 
 ### Added
