@@ -1931,4 +1931,224 @@ mod tests {
                 if message.contains("image buffer exceeds")
         ));
     }
+
+    /// Decodes a PNG with `psd-png` into the same `DecodedSource` shape the `image`-crate
+    /// path produces, so the two can be compared byte for byte.
+    ///
+    /// `psd-png` is always asked for 16-bit RGBA and the result goes through
+    /// `interleaved_to_planar`, which is the port's own conversion. That keeps the comparison
+    /// to the only thing that differs — which decoder produced the pixels — and leaves every
+    /// bit-depth decision in the port's `BitDepth` impl where it already lives.
+    ///
+    /// Asking for 8-bit instead would not be equivalent. `psd-png` narrows a 16-bit source by
+    /// keeping the high byte; the port narrows by `round(v / 257)`. The two disagree by one
+    /// least-significant bit on much of the range, and the corpus is entirely 8-bit, so
+    /// nothing else in the suite would notice.
+    ///
+    /// A 16-bit converted row is a byte buffer of big-endian samples rather than a `u16`
+    /// buffer, so it is deserialised here. The production path would do this with the
+    /// workspace's bulk byte-order helper instead of a per-sample conversion.
+    #[cfg(feature = "image")]
+    fn decode_raster_png_psd_png<T: BitDepth>(bytes: &[u8]) -> Result<DecodedSource<T>> {
+        let info =
+            psd_png::read_info(bytes).map_err(|error| PsdError::ImageDecode(error.to_string()))?;
+        let sample_count = checked_raster_sample_count::<T>(info.width, info.height)?;
+        let mut wide_bytes = Vec::new();
+        wide_bytes
+            .try_reserve_exact(sample_count.saturating_mul(4).saturating_mul(2))
+            .map_err(|error| {
+                PsdError::ImageDecode(format!("could not allocate decoded pixels: {error}"))
+            })?;
+        psd_png::Decoder::new()
+            .max_decompressed_size(Some(MAX_ENCODED_SOURCE_BYTES as usize))
+            .decode_to_rgba16(bytes, |row| {
+                wide_bytes.extend_from_slice(row.bytes);
+                Ok::<(), psd_png::Error>(())
+            })
+            .map_err(|error| PsdError::ImageDecode(error.to_string()))?;
+        let pixels: Vec<u16> = wide_bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect();
+        let raster =
+            interleaved_to_planar::<T, u16>(pixels, 4, info.width, info.height, sample_count)?;
+        Ok(DecodedSource {
+            raster,
+            file_type: *b"png ",
+        })
+    }
+
+    #[cfg(feature = "image")]
+    fn assert_same_raster<T: BitDepth + std::fmt::Debug>(
+        image_crate: &Raster<T>,
+        psd_png: &Raster<T>,
+        what: &str,
+    ) {
+        assert_eq!(
+            (image_crate.width(), image_crate.height()),
+            (psd_png.width(), psd_png.height()),
+            "{what}: dimensions differ"
+        );
+        for (channel_index, key) in [
+            ChannelKey::color(0),
+            ChannelKey::color(1),
+            ChannelKey::color(2),
+            ChannelKey::ALPHA,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let left = image_crate.channel(key).unwrap();
+            let right = psd_png.channel(key).unwrap();
+            assert_eq!(
+                left.len(),
+                right.len(),
+                "{what}: channel {channel_index} length differs"
+            );
+            for (sample_index, (a, b)) in left.iter().zip(right.iter()).enumerate() {
+                assert_eq!(
+                    a, b,
+                    "{what}: channel {channel_index} sample {sample_index} differs"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "image")]
+    fn assert_png_parity<T: BitDepth + std::fmt::Debug>(bytes: &[u8], what: &str) {
+        let image_crate = decode_source_raster::<T>(bytes)
+            .unwrap_or_else(|error| panic!("{what}: image-crate path failed: {error}"));
+        let psd_png = decode_raster_png_psd_png::<T>(bytes)
+            .unwrap_or_else(|error| panic!("{what}: psd-png path failed: {error}"));
+        assert_eq!(
+            image_crate.file_type, *b"png ",
+            "{what}: unexpected file type"
+        );
+        assert_eq!(psd_png.file_type, *b"png ", "{what}: unexpected file type");
+        assert_same_raster(&image_crate.raster, &psd_png.raster, what);
+    }
+
+    #[cfg(feature = "image")]
+    fn corpus_pngs() -> Vec<std::path::PathBuf> {
+        fn walk(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+                {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures"),
+            &mut found,
+        );
+        found.sort();
+        found
+    }
+
+    /// The gate for swapping the smart-object PNG decoder over: the two decoders must agree
+    /// byte for byte, at every bit depth the port supports, on every PNG in the corpus.
+    #[cfg(feature = "image")]
+    #[test]
+    fn psd_png_agrees_with_the_image_crate_on_every_corpus_png() {
+        let pngs = corpus_pngs();
+        assert!(
+            !pngs.is_empty(),
+            "no PNG fixtures found: the parity gate would pass without comparing anything"
+        );
+        for path in &pngs {
+            let bytes = read_source_file(path).unwrap();
+            let what = path.display().to_string();
+            assert_png_parity::<u8>(&bytes, &format!("{what} as u8"));
+            assert_png_parity::<u16>(&bytes, &format!("{what} as u16"));
+            assert_png_parity::<f32>(&bytes, &format!("{what} as f32"));
+        }
+    }
+
+    /// Greyscale is the case the port deliberately treats differently from upstream: it is
+    /// placed as neutral RGB, the way Photoshop places it. `psd-png` has to agree with that
+    /// rather than with the file's own single plane.
+    #[cfg(feature = "image")]
+    #[test]
+    fn psd_png_places_grayscale_as_neutral_rgb() {
+        let encode = |image: image::DynamicImage| {
+            let mut bytes = Vec::new();
+            image
+                .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .unwrap();
+            bytes
+        };
+        let gray = [0u8, 77, 200, 255];
+        let luma = image::GrayImage::from_raw(2, 2, gray.to_vec()).unwrap();
+        let bytes = encode(luma.into());
+
+        assert_png_parity::<u8>(&bytes, "8-bit greyscale as u8");
+        assert_png_parity::<u16>(&bytes, "8-bit greyscale as u16");
+
+        let decoded = decode_raster_png_psd_png::<u8>(&bytes).unwrap();
+        for index in 0..3 {
+            assert_eq!(
+                decoded.raster.channel(ChannelKey::color(index)).unwrap(),
+                gray,
+                "colour channel {index} is not neutral grey"
+            );
+        }
+        assert_eq!(decoded.raster.channel(ChannelKey::ALPHA).unwrap(), [255; 4]);
+
+        let luma_alpha =
+            image::GrayAlphaImage::from_raw(2, 2, vec![0, 10, 77, 128, 200, 255, 255, 0]).unwrap();
+        let bytes = encode(luma_alpha.into());
+        assert_png_parity::<u8>(&bytes, "8-bit greyscale+alpha as u8");
+        let decoded = decode_raster_png_psd_png::<u8>(&bytes).unwrap();
+        assert_eq!(
+            decoded.raster.channel(ChannelKey::ALPHA).unwrap(),
+            [10, 128, 255, 0]
+        );
+    }
+
+    /// A 16-bit source narrowed into an 8-bit document is the one place the two decoders can
+    /// silently disagree, and the corpus cannot catch it: every PNG in `fixtures/` is 8-bit.
+    /// `51_200` is one of the values where the two plausible rules part company —
+    /// `round(51200 / 257)` is 199, while keeping the high byte is 200.
+    #[cfg(feature = "image")]
+    #[test]
+    fn sixteen_bit_sources_keep_the_ports_narrowing_rule() {
+        let encode = |image: image::DynamicImage| {
+            let mut bytes = Vec::new();
+            image
+                .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .unwrap();
+            bytes
+        };
+        let samples = [0u16, 40_000, 51_200, 65_535];
+        let wide =
+            image::ImageBuffer::<image::Luma<u16>, _>::from_raw(4, 1, samples.to_vec()).unwrap();
+        let bytes = encode(wide.into());
+
+        assert_png_parity::<u8>(&bytes, "16-bit greyscale as u8");
+        assert_png_parity::<u16>(&bytes, "16-bit greyscale as u16");
+        assert_png_parity::<f32>(&bytes, "16-bit greyscale as f32");
+
+        // Pinned rather than merely compared: this is the rule a future decoder swap would
+        // change, and parity alone would not say which side moved.
+        let decoded = decode_raster_png_psd_png::<u8>(&bytes).unwrap();
+        assert_eq!(
+            decoded.raster.channel(ChannelKey::color(0)).unwrap(),
+            [0, 156, 199, 255]
+        );
+        let decoded = decode_raster_png_psd_png::<u16>(&bytes).unwrap();
+        assert_eq!(
+            decoded.raster.channel(ChannelKey::color(0)).unwrap(),
+            samples
+        );
+    }
 }

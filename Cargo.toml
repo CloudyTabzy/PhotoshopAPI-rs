@@ -1,18 +1,23 @@
 [workspace]
 resolver = "2"
-members = ["crates/psd-core", "crates/psd-codecs", "crates/psd", "crates/psd-py"]
+members = ["crates/psd-core", "crates/psd-codecs", "crates/psd-png", "crates/psd", "crates/psd-py"]
+# `crates/psd-png` carries its own benchmark and fuzz packages. Both declare themselves
+# workspace roots so they build standalone; excluding them keeps them out of this workspace
+# without breaking that.
+exclude = ["crates/psd-png/bench", "crates/psd-png/fuzz"]
 
 [workspace.package]
 edition = "2021"
 license = "BSD-3-Clause"
 # The single project version; bump it with every CHANGELOG.md entry.
-version = "0.6.6"
+version = "0.6.7"
 
 # Dependency versions are centralized here; crates pull them in with
 # `workspace = true`.
 [workspace.dependencies]
 psd-core = { path = "crates/psd-core" }
 psd-codecs = { path = "crates/psd-codecs" }
+psd-png = { path = "crates/psd-png" }
 psd = { path = "crates/psd" }
 
 thiserror = "2"

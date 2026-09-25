@@ -20,15 +20,10 @@ exclude = ["bench/", "fuzz/", ".github/"]
 # by default: without it the process environment has no say in which code runs.
 scalar-override = []
 
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-
-[profile.bench]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-
-[workspace]
-members = [".", "bench"]
+# The profile and workspace tables below were present when this crate was a standalone
+# repository. They are removed here because a workspace member cannot also be a workspace
+# root, and cannot carry profiles of its own: `bench/` and `fuzz/` are excluded by the parent
+# workspace instead, so both still build standalone, and the parent workspace declares no
+# release profile, so the only thing lost is this crate's former `lto = "thin"` and
+# `codegen-units = 1` for its own release builds. Re-applying this edit is part of syncing a
+# newer revision of this crate into the workspace.

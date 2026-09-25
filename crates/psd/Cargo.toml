@@ -21,3 +21,9 @@ memmap2.workspace = true
 nalgebra.workspace = true
 image = { workspace = true, optional = true }
 uuid.workspace = true
+
+# `psd-png` is not a production dependency yet. It is here so the differential test can
+# prove it agrees with the `image`-crate path byte for byte before the smart-object decoder
+# is switched over; see `smart_object.rs`'s module tests.
+[dev-dependencies]
+psd-png.workspace = true

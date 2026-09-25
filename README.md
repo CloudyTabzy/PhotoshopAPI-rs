@@ -52,18 +52,28 @@ This is the substance of the port, not a feature checkbox.
 
 ### A clean dependency ladder
 
-Four crates, each with a strictly narrower job than its neighbour:
+Five crates, each with a strictly narrower job than its neighbour:
 
 | Crate | Responsibility | Depends on |
 |---|---|---|
 | `psd-core` | Raw on-disk sections, tagged blocks, descriptors | *(nothing)* |
 | `psd-codecs` | RLE / ZIP / ZIP-prediction / endian / interleave | *(nothing)* |
+| `psd-png` | Streaming, memory-bounded PNG decoder (vendored fork) | *(nothing)* |
 | `psd` | The `LayeredFile<T>` document API | `psd-core`, `psd-codecs` |
 | `psd-py` | Python bindings (PyO3) | `psd` |
 
 `psd-core` knows nothing about pixels and `psd-codecs` knows nothing about
 Photoshop, so each is testable in isolation — the format layer has no codec
 dependency at all, and synthesizes the merged composite's bytes itself.
+
+`psd-png` is a fork of [png-spark](https://github.com/stephenberry/png-spark)
+0.2.0 by Stephen Berry, vendored here whole. It decodes a PNG one scanline at
+a time while holding a few hundred kilobytes, whatever the image's height, and
+its design and measurements are in `crates/psd-png/docs/`. It is MIT OR
+Apache-2.0 rather than BSD 3-Clause; see the third-party section of `LICENSE`.
+It is currently a **dev-dependency only**: a differential test decodes every
+corpus PNG through both it and the `image` crate and requires byte equality, but
+nothing in the read path uses it yet.
 
 ### An arena layer tree, addressed by identity and by path
 

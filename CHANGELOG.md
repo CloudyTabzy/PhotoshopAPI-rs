@@ -12,6 +12,26 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-09-25
+
+### Added
+
+- `crates/psd-png`, a vendored fork of the png-spark PNG codec, is now a workspace member. It
+  is a **dev-dependency only** at this point: nothing in the read path uses it yet. What it
+  brings is a differential test that decodes every PNG in the corpus through both it and the
+  `image` crate, at `u8`, `u16` and `f32`, and requires the two to agree byte for byte, plus
+  coverage for the greyscale and 16-bit cases the corpus does not contain.
+- A test pinning how a 16-bit source is narrowed into an 8-bit document. The port narrows by
+  `round(v / 257)`; `psd-png` keeps the high byte, and the two disagree by one
+  least-significant bit across much of the range. Every PNG in `fixtures/` is 8-bit, so no other
+  test would notice a decoder swap that changed this — the test fails if the swap is made.
+
+### Changed
+
+- The workspace's third-party code is now recorded in `LICENSE`, and the dependency ladder in
+  `README.md` lists the vendored crate. `crates/psd-png` is MIT OR Apache-2.0 with its original
+  copyright retained, so it is not covered by this project's BSD 3-Clause terms.
+
 ## [0.6.6] - 2026-09-24
 
 ### Added
