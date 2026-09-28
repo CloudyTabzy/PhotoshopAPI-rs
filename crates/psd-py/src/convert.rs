@@ -158,11 +158,20 @@ pub fn read_options_from_py(memory_limit: Option<i64>) -> PyResult<psd::ReadOpti
 }
 
 /// `photoshopapi.enum.BitDepth` for a sample depth in bits.
+///
+/// The raw values are upstream's: `BD_1 = 0`, `BD_8 = 1`, `BD_16 = 2`,
+/// `BD_32 = 3`.
 pub fn bit_depth_to_py(py: Python<'_>, depth: u16) -> PyResult<Py<PyAny>> {
     let raw = match depth {
+        1 => 0,
         8 => 1,
         16 => 2,
-        _ => 3,
+        32 => 3,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown bit depth {other}; expected 1, 8, 16 or 32"
+            )))
+        }
     };
     py_enum(py, "BitDepth", raw)
 }

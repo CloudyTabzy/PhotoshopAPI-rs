@@ -226,6 +226,42 @@ class TextRangeTest(unittest.TestCase):
             layer.split_style_run(0, 99)
 
 
+class OneBitDocumentTest(unittest.TestCase):
+    """A 1-bit (bitmap mode) document reads as an 8-bit one.
+
+    The minimal file below is a valid 1x1 grayscale bitmap document: the
+    header declares depth 1 and the layer-and-mask section is empty. Its
+    on-disk depth is reported through ``source_depth`` while ``bit_depth``
+    stays 8, the depth it is read at.
+    """
+
+    @staticmethod
+    def one_bit_bytes() -> bytes:
+        import struct
+
+        header = b"8BPS" + struct.pack(">H", 1) + bytes(6)
+        header += struct.pack(">HIIHH", 1, 1, 1, 1, 1)  # channels, h, w, depth 1, grayscale
+        return header + struct.pack(">I", 0) + struct.pack(">I", 0) + struct.pack(">I", 0)
+
+    def test_reads_and_reports_the_source_depth(self):
+        document = psapi.LayeredFile.read(io.BytesIO(self.one_bit_bytes()))
+        self.assertIsInstance(document, psapi.LayeredFile_8bit)
+        self.assertEqual(document.bit_depth, psapi.enum.BitDepth.bd_8)
+        self.assertEqual(document.source_depth, psapi.enum.BitDepth.bd_1)
+
+        # A file written back out is an ordinary 8-bit document.
+        reread = psapi.LayeredFile_8bit.from_bytes(document.to_bytes())
+        self.assertEqual(reread.source_depth, psapi.enum.BitDepth.bd_8)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "bitmap.psd")
+            with open(path, "wb") as handle:
+                handle.write(self.one_bit_bytes())
+            self.assertEqual(
+                psapi.PhotoshopFile.find_bitdepth(path), psapi.enum.BitDepth.bd_1
+            )
+
+
 class IoTest(unittest.TestCase):
     def test_streams_and_photoshop_file(self):
         document = psapi.LayeredFile_32bit(psapi.enum.ColorMode.rgb, 4, 4)

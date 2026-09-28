@@ -4,6 +4,7 @@ from enum import IntEnum
 
 
 class BitDepth(IntEnum):
+    bd_1 = 0
     bd_8 = 1
     bd_16 = 2
     bd_32 = 3

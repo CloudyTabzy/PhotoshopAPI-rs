@@ -12,6 +12,20 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.22] - 2026-09-28
+
+### Fixed
+
+- Python bindings: a 1-bit (bitmap mode) file reports `BitDepth.bd_1` from
+  `PhotoshopFile.find_bitdepth` instead of the 32-bit fallback, and the
+  `BitDepth` enum gains its `bd_1` member (upstream's `BD_1 = 0`).
+
+### Added
+
+- Python bindings: `LayeredFile_*.source_depth` reports the file's on-disk
+  depth, which differs from `bit_depth` only for 1-bit documents (they read
+  as 8-bit ones, and saving writes 8-bit).
+
 ## [0.6.21] - 2026-09-28
 
 ### Added

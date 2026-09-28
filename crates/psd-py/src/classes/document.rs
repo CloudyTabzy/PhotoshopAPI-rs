@@ -181,6 +181,16 @@ macro_rules! document_class {
                 bit_depth_to_py(py, <Sample as BitDepth>::DEPTH)
             }
 
+            /// The file's on-disk depth. It differs from
+            /// [`bit_depth`](Self::bit_depth) only for 1-bit (bitmap mode)
+            /// documents, which read as 8-bit ones; saving such a document
+            /// writes 8-bit.
+            #[getter]
+            fn source_depth(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+                let depth = read_document(&self.inner, |file| Ok(file.source_depth))?;
+                bit_depth_to_py(py, depth)
+            }
+
             #[getter(color_mode)]
             fn py_color_mode(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
                 py_enum(py, "ColorMode", i64::from(self.color_mode()?.as_raw()))
