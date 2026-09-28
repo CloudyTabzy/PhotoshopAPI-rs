@@ -81,9 +81,228 @@ fn scalar_forced() -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// Row-conversion kernels
+//
+// `transform.rs` converts a reconstructed row into the layout a caller asked for. Most of
+// that work is per-pixel shuffling — widen, narrow, replicate, resolve a palette — which
+// is the shape SIMD eats. The same rules as the filter kernels apply: SSE2 only (it is
+// x86-64 baseline), every load and store goes through bounds-checked indexing, the
+// `scalar-override` switch turns the whole layer off for measurement, and anything not
+// claimed falls back to `transform.rs`'s scalar helpers untouched.
+
+use crate::common::{BitDepth, ColorType};
+use crate::error::Error;
+use crate::transform::Palette;
+
+/// What one converting row needs, resolved once per image by `RowConverter`.
+pub(crate) struct RowConversion<'a> {
+    pub(crate) color_type: ColorType,
+    pub(crate) bit_depth: BitDepth,
+    /// Samples per output pixel: 3 or 4.
+    pub(crate) channels: usize,
+    /// Whether output samples are 16-bit big-endian, or 8-bit.
+    pub(crate) wide: bool,
+    /// The `tRNS` grey level of a greyscale image, at the file's own depth.
+    pub(crate) grey_key: Option<u16>,
+    /// The `tRNS` colour of an RGB image, at the file's own depth.
+    pub(crate) rgb_key: Option<[u16; 3]>,
+    /// The resolved palette of an indexed image.
+    pub(crate) palette: Option<&'a Palette>,
+}
+
+/// Converts `row` into `target` on the fastest path the shape has, or reports that the
+/// caller's scalar path must do it.
+///
+/// `Ok(false)` leaves `target` untouched; `Err` means a malformed row was caught
+/// mid-conversion, exactly as the scalar path would report it.
+pub(crate) fn convert_row(
+    conv: &RowConversion<'_>,
+    row: &[u8],
+    target: &mut [u8],
+) -> Result<bool, Error> {
+    if scalar_forced() {
+        return Ok(false);
+    }
+    // The indexed path is a resolved-table copy — portable scalar, worth having on every
+    // target. The palette load per pixel is a gather SSE2 cannot do, so no kernel exists
+    // for it; the win over the generic path is one entry copy instead of four
+    // per-channel writes.
+    if conv.color_type == ColorType::Indexed {
+        let Some(palette) = conv.palette else { return Ok(false) };
+        return indexed(conv, row, target, palette);
+    }
+    // `Rgb` → `Rgba` is one copy plus a fixed alpha lane per pixel — portable scalar,
+    // and only for the keyless shape, which the byte-level kernels express exactly. A
+    // `tRNS`-keyed row needs a whole-pixel compare per pixel and stays scalar.
+    if conv.color_type == ColorType::Rgb {
+        return rgb_to_rgba(conv, row, target);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86::convert_row(conv, row, target)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (row, target);
+        Ok(false)
+    }
+}
+
+/// Pixels the sub-byte depths are unpacked into before the byte-level paths run. Any
+/// width is fine as long as the per-row cost stays small; the scratch is stack memory.
+const SUBBYTE_CHUNK: usize = 512;
+
+/// Splits a sub-byte-depth row into ≤ [`SUBBYTE_CHUNK`]-pixel spans, unpacks each span
+/// MSB-first into a scratch row of whole bytes, and runs `emit` on it.
+fn chunked_subbyte(
+    bits: usize,
+    row: &[u8],
+    target: &mut [u8],
+    out_stride: usize,
+    emit: &mut impl FnMut(&[u8], &mut [u8]) -> Result<(), Error>,
+) -> Result<bool, Error> {
+    let width = target.len() / out_stride;
+    if row.len() != (width * bits).div_ceil(8) {
+        return Ok(false);
+    }
+    let mut scratch = [0u8; SUBBYTE_CHUNK];
+    let mut x = 0;
+    while x < width {
+        let n = (width - x).min(SUBBYTE_CHUNK);
+        let mask = (1u8 << bits) - 1;
+        for (i, slot) in scratch[..n].iter_mut().enumerate() {
+            let bit = (x + i) * bits;
+            *slot = (row[bit / 8] >> (8 - bits - bit % 8)) & mask;
+        }
+        emit(&scratch[..n], &mut target[x * out_stride..(x + n) * out_stride])?;
+        x += n;
+    }
+    Ok(true)
+}
+
+/// One resolved-table lookup and one fixed-size entry copy per pixel — the indexed
+/// conversion's inner loop.
+///
+/// `OUT` is the bytes an output pixel occupies (3, 4, 6 or 8) and fixes the table stride
+/// with it: entries are 4 bytes wide for 8-bit outputs and 8 for 16-bit ones. The copy is
+/// a constant size, so it compiles to a single load and store — a runtime stride here
+/// would turn it into a `memcpy` call per pixel, which measured slower than the scalar
+/// per-channel write it replaces.
+fn indexed_emit<const OUT: usize>(
+    palette: &Palette,
+    indices: &[u8],
+    target: &mut [u8],
+) -> Result<(), Error> {
+    if OUT == 4 {
+        for (pixel, &index) in target.chunks_exact_mut(OUT).zip(indices) {
+            if usize::from(index) >= palette.len {
+                return Err(Error::PaletteIndexOutOfRange);
+            }
+            pixel.copy_from_slice(&palette.rgba[usize::from(index)]);
+        }
+    } else if OUT == 8 {
+        for (pixel, &index) in target.chunks_exact_mut(OUT).zip(indices) {
+            if usize::from(index) >= palette.len {
+                return Err(Error::PaletteIndexOutOfRange);
+            }
+            pixel.copy_from_slice(&palette.rgba16[usize::from(index)]);
+        }
+    } else if OUT == 3 {
+        // Three-channel targets take the RGB prefix of the same entries, alpha dropped.
+        for (pixel, &index) in target.chunks_exact_mut(OUT).zip(indices) {
+            if usize::from(index) >= palette.len {
+                return Err(Error::PaletteIndexOutOfRange);
+            }
+            pixel.copy_from_slice(&palette.rgba[usize::from(index)][..OUT]);
+        }
+    } else {
+        for (pixel, &index) in target.chunks_exact_mut(OUT).zip(indices) {
+            if usize::from(index) >= palette.len {
+                return Err(Error::PaletteIndexOutOfRange);
+            }
+            pixel.copy_from_slice(&palette.rgba16[usize::from(index)][..OUT]);
+        }
+    }
+    Ok(())
+}
+
+/// `Rgb` → `Rgba` for the keyless shape: the three channels copy straight over and the
+/// alpha lane takes the constant. 16-bit copies carry the big-endian byte order through
+/// untouched.
+///
+/// Only the widening shapes are claimed: measured against the scalar helpers, the
+/// equal-width ones — 8→8 and 16→16 — lose to the autovectorised scalar loop.
+fn rgb_to_rgba(conv: &RowConversion<'_>, row: &[u8], target: &mut [u8]) -> Result<bool, Error> {
+    if conv.channels != 4 || conv.rgb_key.is_some() {
+        return Ok(false);
+    }
+    match (conv.bit_depth, conv.wide) {
+        (BitDepth::Eight, true) => {
+            let width = target.len() / 8;
+            if row.len() != width * 3 {
+                return Ok(false);
+            }
+            for (i, px) in row.chunks_exact(3).enumerate() {
+                let (r, g, b) = (px[0], px[1], px[2]);
+                target[8 * i..8 * i + 8].copy_from_slice(&[r, r, g, g, b, b, 0xFF, 0xFF]);
+            }
+        }
+        (BitDepth::Sixteen, false) => {
+            let width = target.len() / 4;
+            if row.len() != width * 6 {
+                return Ok(false);
+            }
+            for (i, px) in row.chunks_exact(6).enumerate() {
+                target[4 * i..4 * i + 4].copy_from_slice(&[px[0], px[2], px[4], 255]);
+            }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// The indexed conversion: a table copy per pixel, portable to every target.
+///
+/// At depth 8 every output width is claimed. The sub-byte depths are claimed only for
+/// 16-bit output, where the widened table copy beats the scalar per-channel write —
+/// measured against the scalar helpers, the 8-bit sub-byte path loses to the
+/// autovectorised scalar loop.
+fn indexed(
+    conv: &RowConversion<'_>,
+    row: &[u8],
+    target: &mut [u8],
+    palette: &Palette,
+) -> Result<bool, Error> {
+    let out = conv.channels * usize::from(conv.wide) + conv.channels;
+    let mut emit = |indices: &[u8], target: &mut [u8]| match out {
+        3 => indexed_emit::<3>(palette, indices, target),
+        4 => indexed_emit::<4>(palette, indices, target),
+        6 => indexed_emit::<6>(palette, indices, target),
+        8 => indexed_emit::<8>(palette, indices, target),
+        _ => Ok(()),
+    };
+    match conv.bit_depth {
+        BitDepth::Eight => {
+            if row.len() != target.len() / out {
+                return Ok(false);
+            }
+            emit(row, target)?;
+            Ok(true)
+        }
+        depth @ (BitDepth::One | BitDepth::Two | BitDepth::Four) if conv.wide => {
+            chunked_subbyte(depth.bits(), row, target, out, &mut emit)
+        }
+        BitDepth::One | BitDepth::Two | BitDepth::Four | BitDepth::Sixteen => Ok(false),
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use core::arch::x86_64::*;
+
+    use super::{Error, RowConversion};
+    use crate::common::{BitDepth, ColorType};
 
     // Every kernel below is compiled for SSE2 and relies on nothing else. The x86-64 baseline
     // includes it, so this holds on every x86-64 target; if a custom target ever turned it
@@ -243,6 +462,431 @@ mod x86 {
     #[target_feature(enable = "sse2")]
     fn widen(bytes: [u8; 4]) -> __m128i {
         _mm_unpacklo_epi8(_mm_cvtsi32_si128(i32::from_le_bytes(bytes)), _mm_setzero_si128())
+    }
+
+    // ------------------------------------------------------------------
+    // Conversion kernels: a native-layout row in, interleaved pixels out.
+    //
+    // The 16-bit cases never byteswap: a big-endian sample read as a little-endian lane is
+    // the swapped value, and storing that lane little-endian writes the same bytes back —
+    // the swap is invisible end to end. Only the `tRNS` compares see it, and they compare
+    // against a swapped key instead.
+
+    /// Sixteen bytes of `bytes` as a vector, read through slice indexing rather than a
+    /// pointer load.
+    #[target_feature(enable = "sse2")]
+    fn load16(bytes: &[u8]) -> __m128i {
+        _mm_set_epi64x(
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as i64,
+            u64::from_le_bytes(bytes[..8].try_into().unwrap()) as i64,
+        )
+    }
+
+    /// The sixteen bytes of `v` into `target`, again through indexing only.
+    #[target_feature(enable = "sse2")]
+    fn store16(target: &mut [u8], v: __m128i) {
+        target[..8].copy_from_slice(&_mm_cvtsi128_si64(v).to_le_bytes());
+        target[8..16].copy_from_slice(&_mm_cvtsi128_si64(_mm_srli_si128(v, 8)).to_le_bytes());
+    }
+
+    /// Stores one block of four RGBA8 pixels built from a replicated sample: `u` holds
+    /// `v, v, v, v` per pixel, `matched` the `tRNS` compare expanded the same way (all
+    /// ones where the pixel is transparent). A zero `matched` leaves every pixel opaque.
+    #[target_feature(enable = "sse2")]
+    fn emit8(u: __m128i, matched: __m128i, target: &mut [u8]) {
+        let px = _mm_or_si128(
+            _mm_and_si128(u, _mm_set1_epi32(0x00FF_FFFF)),
+            _mm_andnot_si128(matched, _mm_set1_epi32(0xFF00_0000u32 as i32)),
+        );
+        store16(target, px);
+    }
+
+    /// The same for a 16-bit target: `u` holds four `u16` lanes per pixel, the last takes
+    /// the alpha. Lanes 3 and 7 are the two pixels' alpha positions.
+    #[target_feature(enable = "sse2")]
+    fn emit16(u: __m128i, matched: __m128i, target: &mut [u8]) {
+        let px = _mm_or_si128(
+            _mm_and_si128(u, _mm_set_epi16(0, -1, -1, -1, 0, -1, -1, -1)),
+            _mm_andnot_si128(matched, _mm_set_epi16(-1, 0, 0, 0, -1, 0, 0, 0)),
+        );
+        store16(target, px);
+    }
+
+    /// `Greyscale` at depth 8 → RGBA8: every byte becomes `v, v, v, alpha`.
+    #[target_feature(enable = "sse2")]
+    fn grey8_rgba8(row: &[u8], target: &mut [u8], key: Option<u16>) -> bool {
+        let width = target.len() / 4;
+        if row.len() != width {
+            return false;
+        }
+        // A key past one byte can never equal a byte sample — every pixel stays opaque.
+        let key = key.and_then(|k| u8::try_from(k).ok());
+        let keyv = key.map_or_else(|| _mm_setzero_si128(), |k| _mm_set1_epi8(k as i8));
+        let mut x = 0;
+        let mut o = 0;
+        while x + 16 <= width {
+            let v = load16(&row[x..]);
+            let c = if key.is_some() { _mm_cmpeq_epi8(v, keyv) } else { _mm_setzero_si128() };
+            let (t_lo, t_hi) = (_mm_unpacklo_epi8(v, v), _mm_unpackhi_epi8(v, v));
+            let (c_lo, c_hi) = (_mm_unpacklo_epi8(c, c), _mm_unpackhi_epi8(c, c));
+            emit8(_mm_unpacklo_epi16(t_lo, t_lo), _mm_unpacklo_epi16(c_lo, c_lo), &mut target[o..]);
+            emit8(
+                _mm_unpackhi_epi16(t_lo, t_lo),
+                _mm_unpackhi_epi16(c_lo, c_lo),
+                &mut target[o + 16..],
+            );
+            emit8(
+                _mm_unpacklo_epi16(t_hi, t_hi),
+                _mm_unpacklo_epi16(c_hi, c_hi),
+                &mut target[o + 32..],
+            );
+            emit8(
+                _mm_unpackhi_epi16(t_hi, t_hi),
+                _mm_unpackhi_epi16(c_hi, c_hi),
+                &mut target[o + 48..],
+            );
+            x += 16;
+            o += 64;
+        }
+        for &g in &row[x..width] {
+            let a = if key.is_some_and(|k| g == k) { 0 } else { 255 };
+            target[o..o + 4].copy_from_slice(&[g, g, g, a]);
+            o += 4;
+        }
+        true
+    }
+
+    /// `Greyscale` at depth 16 → RGBA8: the file's high byte is the output sample —
+    /// which is the low byte of the swapped `u16` lane — replicated, with the `tRNS`
+    /// compare still taken at the full 16 bits against a swapped key.
+    #[target_feature(enable = "sse2")]
+    fn grey16_rgba8(row: &[u8], target: &mut [u8], key: Option<u16>) -> bool {
+        let width = target.len() / 4;
+        if row.len() != width * 2 {
+            return false;
+        }
+        let keyv =
+            key.map_or_else(|| _mm_setzero_si128(), |k| _mm_set1_epi16(k.swap_bytes() as i16));
+        let low = _mm_set1_epi16(0x00FF);
+        let mut x = 0;
+        let mut o = 0;
+        while x + 16 <= width {
+            let a = load16(&row[2 * x..]);
+            let b = load16(&row[2 * x + 16..]);
+            let g = _mm_packus_epi16(_mm_and_si128(a, low), _mm_and_si128(b, low));
+            let c = if key.is_some() {
+                _mm_packus_epi16(
+                    _mm_and_si128(_mm_cmpeq_epi16(a, keyv), low),
+                    _mm_and_si128(_mm_cmpeq_epi16(b, keyv), low),
+                )
+            } else {
+                _mm_setzero_si128()
+            };
+            let (t_lo, t_hi) = (_mm_unpacklo_epi8(g, g), _mm_unpackhi_epi8(g, g));
+            let (c_lo, c_hi) = (_mm_unpacklo_epi8(c, c), _mm_unpackhi_epi8(c, c));
+            emit8(_mm_unpacklo_epi16(t_lo, t_lo), _mm_unpacklo_epi16(c_lo, c_lo), &mut target[o..]);
+            emit8(
+                _mm_unpackhi_epi16(t_lo, t_lo),
+                _mm_unpackhi_epi16(c_lo, c_lo),
+                &mut target[o + 16..],
+            );
+            emit8(
+                _mm_unpacklo_epi16(t_hi, t_hi),
+                _mm_unpacklo_epi16(c_hi, c_hi),
+                &mut target[o + 32..],
+            );
+            emit8(
+                _mm_unpackhi_epi16(t_hi, t_hi),
+                _mm_unpackhi_epi16(c_hi, c_hi),
+                &mut target[o + 48..],
+            );
+            x += 16;
+            o += 64;
+        }
+        for px in row[2 * x..2 * width].chunks_exact(2) {
+            let raw = u16::from_be_bytes([px[0], px[1]]);
+            let a = if key == Some(raw) { 0 } else { 255 };
+            target[o..o + 4].copy_from_slice(&[px[0], px[0], px[0], a]);
+            o += 4;
+        }
+        true
+    }
+
+    /// `Greyscale` at depth 16 → RGBA16: the `u16` lane is already the output sample.
+    #[target_feature(enable = "sse2")]
+    fn grey16_rgba16(row: &[u8], target: &mut [u8], key: Option<u16>) -> bool {
+        let width = target.len() / 8;
+        if row.len() != width * 2 {
+            return false;
+        }
+        let keyv =
+            key.map_or_else(|| _mm_setzero_si128(), |k| _mm_set1_epi16(k.swap_bytes() as i16));
+        let mut x = 0;
+        let mut o = 0;
+        while x + 8 <= width {
+            let v = load16(&row[2 * x..]);
+            let c = if key.is_some() { _mm_cmpeq_epi16(v, keyv) } else { _mm_setzero_si128() };
+            let (d_lo, d_hi) = (_mm_unpacklo_epi16(v, v), _mm_unpackhi_epi16(v, v));
+            let (m_lo, m_hi) = (_mm_unpacklo_epi16(c, c), _mm_unpackhi_epi16(c, c));
+            emit16(
+                _mm_unpacklo_epi32(d_lo, d_lo),
+                _mm_unpacklo_epi32(m_lo, m_lo),
+                &mut target[o..],
+            );
+            emit16(
+                _mm_unpackhi_epi32(d_lo, d_lo),
+                _mm_unpackhi_epi32(m_lo, m_lo),
+                &mut target[o + 16..],
+            );
+            emit16(
+                _mm_unpacklo_epi32(d_hi, d_hi),
+                _mm_unpacklo_epi32(m_hi, m_hi),
+                &mut target[o + 32..],
+            );
+            emit16(
+                _mm_unpackhi_epi32(d_hi, d_hi),
+                _mm_unpackhi_epi32(m_hi, m_hi),
+                &mut target[o + 48..],
+            );
+            x += 8;
+            o += 64;
+        }
+        for px in row[2 * x..2 * width].chunks_exact(2) {
+            let raw = u16::from_be_bytes([px[0], px[1]]);
+            let a = if key == Some(raw) { [0, 0] } else { [0xFF, 0xFF] };
+            target[o..o + 8]
+                .copy_from_slice(&[px[0], px[1], px[0], px[1], px[0], px[1], a[0], a[1]]);
+            o += 8;
+        }
+        true
+    }
+
+    /// `Greyscale` at depth 16 → RGBA, whichever output width was asked for.
+    #[target_feature(enable = "sse2")]
+    fn grey16_rgba(row: &[u8], target: &mut [u8], wide: bool, key: Option<u16>) -> bool {
+        if wide { grey16_rgba16(row, target, key) } else { grey16_rgba8(row, target, key) }
+    }
+
+    /// The `GreyscaleAlpha` lane fix shared by every output shape: a `[g, g, a, a]`
+    /// byte pattern per pixel becomes `[g, g, g, a]`.
+    #[target_feature(enable = "sse2")]
+    fn graya_fix(t: __m128i) -> __m128i {
+        _mm_or_si128(
+            _mm_and_si128(t, _mm_set1_epi32(0xFF00_FFFFu32 as i32)),
+            _mm_and_si128(_mm_slli_epi32(t, 8), _mm_set1_epi32(0x00FF_0000)),
+        )
+    }
+
+    /// `GreyscaleAlpha` at depth 8 → RGBA8: `[g, a]` pairs become `g, g, g, a`.
+    #[target_feature(enable = "sse2")]
+    fn graya8_rgba8(row: &[u8], target: &mut [u8]) -> bool {
+        let width = target.len() / 4;
+        if row.len() != width * 2 {
+            return false;
+        }
+        let mut x = 0;
+        let mut o = 0;
+        while x + 8 <= width {
+            let v = load16(&row[2 * x..]);
+            store16(&mut target[o..], graya_fix(_mm_unpacklo_epi8(v, v)));
+            store16(&mut target[o + 16..], graya_fix(_mm_unpackhi_epi8(v, v)));
+            x += 8;
+            o += 32;
+        }
+        for px in row[2 * x..2 * width].chunks_exact(2) {
+            target[o..o + 4].copy_from_slice(&[px[0], px[0], px[0], px[1]]);
+            o += 4;
+        }
+        true
+    }
+
+    /// `GreyscaleAlpha` at depth 8 → RGBA16: the fixed `[g, g, g, a]` bytes widen to
+    /// `u16` samples by one more byte-pair unpack each.
+    #[target_feature(enable = "sse2")]
+    fn graya8_rgba16(row: &[u8], target: &mut [u8]) -> bool {
+        let width = target.len() / 8;
+        if row.len() != width * 2 {
+            return false;
+        }
+        let mut x = 0;
+        let mut o = 0;
+        while x + 8 <= width {
+            let v = load16(&row[2 * x..]);
+            for t in [_mm_unpacklo_epi8(v, v), _mm_unpackhi_epi8(v, v)] {
+                let px = graya_fix(t);
+                store16(&mut target[o..], _mm_unpacklo_epi8(px, px));
+                store16(&mut target[o + 16..], _mm_unpackhi_epi8(px, px));
+                o += 32;
+            }
+            x += 8;
+        }
+        for px in row[2 * x..2 * width].chunks_exact(2) {
+            let (g, a) = (px[0], px[1]);
+            target[o..o + 8].copy_from_slice(&[g, g, g, g, g, g, a, a]);
+            o += 8;
+        }
+        true
+    }
+
+    /// `GreyscaleAlpha` at depth 16 → RGBA8: lanes narrow to their low bytes (the file's
+    /// high bytes), giving the same `[g, a]` pairs the 8-bit kernel expands.
+    #[target_feature(enable = "sse2")]
+    fn graya16_rgba8(row: &[u8], target: &mut [u8]) -> bool {
+        let width = target.len() / 4;
+        if row.len() != width * 4 {
+            return false;
+        }
+        let low = _mm_set1_epi16(0x00FF);
+        let mut x = 0;
+        let mut o = 0;
+        while x + 8 <= width {
+            let a = load16(&row[4 * x..]);
+            let b = load16(&row[4 * x + 16..]);
+            let pairs = _mm_packus_epi16(_mm_and_si128(a, low), _mm_and_si128(b, low));
+            store16(&mut target[o..], graya_fix(_mm_unpacklo_epi8(pairs, pairs)));
+            store16(&mut target[o + 16..], graya_fix(_mm_unpackhi_epi8(pairs, pairs)));
+            x += 8;
+            o += 32;
+        }
+        for px in row[4 * x..4 * width].chunks_exact(4) {
+            target[o..o + 4].copy_from_slice(&[px[0], px[0], px[0], px[2]]);
+            o += 4;
+        }
+        true
+    }
+
+    /// `GreyscaleAlpha` at depth 16 → RGBA16: `[G, A]` lanes become `G, G, G, A`, the
+    /// byte order riding through untouched.
+    #[target_feature(enable = "sse2")]
+    fn graya16_rgba16(row: &[u8], target: &mut [u8]) -> bool {
+        let width = target.len() / 8;
+        if row.len() != width * 4 {
+            return false;
+        }
+        // Per u64 lane the pair pattern is `[G, G, A, A]`; lane 2 must hold a copy of
+        // lane 0 instead of the second `A`.
+        let keep = _mm_set_epi64x(0xFFFF_0000_FFFF_FFFFu64 as i64, 0xFFFF_0000_FFFF_FFFFu64 as i64);
+        let fill_at =
+            _mm_set_epi64x(0x0000_FFFF_0000_0000u64 as i64, 0x0000_FFFF_0000_0000u64 as i64);
+        let mut x = 0;
+        let mut o = 0;
+        while x + 4 <= width {
+            let v = load16(&row[4 * x..]);
+            for t in [_mm_unpacklo_epi16(v, v), _mm_unpackhi_epi16(v, v)] {
+                let px = _mm_or_si128(
+                    _mm_and_si128(t, keep),
+                    _mm_and_si128(_mm_slli_epi64(t, 32), fill_at),
+                );
+                store16(&mut target[o..], px);
+                o += 16;
+            }
+            x += 4;
+        }
+        for px in row[4 * x..4 * width].chunks_exact(4) {
+            let (g, a) = ([px[0], px[1]], [px[2], px[3]]);
+            target[o..o + 8].copy_from_slice(&[g[0], g[1], g[0], g[1], g[0], g[1], a[0], a[1]]);
+            o += 8;
+        }
+        true
+    }
+
+    /// `GreyscaleAlpha` at either depth → RGBA, whichever output width was asked for.
+    #[target_feature(enable = "sse2")]
+    fn graya_rgba(row: &[u8], target: &mut [u8], depth: BitDepth, wide: bool) -> bool {
+        match (depth, wide) {
+            (BitDepth::Eight, false) => graya8_rgba8(row, target),
+            (BitDepth::Eight, true) => graya8_rgba16(row, target),
+            (BitDepth::Sixteen, false) => graya16_rgba8(row, target),
+            (BitDepth::Sixteen, true) => graya16_rgba16(row, target),
+            _ => false,
+        }
+    }
+
+    /// `Rgba` at depth 16 → RGBA8: each `u16` lane narrows to its low byte — the file's
+    /// high byte.
+    #[target_feature(enable = "sse2")]
+    fn rgba16_rgba8(row: &[u8], target: &mut [u8]) -> bool {
+        let width = target.len() / 4;
+        if row.len() != width * 8 {
+            return false;
+        }
+        let low = _mm_set1_epi16(0x00FF);
+        let mut x = 0;
+        let mut o = 0;
+        while x + 4 <= width {
+            let a = load16(&row[8 * x..]);
+            let b = load16(&row[8 * x + 16..]);
+            store16(
+                &mut target[o..],
+                _mm_packus_epi16(_mm_and_si128(a, low), _mm_and_si128(b, low)),
+            );
+            x += 4;
+            o += 16;
+        }
+        for px in row[8 * x..8 * width].chunks_exact(8) {
+            target[o..o + 4].copy_from_slice(&[px[0], px[2], px[4], px[6]]);
+            o += 4;
+        }
+        true
+    }
+
+    /// `Rgba` at depth 8 → RGBA16: one byte-pair unpack per half block widens every
+    /// sample by `v * 257` for free.
+    #[target_feature(enable = "sse2")]
+    fn rgba8_rgba16(row: &[u8], target: &mut [u8]) -> bool {
+        let width = target.len() / 8;
+        if row.len() != width * 4 {
+            return false;
+        }
+        let mut x = 0;
+        let mut o = 0;
+        while x + 4 <= width {
+            let v = load16(&row[4 * x..]);
+            store16(&mut target[o..], _mm_unpacklo_epi8(v, v));
+            store16(&mut target[o + 16..], _mm_unpackhi_epi8(v, v));
+            x += 4;
+            o += 32;
+        }
+        for px in row[4 * x..4 * width].chunks_exact(4) {
+            let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
+            target[o..o + 8].copy_from_slice(&[r, r, g, g, b, b, a, a]);
+            o += 8;
+        }
+        true
+    }
+
+    /// The conversion dispatch for this target: four-channel targets only — the
+    /// three-channel layouts have no kernel and stay scalar.
+    pub(super) fn convert_row(
+        conv: &RowConversion<'_>,
+        row: &[u8],
+        target: &mut [u8],
+    ) -> Result<bool, Error> {
+        if conv.channels != 4 {
+            return Ok(false);
+        }
+        // SAFETY: every kernel below needs only SSE2, which the x86-64 baseline enables
+        // for this whole build (the module asserts it at compile time). The kernels
+        // check the slice lengths themselves and touch memory only through indexing.
+        unsafe {
+            match (conv.color_type, conv.bit_depth) {
+                // Measured against the scalar helpers, the depth-8 → 16-bit greyscale
+                // kernel loses to the autovectorised scalar loop, so only the 8-bit
+                // target is claimed here.
+                (ColorType::Grayscale, BitDepth::Eight) if !conv.wide => {
+                    Ok(grey8_rgba8(row, target, conv.grey_key))
+                }
+                (ColorType::Grayscale, BitDepth::Sixteen) => {
+                    Ok(grey16_rgba(row, target, conv.wide, conv.grey_key))
+                }
+                (ColorType::GrayscaleAlpha, d @ (BitDepth::Eight | BitDepth::Sixteen)) => {
+                    Ok(graya_rgba(row, target, d, conv.wide))
+                }
+                (ColorType::Rgba, BitDepth::Eight) if conv.wide => Ok(rgba8_rgba16(row, target)),
+                (ColorType::Rgba, BitDepth::Sixteen) if !conv.wide => Ok(rgba16_rgba8(row, target)),
+                _ => Ok(false),
+            }
+        }
     }
 }
 
@@ -427,6 +1071,400 @@ mod tests {
         for bpp in [3usize, 4].into_iter().filter(|&bpp| claims_stride(bpp)) {
             let mut row = filtered[..bpp].to_vec();
             assert!(paeth_row(&mut row, &prev[..bpp], bpp), "bpp {bpp}: one pixel must be claimed");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Conversion parity: every row the accelerated paths claim must equal the scalar
+    // helpers in transform.rs byte for byte — they are the reference the kernels are
+    // pinned to. The tests drive `x86::convert_row` and the portable paths directly
+    // rather than the facade, so a compiled-in scalar override cannot turn a kernel
+    // test into a test of the fallback.
+
+    use crate::transform::{self, Palette, RowSample};
+
+    /// A four-channel `RowConversion`, the shape the kernels cover.
+    fn conv<'a>(
+        color: ColorType,
+        depth: BitDepth,
+        wide: bool,
+        palette: Option<&'a Palette>,
+    ) -> RowConversion<'a> {
+        RowConversion {
+            color_type: color,
+            bit_depth: depth,
+            channels: 4,
+            wide,
+            grey_key: None,
+            rgb_key: None,
+            palette,
+        }
+    }
+
+    /// The scalar helpers from transform.rs dispatch the same way `RowConverter::convert`
+    /// does — so what this computes is what the caller gets when a kernel declines.
+    fn scalar_convert<S: RowSample>(
+        conv: &RowConversion<'_>,
+        row: &[u8],
+        target: &mut [u8],
+    ) -> Result<(), Error> {
+        match (conv.color_type, conv.bit_depth) {
+            (ColorType::Grayscale, BitDepth::One) => {
+                transform::grey_row::<4, 1, S>(row, target, conv.grey_key)
+            }
+            (ColorType::Grayscale, BitDepth::Two) => {
+                transform::grey_row::<4, 2, S>(row, target, conv.grey_key)
+            }
+            (ColorType::Grayscale, BitDepth::Four) => {
+                transform::grey_row::<4, 4, S>(row, target, conv.grey_key)
+            }
+            (ColorType::Grayscale, BitDepth::Eight) => {
+                transform::grey_row::<4, 8, S>(row, target, conv.grey_key)
+            }
+            (ColorType::Grayscale, BitDepth::Sixteen) => {
+                transform::grey_row::<4, 16, S>(row, target, conv.grey_key)
+            }
+            (ColorType::GrayscaleAlpha, BitDepth::Eight) => {
+                transform::grey_alpha_row::<4, false, S>(row, target)
+            }
+            (ColorType::GrayscaleAlpha, BitDepth::Sixteen) => {
+                transform::grey_alpha_row::<4, true, S>(row, target)
+            }
+            (ColorType::Rgb, BitDepth::Eight) => {
+                transform::rgb_row::<4, false, S>(row, target, conv.rgb_key)
+            }
+            (ColorType::Rgb, BitDepth::Sixteen) => {
+                transform::rgb_row::<4, true, S>(row, target, conv.rgb_key)
+            }
+            (ColorType::Rgba, BitDepth::Eight) => transform::rgba_row::<4, false, S>(row, target),
+            (ColorType::Rgba, BitDepth::Sixteen) => transform::rgba_row::<4, true, S>(row, target),
+            (ColorType::Indexed, depth) => {
+                let palette = conv.palette.expect("an indexed row needs a palette");
+                match depth {
+                    BitDepth::One => transform::indexed_row::<4, 1, S>(row, target, palette)?,
+                    BitDepth::Two => transform::indexed_row::<4, 2, S>(row, target, palette)?,
+                    BitDepth::Four => transform::indexed_row::<4, 4, S>(row, target, palette)?,
+                    BitDepth::Eight => transform::indexed_row::<4, 8, S>(row, target, palette)?,
+                    BitDepth::Sixteen => unreachable!(),
+                }
+            }
+            _ => unreachable!("a shape the tests never build"),
+        }
+        Ok(())
+    }
+
+    /// The scalar reference for a row, picking the sample width from `conv`.
+    fn scalar(conv: &RowConversion<'_>, row: &[u8], target: &mut [u8]) -> Result<(), Error> {
+        if conv.wide {
+            scalar_convert::<u16>(conv, row, target)
+        } else {
+            scalar_convert::<u8>(conv, row, target)
+        }
+    }
+
+    /// One native-layout row of `width` pixels — deterministic garbage, seeded per shape.
+    /// Sub-byte depths pack MSB-first, so random bytes are already a valid row.
+    fn native_row(color: ColorType, depth: BitDepth, width: usize, seed: u64) -> Vec<u8> {
+        let pixels_per_byte = match depth {
+            BitDepth::One => 8,
+            BitDepth::Two => 4,
+            BitDepth::Four => 2,
+            _ => 1,
+        };
+        let channels = match color {
+            ColorType::Grayscale | ColorType::Indexed => 1,
+            ColorType::GrayscaleAlpha => 2,
+            ColorType::Rgb => 3,
+            ColorType::Rgba => 4,
+        };
+        let bytes = match depth {
+            BitDepth::Sixteen => width * channels * 2,
+            _ => (width * channels).div_ceil(pixels_per_byte),
+        };
+        corpus(bytes, seed)
+    }
+
+    /// `x86::convert_row` plus the portable paths, in the facade's own order — minus the
+    /// scalar-override gate, so kernels are always exercised.
+    fn accelerated(conv: &RowConversion<'_>, row: &[u8], target: &mut [u8]) -> Result<bool, Error> {
+        if conv.color_type == ColorType::Indexed {
+            let Some(palette) = conv.palette else { return Ok(false) };
+            return indexed(conv, row, target, palette);
+        }
+        if conv.color_type == ColorType::Rgb {
+            return rgb_to_rgba(conv, row, target);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            x86::convert_row(conv, row, target)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (row, target);
+            Ok(false)
+        }
+    }
+
+    /// Asserts the accelerated path claims the row and matches the scalar helpers.
+    fn assert_parity(conv: &RowConversion<'_>, row: &[u8], width: usize, ctx: &str) {
+        let out = 4 * usize::from(conv.wide) + 4;
+        let mut want = vec![0xCCu8; width * out];
+        scalar(conv, row, &mut want).unwrap();
+
+        let mut got = vec![0x55u8; width * out];
+        let claimed = accelerated(conv, row, &mut got).unwrap();
+        assert!(claimed, "{ctx}: the accelerated path declined a covered shape");
+        assert_eq!(got, want, "{ctx}: accelerated and scalar disagree");
+    }
+
+    /// Asserts the accelerated path declines and leaves the target untouched.
+    fn assert_declined(conv: &RowConversion<'_>, row: &[u8], width: usize, ctx: &str) {
+        let out = 4 * usize::from(conv.wide) + 4;
+        let mut got = vec![0x55u8; width * out];
+        let before = got.clone();
+        let claimed = accelerated(conv, row, &mut got).unwrap();
+        assert!(!claimed, "{ctx}: an uncovered shape was claimed");
+        assert_eq!(got, before, "{ctx}: a declined row must be untouched");
+    }
+
+    /// The widths a parity check should cover: tails of every length below the block
+    /// size, a boundary or two, and enough to span the chunked sub-byte path twice.
+    fn widths() -> [usize; 11] {
+        [1, 2, 3, 7, 8, 9, 15, 16, 17, 63, 1100]
+    }
+
+    /// Greyscale rows at every covered depth and output width, with no `tRNS` key and
+    /// with keys that do and do not appear in the row — including one above the byte
+    /// range, which can never match a depth-8 sample. The depth-8 → 16-bit target is
+    /// not covered: measured to lose to the autovectorised scalar loop, it declines.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn greyscale_conversion_matches_scalar() {
+        for depth in [BitDepth::Eight, BitDepth::Sixteen] {
+            for wide in [false, true] {
+                if depth == BitDepth::Eight && wide {
+                    continue;
+                }
+                for key in [None, Some(0x5A5A), Some(0x1234), Some(0xFFFF)] {
+                    let mut spec = conv(ColorType::Grayscale, depth, wide, None);
+                    spec.grey_key = key;
+                    for width in widths() {
+                        let row =
+                            native_row(ColorType::Grayscale, depth, width, 0xA511 ^ width as u64);
+                        assert_parity(
+                            &spec,
+                            &row,
+                            width,
+                            &format!("{depth:?} wide={wide} key={key:?} w={width}"),
+                        );
+                    }
+                }
+            }
+        }
+        let spec = conv(ColorType::Grayscale, BitDepth::Eight, true, None);
+        let row = native_row(ColorType::Grayscale, BitDepth::Eight, 64, 0xA511);
+        assert_declined(&spec, &row, 64, "gray8 → rgba16 declines");
+    }
+
+    /// Sub-byte greyscale rows decline at every depth and output width: measured against
+    /// the scalar helpers, the chunked unpack plus byte kernels loses to the
+    /// autovectorised scalar loop, keyed or not.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn subbyte_greyscale_declines() {
+        for depth in [BitDepth::One, BitDepth::Two, BitDepth::Four] {
+            for wide in [false, true] {
+                for key in [None, Some(1)] {
+                    let mut spec = conv(ColorType::Grayscale, depth, wide, None);
+                    spec.grey_key = key;
+                    let row = native_row(ColorType::Grayscale, depth, 64, 0xBADC_0FFE);
+                    assert_declined(&spec, &row, 64, &format!("{depth:?} wide={wide} key={key:?}"));
+                }
+            }
+        }
+    }
+
+    /// Greyscale-alpha rows at both depths and both output widths.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn greyscale_alpha_conversion_matches_scalar() {
+        for depth in [BitDepth::Eight, BitDepth::Sixteen] {
+            for wide in [false, true] {
+                let spec = conv(ColorType::GrayscaleAlpha, depth, wide, None);
+                for width in widths() {
+                    let row = native_row(
+                        ColorType::GrayscaleAlpha,
+                        depth,
+                        width,
+                        0xC0DE ^ (width as u64) << 3,
+                    );
+                    assert_parity(&spec, &row, width, &format!("{depth:?} wide={wide} w={width}"));
+                }
+            }
+        }
+    }
+
+    /// The RGBA width conversions the kernels claim — 8→16 and 16→8. The equal-width
+    /// cases never reach conversion at all (`passes_through` in transform.rs).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn rgba_width_conversion_matches_scalar() {
+        for (depth, wide) in [(BitDepth::Eight, true), (BitDepth::Sixteen, false)] {
+            let spec = conv(ColorType::Rgba, depth, wide, None);
+            for width in widths() {
+                let row = native_row(ColorType::Rgba, depth, width, 0xD00D ^ width as u64);
+                assert_parity(&spec, &row, width, &format!("{depth:?} wide={wide} w={width}"));
+            }
+        }
+    }
+
+    /// The same-width RGBA cases decline — they are pass-throughs, not conversions —
+    /// and so does every three-channel target, which has no kernel.
+    #[test]
+    fn uncovered_shapes_decline() {
+        let width = 32;
+        for (color, depth, wide) in [
+            (ColorType::Rgba, BitDepth::Eight, false),
+            (ColorType::Rgba, BitDepth::Sixteen, true),
+            (ColorType::Grayscale, BitDepth::Eight, false),
+        ] {
+            let mut spec = conv(color, depth, wide, None);
+            spec.channels = 3;
+            let row = native_row(color, depth, width, 0xABCD);
+            let out = 3 * usize::from(wide) + 3;
+            let mut got = vec![0x55u8; width * out];
+            let before = got.clone();
+            let claimed = accelerated(&spec, &row, &mut got).unwrap();
+            assert!(!claimed, "{color:?}/{depth:?}: a 3-channel shape must decline");
+            assert_eq!(got, before, "a declined row must be untouched");
+        }
+        // A keyed RGB row declines: the per-pixel colour compare is scalar work.
+        let mut spec = conv(ColorType::Rgb, BitDepth::Eight, false, None);
+        spec.rgb_key = Some([0x11, 0x22, 0x33]);
+        let row = native_row(ColorType::Rgb, BitDepth::Eight, width, 0xFACE);
+        assert_declined(&spec, &row, width, "keyed RGB must decline");
+    }
+
+    /// `Rgb` → `Rgba`, keyless: the widening shapes are claimed and pinned to the scalar
+    /// helpers; the equal-width ones decline — measured to lose to the autovectorised
+    /// scalar loop.
+    #[test]
+    fn rgb_to_rgba_matches_scalar() {
+        for (depth, wide) in [(BitDepth::Eight, true), (BitDepth::Sixteen, false)] {
+            let spec = conv(ColorType::Rgb, depth, wide, None);
+            for width in widths() {
+                let row = native_row(ColorType::Rgb, depth, width, 0xBEEF ^ width as u64);
+                assert_parity(&spec, &row, width, &format!("{depth:?} wide={wide} w={width}"));
+            }
+        }
+        for (depth, wide) in [(BitDepth::Eight, false), (BitDepth::Sixteen, true)] {
+            let spec = conv(ColorType::Rgb, depth, wide, None);
+            let row = native_row(ColorType::Rgb, depth, 64, 0xFACE);
+            assert_declined(&spec, &row, 64, &format!("{depth:?} wide={wide}"));
+        }
+    }
+
+    /// The indexed path: a full palette and a short one, with and without `tRNS`, at
+    /// every legal depth — and, since the palette copy is portable scalar, on every
+    /// architecture.
+    #[test]
+    fn indexed_conversion_matches_scalar() {
+        // 256 entries of deterministic colour, and a 4-entry palette for the sub-byte
+        // depths.
+        let mut plte = Vec::new();
+        for i in 0..256u32 {
+            plte.extend_from_slice(&[(i as u8).wrapping_mul(3), (i as u8) >> 1, 255 - i as u8]);
+        }
+        let trns: Vec<u8> = (0..256u32).map(|i| (i as u8).wrapping_mul(37)).collect();
+        let short_plte = plte[..12].to_vec();
+        for (plte, trns, name) in [
+            (plte.clone(), None, "full"),
+            (plte.clone(), Some(trns.as_slice()), "full+trns"),
+            (short_plte.clone(), None, "short"),
+            (short_plte, Some(&[64, 128][..]), "short+trns"),
+        ] {
+            let palette = Palette::new(&plte, trns);
+            for depth in [BitDepth::One, BitDepth::Two, BitDepth::Four, BitDepth::Eight] {
+                for wide in [false, true] {
+                    let spec = conv(ColorType::Indexed, depth, wide, Some(&palette));
+                    // The sub-byte depths are claimed only for 16-bit output; the 8-bit
+                    // sub-byte path measured slower than the scalar loop and declined.
+                    let claimed = depth == BitDepth::Eight || wide;
+                    for width in [1usize, 5, 16, 17, 40, 600] {
+                        let mut row =
+                            native_row(ColorType::Indexed, depth, width, 0xC0FF ^ width as u64);
+                        if palette.len < 256 && depth == BitDepth::Eight {
+                            for b in &mut row {
+                                *b &= (palette.len - 1) as u8;
+                            }
+                        }
+                        let out = 4 * usize::from(wide) + 4;
+                        let mut want = vec![0u8; width * out];
+                        match scalar(&spec, &row, &mut want) {
+                            Ok(()) => {
+                                let mut got = vec![0u8; width * out];
+                                if claimed {
+                                    assert!(
+                                        accelerated(&spec, &row, &mut got).unwrap(),
+                                        "{name} {depth:?} wide={wide} w={width}: declined"
+                                    );
+                                    assert_eq!(got, want, "{name} {depth:?} w={width}: disagree");
+                                } else {
+                                    assert!(
+                                        !accelerated(&spec, &row, &mut got).unwrap(),
+                                        "{name} {depth:?} wide={wide} w={width}: claimed"
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                let mut got = vec![0u8; width * out];
+                                let outcome = accelerated(&spec, &row, &mut got);
+                                if claimed {
+                                    assert!(
+                                        outcome.is_err(),
+                                        "{name} {depth:?}: out-of-range must error too"
+                                    );
+                                } else {
+                                    assert!(
+                                        !outcome.unwrap(),
+                                        "{name} {depth:?}: a declined row must decline"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An out-of-range index must produce the same error the scalar path does — and a
+    /// short palette with a tall index row is exactly that case.
+    #[test]
+    fn indexed_out_of_range_errors() {
+        let plte = vec![1u8, 2, 3, 4, 5, 6]; // two entries
+        let palette = Palette::new(&plte, None);
+        let spec = conv(ColorType::Indexed, BitDepth::Eight, false, Some(&palette));
+        let row = [0u8, 1, 200, 0];
+        let mut got = vec![0u8; 16];
+        assert_eq!(accelerated(&spec, &row, &mut got).unwrap_err(), Error::PaletteIndexOutOfRange);
+    }
+
+    /// When the scalar override is in force the facade declines everything — kernels and
+    /// portable paths alike — and leaves the row to the scalar helpers.
+    #[test]
+    fn the_override_declines_every_shape() {
+        if !scalar_forced() {
+            return;
+        }
+        let plte = vec![1u8, 2, 3];
+        let palette = Palette::new(&plte, None);
+        for color in [ColorType::Grayscale, ColorType::Rgb, ColorType::Indexed] {
+            let palette_ref = if color == ColorType::Indexed { Some(&palette) } else { None };
+            let spec = conv(color, BitDepth::Eight, false, palette_ref);
+            let row = native_row(color, BitDepth::Eight, 8, 0x1234);
+            let mut got = vec![0u8; 32];
+            assert!(!convert_row(&spec, &row, &mut got).unwrap());
         }
     }
 }
