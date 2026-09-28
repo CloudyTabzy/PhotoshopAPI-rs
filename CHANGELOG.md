@@ -12,6 +12,26 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.15] - 2026-09-28
+
+### Fixed
+
+- `psd-companion`: the brush-dynamics `bVTy` control table now follows
+  Photoshop's own order (`0 off, 1 fade, 2 pen pressure, 3 pen tilt,
+  4 stylus wheel, 5 rotation, 6 initial direction, 7 direction`). The table
+  this reader inherited from a widely used parser library orders the values
+  differently from index 5 on, which silently renamed the angle controls
+  (`rotation` read as `initial direction` and so on). Pinned against a
+  Photoshop export whose every dynamic was set to a distinct value, and
+  confirmed by two independent format references. Cross-validated against
+  that reference implementation's own test expectations, including a
+  pixel-level brush-mask checksum, which now all match.
+- A `-3` (real user mask) channel whose payload does not decode — the
+  compression-marker-only records older Photoshop files carry — is kept raw
+  instead of failing the read. Photoshop ignores that plane's payload; the
+  `-2` rendered mask, which Photoshop does read, stays strict. Pinned by
+  `empty_real_user_mask_channel_does_not_fail_the_read`.
+
 ## [0.6.14] - 2026-09-28
 
 ### Fixed

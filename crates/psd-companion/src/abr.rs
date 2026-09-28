@@ -472,16 +472,20 @@ fn pixels(descriptor: &Descriptor, key: &str) -> Result<f64> {
 // Brush model parsing
 // ===========================================================================
 
-const DYNAMICS_CONTROL: [&str; 9] = [
+/// The `bVTy` control values, in Photoshop's own order. Pinned against a
+/// Photoshop 2026 export whose every dynamic was set to a distinct value, and
+/// confirmed by two independent format references; a widely used parser
+/// library carries a different order from index 5 on, which reads `rotation`
+/// as `initial direction` and shifts everything after it.
+const DYNAMICS_CONTROL: [&str; 8] = [
     "off",
     "fade",
     "pen pressure",
     "pen tilt",
     "stylus wheel",
+    "rotation",
     "initial direction",
     "direction",
-    "initial rotation",
-    "rotation",
 ];
 
 const DYNAMIC_BRUSH_SHAPES: [&str; 10] = [
@@ -514,14 +518,16 @@ fn blend_mode(descriptor: &Descriptor, key: &str) -> BrushBlendMode {
     BrushBlendMode::from_key(&as_text(descriptor.get(key)))
 }
 
+/// The `bVTy` control name for a raw index; unknown values degrade to `off`,
+/// as the reference does.
+fn dynamics_control(index: usize) -> &'static str {
+    DYNAMICS_CONTROL.get(index).copied().unwrap_or("off")
+}
+
 fn dynamics(descriptor: &Descriptor) -> Result<BrushDynamics> {
     let control_index = as_number(descriptor.get("bVTy")) as usize;
     Ok(BrushDynamics {
-        control: DYNAMICS_CONTROL
-            .get(control_index)
-            .copied()
-            .unwrap_or("off")
-            .to_owned(),
+        control: dynamics_control(control_index).to_owned(),
         steps: as_number(descriptor.get("fStp")),
         jitter: percent(descriptor, "jitter")?,
         minimum: percent(descriptor, "Mnm ")?,
@@ -1271,6 +1277,23 @@ mod tests {
         assert_eq!(abr.samples[0].alpha, vec![1, 2, 3, 4]);
         assert_eq!(abr.patterns.len(), 1);
         assert_eq!(abr.patterns[0].id, "pat-id");
+    }
+
+    #[test]
+    fn dynamics_controls_follow_photoshop_order() {
+        // Pinned against a Photoshop 2026 export whose every dynamic was set
+        // to a distinct value and confirmed by two independent format
+        // references. A widely used parser library orders these differently
+        // from index 5 on, which silently renames the angle controls.
+        assert_eq!(dynamics_control(0), "off");
+        assert_eq!(dynamics_control(1), "fade");
+        assert_eq!(dynamics_control(2), "pen pressure");
+        assert_eq!(dynamics_control(3), "pen tilt");
+        assert_eq!(dynamics_control(4), "stylus wheel");
+        assert_eq!(dynamics_control(5), "rotation");
+        assert_eq!(dynamics_control(6), "initial direction");
+        assert_eq!(dynamics_control(7), "direction");
+        assert_eq!(dynamics_control(8), "off", "unknown values degrade to off");
     }
 
     #[test]

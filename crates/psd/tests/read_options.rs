@@ -417,3 +417,63 @@ fn oversized_mask_rect_is_rejected_before_channel_decode() {
         }
     ));
 }
+
+/// Older Photoshop files carry compression-marker-only `-3` (real user mask)
+/// records. Photoshop ignores that plane's payload, so a record that does not
+/// decode must not fail the read; the layer's pixels stay intact. The `-2`
+/// rendered mask, which Photoshop does read, stays strict.
+#[test]
+fn empty_real_user_mask_channel_does_not_fail_the_read() {
+    let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 2, 2).unwrap();
+    let mut layer = Layer::new_image("Masked", Rect::new(0, 0, 2, 2));
+    let pixels = layer.image_mut().unwrap();
+    pixels
+        .channels
+        .insert(ChannelKey::color(0), vec![10, 20, 30, 40]);
+    pixels
+        .channels
+        .insert(ChannelKey::USER_MASK, vec![1, 2, 3, 4]);
+    layer.mask = Some(psd::core::LayerMaskData {
+        pixel_mask: Some(LayerMask {
+            top: 0,
+            left: 0,
+            bottom: 2,
+            right: 2,
+            default_color: 0,
+            flags: Default::default(),
+            params: None,
+        }),
+        vector_mask: None,
+    });
+    document.add_layer(layer);
+
+    // Relabel the mask channel `-3` and strip it to the two-byte compression
+    // marker, the shape old files carry.
+    let mut file = document.to_photoshop_file().unwrap();
+    let layer_info = &mut file.layer_and_mask_info.layer_info;
+    let record = &mut layer_info.layer_records[0];
+    let position = record
+        .channels
+        .iter()
+        .position(|channel| channel.index == -2)
+        .expect("the mask channel");
+    record.channels[position].index = -3;
+    record.channels[position].id = psd::core::ChannelId::from_index(-3, ColorMode::Rgb);
+    record.channels[position].size = 2;
+    layer_info.channel_image_data[0].channels[position] = psd::core::ChannelData {
+        compression: Compression::Raw,
+        data: Vec::new(),
+    };
+
+    let mut writer = BeWriter::new();
+    file.write(&mut writer).unwrap();
+    let bytes = writer.into_inner();
+
+    let back = LayeredFile::<u8>::from_bytes(&bytes).expect("the empty -3 must not fail the read");
+    let id = back.find_layer("Masked").unwrap();
+    let pixels = back.layer(id).unwrap().image().unwrap();
+    assert_eq!(
+        pixels.channels.get(ChannelKey::color(0)),
+        Some(&[10, 20, 30, 40][..])
+    );
+}

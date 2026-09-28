@@ -638,14 +638,37 @@ impl<T: BitDepth> LayeredFile<T> {
                     );
                 } else {
                     charge_decoded_bitmap(remaining_bitmap_memory, width, height, T::SIZE)?;
-                    let samples = decompress_channel::<T>(
+                    let decoded = decompress_channel::<T>(
                         channel.compression,
                         &channel.data,
                         width,
                         height,
                         version,
-                    )?;
-                    channels.insert(key, samples);
+                    );
+                    match decoded {
+                        Ok(samples) => {
+                            channels.insert(key, samples);
+                        }
+                        // Older Photoshop files carry compression-marker-only
+                        // or undersized `-3` records. Photoshop ignores that
+                        // plane's payload, so a record that does not decode is
+                        // kept raw rather than failing the whole read. `-2`,
+                        // the rendered mask Photoshop actually reads, stays
+                        // strict.
+                        Err(_) if key == ChannelKey::REAL_USER_MASK => {
+                            channels.insert_raw(
+                                key,
+                                RawChannelData::new(
+                                    channel.compression,
+                                    channel.data,
+                                    width,
+                                    height,
+                                    version,
+                                ),
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             Ok(channels)
