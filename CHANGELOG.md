@@ -12,6 +12,23 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.18] - 2026-09-28
+
+### Fixed
+
+- Files whose layer-and-mask section declares length zero — written without a
+  layer section — read again; the reader used to parse into the image data
+  that follows. A section that ends right after the layer info (no global
+  layer mask info and no document-level blocks) is accepted too, the mask
+  info is optional, and a mask length that runs past the section is clamped
+  rather than rejected. Some writers also declare a layer-info or
+  record-extra length a couple of bytes longer than its content; the tail is
+  then read from where the content actually ended — a non-zero gap means the
+  next section starts there, padding is zeros — which is what makes those
+  files' channel data and trailing tagged blocks line up. Found by
+  cross-validating against an older third-party parser's fixture set, whose
+  reader walks structurally instead of trusting declared lengths.
+
 ## [0.6.17] - 2026-09-28
 
 ### Fixed

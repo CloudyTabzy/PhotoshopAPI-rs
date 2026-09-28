@@ -38,6 +38,26 @@ use crate::io::{BeReader, BeWriter};
 use crate::strings::PascalString;
 use crate::tagged_blocks::{AdditionalLayerInfo, TaggedBlock, TaggedBlockKey};
 
+/// Whether a plausible global-mask length sits at `start`: one that fits
+/// inside the section. A layer-info length that over-counts by a couple of
+/// bytes leaves a garbage length here, which is how the fallback to the real
+/// content end is chosen.
+fn global_mask_fits(reader: &mut BeReader, start: usize, end: usize) -> bool {
+    if start + 4 > end {
+        return false;
+    }
+    let saved = reader.position();
+    if reader.seek(start).is_err() {
+        return false;
+    }
+    let fits = reader
+        .u32()
+        .map(|length| (length as usize) <= end - (start + 4))
+        .unwrap_or(false);
+    let _ = reader.seek(saved);
+    fits
+}
+
 /// Photoshop's documented per-layer channel cap.
 pub const MAX_LAYER_CHANNELS: usize = 56;
 
@@ -72,28 +92,49 @@ impl<'a> LayerAndMaskInformation<'a> {
                 offset,
                 message: "layer and mask info length overflows",
             })?;
+        // A zero-length section carries no subsections at all. Files written
+        // without layers declare it empty, and parsing must not run into the
+        // image data that follows.
+        if section_len == 0 {
+            return Ok(Self::default());
+        }
 
-        let layer_info = LayerInfo::read(reader, header)?;
+        let (layer_info, content_end) = LayerInfo::read_tracking_content_end(reader, header)?;
 
-        let glmi_len = reader.u32()? as usize;
-        let global_layer_mask_info = GlobalLayerMaskInfo {
-            data: reader.take(glmi_len)?.to_vec(),
-        };
+        // The global-mask info is optional in the wild: some writers end the
+        // section right after the layer info, and some declare a layer-info
+        // length a couple of bytes longer than its content, which puts the
+        // tail at the content end instead of the declared one. Prefer the
+        // declared end when a plausible mask length sits there, and fall back
+        // to the content end otherwise.
+        let declared_end = reader.position();
+        let mut tail_start = declared_end;
+        if !global_mask_fits(reader, declared_end, end) && content_end < declared_end {
+            tail_start = content_end;
+        }
+        reader.seek(tail_start)?;
 
-        let remaining = end
-            .checked_sub(reader.position())
-            .ok_or(PsdError::InvalidData {
-                offset,
-                message: "layer and mask info subsections exceed the section length",
-            })?;
-        let additional_layer_info = if remaining >= 12 {
-            Some(Cow::Owned(AdditionalLayerInfo::read(
-                reader, header, remaining, 4,
-            )?))
-        } else {
-            reader.skip(remaining)?;
-            None
-        };
+        let mut global_layer_mask_info = GlobalLayerMaskInfo::default();
+        let mut additional_layer_info = None;
+        if reader.position() < end {
+            let glmi_len = reader.u32()? as usize;
+            // A mask length that runs past the section is clamped rather than
+            // rejected; Photoshop reads these files.
+            let available = end - reader.position();
+            global_layer_mask_info = GlobalLayerMaskInfo {
+                data: reader.take(glmi_len.min(available))?.to_vec(),
+            };
+
+            let remaining = end - reader.position();
+            additional_layer_info = if remaining >= 12 {
+                Some(Cow::Owned(AdditionalLayerInfo::read(
+                    reader, header, remaining, 4,
+                )?))
+            } else {
+                reader.skip(remaining)?;
+                None
+            };
+        }
 
         let mut result = Self {
             layer_info,
@@ -124,7 +165,7 @@ impl<'a> LayerAndMaskInformation<'a> {
             return Ok(());
         };
         let mut sub = BeReader::new(&block.data);
-        self.layer_info = LayerInfo::read_content(&mut sub, header, block.data.len())?;
+        self.layer_info = LayerInfo::read_content(&mut sub, header, block.data.len())?.0;
         Ok(())
     }
 
@@ -219,6 +260,16 @@ impl<'a> LayerInfo<'a> {
     /// Read the standalone LayerInfo section including its length marker.
     /// A zero length (16/32-bit documents) yields an empty `LayerInfo`.
     pub fn read(reader: &mut BeReader, header: &FileHeader) -> Result<Self> {
+        Ok(Self::read_tracking_content_end(reader, header)?.0)
+    }
+
+    /// Read the section and report where its actual content ended, which can
+    /// be up to four bytes before the declared end (alignment padding, or a
+    /// declared length that over-counts by a couple of bytes).
+    pub(crate) fn read_tracking_content_end(
+        reader: &mut BeReader,
+        header: &FileHeader,
+    ) -> Result<(Self, usize)> {
         let offset = reader.position() as u64;
         let section_len =
             usize::try_from(reader.len(header.version)?).map_err(|_| PsdError::InvalidData {
@@ -226,18 +277,19 @@ impl<'a> LayerInfo<'a> {
                 message: "layer info length does not fit the platform",
             })?;
         if section_len == 0 {
-            return Ok(Self::default());
+            return Ok((Self::default(), reader.position()));
         }
         Self::read_content(reader, header, section_len)
     }
 
     /// Read `content_len` bytes of layer count + records + channel data
     /// without a leading length marker (the payload of `Lr16`/`Lr32`).
+    /// Returns the parsed info and the position where its content ended.
     pub(crate) fn read_content(
         reader: &mut BeReader,
         header: &FileHeader,
         content_len: usize,
-    ) -> Result<Self> {
+    ) -> Result<(Self, usize)> {
         let offset = reader.position() as u64;
         let end = reader
             .position()
@@ -283,11 +335,14 @@ impl<'a> LayerInfo<'a> {
         }
         reader.skip(trailing)?;
 
-        Ok(Self {
-            layer_records,
-            channel_image_data,
-            has_merged_alpha: raw_count < 0,
-        })
+        Ok((
+            Self {
+                layer_records,
+                channel_image_data,
+                has_merged_alpha: raw_count < 0,
+            },
+            position,
+        ))
     }
 
     /// Write the standalone LayerInfo section (with its own marker). 16/32-bit
@@ -422,14 +477,32 @@ impl<'a> LayerRecord<'a> {
         }
 
         let remaining = extra_end - reader.position();
-        let additional_layer_info = if remaining >= 12 {
-            Some(Cow::Owned(AdditionalLayerInfo::read(
-                reader, header, remaining, 1,
-            )?))
+        let (additional_layer_info, content_end) = if remaining >= 12 {
+            let (blocks, content_end) =
+                AdditionalLayerInfo::read_tracking_end(reader, header, remaining, 1)?;
+            (Some(Cow::Owned(blocks)), content_end)
         } else {
-            reader.skip(remaining)?;
-            None
+            // Too short for a block; the whole remainder is a candidate gap.
+            (None, reader.position())
         };
+        // A declared extra-data length can over-count by a few bytes: the gap
+        // then holds the next section's first bytes, not padding. Padding is
+        // zeros, so a non-zero gap means the record really ends at the content
+        // end. (One real fixture declares two bytes too many and is only
+        // consistent when the channel data that follows starts at the content
+        // end.)
+        let gap = extra_end - content_end;
+        let over_counts = (1..=4).contains(&gap) && {
+            let saved = reader.position();
+            let non_zero = reader
+                .seek(content_end)
+                .and_then(|()| reader.take(gap))
+                .map(|bytes| bytes.iter().any(|&byte| byte != 0))
+                .unwrap_or(false);
+            reader.seek(saved)?;
+            non_zero
+        };
+        reader.seek(if over_counts { content_end } else { extra_end })?;
 
         Ok(Self {
             name,

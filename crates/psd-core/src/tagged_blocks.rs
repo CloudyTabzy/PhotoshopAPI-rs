@@ -261,6 +261,19 @@ impl AdditionalLayerInfo {
         max_len: usize,
         padding: usize,
     ) -> Result<Self> {
+        Ok(Self::read_tracking_end(reader, header, max_len, padding)?.0)
+    }
+
+    /// Like [`read`](Self::read), but also reports where the last block ended,
+    /// before any trailing bytes inside `max_len` are skipped. A caller that
+    /// sees non-zero bytes in that gap knows the declared length over-counts
+    /// and the next section really starts at the content end.
+    pub fn read_tracking_end(
+        reader: &mut BeReader,
+        header: &FileHeader,
+        max_len: usize,
+        padding: usize,
+    ) -> Result<(Self, usize)> {
         let start = reader.position();
         let end = start.checked_add(max_len).ok_or(PsdError::InvalidData {
             offset: start as u64,
@@ -286,8 +299,9 @@ impl AdditionalLayerInfo {
                 });
             }
         }
+        let content_end = reader.position();
         reader.skip(end - reader.position())?;
-        Ok(Self { blocks })
+        Ok((Self { blocks }, content_end))
     }
 
     /// Write all blocks with the given alignment (`padding`), for the
