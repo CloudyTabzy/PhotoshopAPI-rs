@@ -560,10 +560,13 @@ impl<T: BitDepth> LayeredFile<T> {
             .unwrap_or_default();
 
         // The unicode name ('luni') takes precedence over the pascal name.
+        // Photoshop pads the block to four bytes and some other writers do
+        // not, so the read must not assume either: the code-unit count is the
+        // whole payload and padding is only ever trailing bytes.
         let mut name = record.name.value().to_string();
         if let Some(block) = blocks.get(TaggedBlockKey::LUNI) {
             let mut reader = BeReader::new(&block.data);
-            if let Ok(unicode) = UnicodeString::read(&mut reader, 4) {
+            if let Ok(unicode) = UnicodeString::read(&mut reader, 1) {
                 name = unicode.value().to_string();
             }
         }
@@ -1244,10 +1247,13 @@ impl<T: BitDepth> LayeredFile<T> {
     ) -> Result<Option<Cow<'a, AdditionalLayerInfo>>> {
         let mut owned: Option<AdditionalLayerInfo> = None;
 
+        // Read tolerantly: an unpadded block (some writers leave them so;
+        // Photoshop pads) fails a padding-4 read, which used to look like a
+        // rename and rewrote the block on every save.
         let current_name = layer
             .blocks
             .get(TaggedBlockKey::LUNI)
-            .and_then(|block| UnicodeString::read(&mut BeReader::new(&block.data), 4).ok());
+            .and_then(|block| UnicodeString::read(&mut BeReader::new(&block.data), 1).ok());
         if current_name.as_ref().map(UnicodeString::value) != Some(layer.name.as_str()) {
             let mut writer = BeWriter::new();
             UnicodeString::new(layer.name.as_str(), 4)?.write_verbatim(&mut writer)?;

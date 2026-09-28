@@ -323,8 +323,12 @@ fn decode_rle_channel(
     }
     let mut scratch = vec![0u8; w * h];
     let mut reader = BeReader::new(channel_data);
-    for row in scratch.chunks_mut(w) {
-        let length = reader.u16()? as usize;
+    // A u16 length per row comes first as a table, then the PackBits rows.
+    let mut lengths = vec![0usize; h];
+    for length in &mut lengths {
+        *length = reader.u16()? as usize;
+    }
+    for (row, length) in scratch.chunks_mut(w).zip(lengths) {
         let bytes = reader.take(length)?;
         decode_packbits_row(bytes, row);
     }
@@ -520,12 +524,14 @@ mod tests {
 
     #[test]
     fn decodes_an_rle_rgb_pattern() {
-        // Two rows per channel (the rectangle is 2x2), each preceded by its
-        // u16 length: a literal packet (header 3) of four bytes.
+        // Two rows per channel (the rectangle is 2x2): the u16 length table
+        // first, then each row as a literal packet (header 3) of four bytes.
         let run = |value: u8| {
             let mut data = Vec::new();
             for _ in 0..2 {
                 data.extend_from_slice(&5u16.to_be_bytes());
+            }
+            for _ in 0..2 {
                 data.extend_from_slice(&[3u8, value, value, value, value]);
             }
             data

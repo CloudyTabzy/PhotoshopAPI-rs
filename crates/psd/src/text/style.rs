@@ -93,6 +93,31 @@ impl PropertyValue for f64 {
     }
 }
 
+/// A float paragraph property: `FirstLineIndent`, `StartIndent`, `EndIndent`,
+/// `SpaceBefore`, `SpaceAfter`, `Zone`, `AutoLeading`.
+///
+/// Photoshop reads a bare integer token for these keys as 16.16 fixed point —
+/// `FirstLineIndent 24` comes back as 0.000366 px, silently losing the indent —
+/// so a value set through the typed setters always carries a decimal point,
+/// even when the file's previous token was an integer. Photoshop's own files
+/// write short decimals; the readback that pinned this is recorded in the
+/// test below.
+pub(crate) struct ParagraphFloat(pub f64);
+
+impl PropertyValue for ParagraphFloat {
+    fn from_engine(value: &EngineValue) -> Option<Self> {
+        value.as_double().map(Self)
+    }
+
+    fn to_engine(&self, current: Option<&EngineValue>) -> psd_core::Result<EngineValue> {
+        let mut token = number_token(self.0, current)?;
+        if let EngineValueKind::Number(number) = &mut token.kind {
+            number.integer = None;
+        }
+        Ok(token)
+    }
+}
+
 impl PropertyValue for i32 {
     fn from_engine(value: &EngineValue) -> Option<Self> {
         integer_value(value)
@@ -485,20 +510,11 @@ macro_rules! paragraph_properties {
 
 paragraph_properties! {
     justification / set_justification: Justification = "Justification";
-    first_line_indent / set_first_line_indent: f64 = "FirstLineIndent";
-    start_indent / set_start_indent: f64 = "StartIndent";
-    end_indent / set_end_indent: f64 = "EndIndent";
-    space_before / set_space_before: f64 = "SpaceBefore";
-    space_after / set_space_after: f64 = "SpaceAfter";
     auto_hyphenate / set_auto_hyphenate: bool = "AutoHyphenate";
     hyphenated_word_size / set_hyphenated_word_size: i32 = "HyphenatedWordSize";
     pre_hyphen / set_pre_hyphen: i32 = "PreHyphen";
     post_hyphen / set_post_hyphen: i32 = "PostHyphen";
     consecutive_hyphens / set_consecutive_hyphens: i32 = "ConsecutiveHyphens";
-    /// Hyphenation zone in points (`Zone`).
-    zone / set_zone: f64 = "Zone";
-    /// Auto-leading multiplier (`AutoLeading`, e.g. `1.2`).
-    auto_leading / set_auto_leading: f64 = "AutoLeading";
     leading_type / set_leading_type: LeadingType = "LeadingType";
     /// Roman hanging punctuation (`Hanging`).
     hanging / set_hanging: bool = "Hanging";
@@ -507,6 +523,60 @@ paragraph_properties! {
     kinsoku_order / set_kinsoku_order: KinsokuOrder = "KinsokuOrder";
     /// Adobe every-line composer instead of the single-line composer.
     every_line_composer / set_every_line_composer: bool = "EveryLineComposer";
+}
+
+/// Float paragraph properties, whose set values always carry a decimal point
+/// (see [`ParagraphFloat`]).
+macro_rules! paragraph_float_properties {
+    ($(
+        $(#[$doc:meta])*
+        $get:ident / $set:ident = $key:literal;
+    )+) => {
+        impl ParagraphStyle {
+            $(
+                #[doc = concat!("`", $key, "` of this paragraph style.")]
+                #[doc = ""]
+                $(#[$doc])*
+                pub fn $get(&self) -> Option<f64> { self.value($key) }
+            )+
+        }
+
+        impl<T: BitDepth> ParagraphStyleMut<'_, T> {
+            $(
+                #[doc = concat!("Set `", $key, "`, inserting it when absent.")]
+                #[doc = ""]
+                $(#[$doc])*
+                pub fn $set(&mut self, value: f64) -> psd_core::Result<&mut Self> {
+                    self.set_typed($key, &ParagraphFloat(value))
+                }
+            )+
+        }
+
+        impl<T: BitDepth> ParagraphStyleRange<'_, T> {
+            $(
+                #[doc = concat!("Set `", $key, "` on every paragraph the range touches.")]
+                #[doc = ""]
+                $(#[$doc])*
+                pub fn $set(&mut self, value: f64) -> psd_core::Result<&mut Self> {
+                    self.apply(|layer, run| {
+                        layer.set_sheet_value(Sheet::ParagraphRun(run), $key, &ParagraphFloat(value))
+                    })
+                }
+            )+
+        }
+    };
+}
+
+paragraph_float_properties! {
+    first_line_indent / set_first_line_indent = "FirstLineIndent";
+    start_indent / set_start_indent = "StartIndent";
+    end_indent / set_end_indent = "EndIndent";
+    space_before / set_space_before = "SpaceBefore";
+    space_after / set_space_after = "SpaceAfter";
+    /// Hyphenation zone in points (`Zone`).
+    zone / set_zone = "Zone";
+    /// Auto-leading multiplier (`AutoLeading`, e.g. `1.2`).
+    auto_leading / set_auto_leading = "AutoLeading";
 }
 
 macro_rules! paragraph_array_properties {

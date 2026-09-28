@@ -12,6 +12,37 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.13] - 2026-09-28
+
+### Fixed
+
+- `luni` roundtrip on files that write the layer-name block unpadded.
+  Photoshop pads the block to four bytes; some other editors do not. The
+  name-comparison read assumed the padded form, so an unpadded block failed to
+  parse, looked like a rename, and was rewritten two bytes longer on every
+  save. The read now takes the code-unit count as the whole payload, and a
+  changed name still writes Photoshop's padded spelling. Found by sweeping a
+  third-party editor's public corpus of 172 real PSD/PSB files through the
+  corpus harness (`PSD_EXTRA_CORPUS`): 169 passed before, all 172 now pass the
+  read, views, roundtrip and stable checks.
+- Float paragraph properties (`FirstLineIndent`, `StartIndent`, `EndIndent`,
+  `SpaceBefore`, `SpaceAfter`, `Zone`, `AutoLeading`) always carry a decimal
+  point when set through the typed setters. Photoshop reads a bare integer
+  token for these keys as 16.16 fixed point — `SpaceBefore 24` reads back as
+  0.000366 px — so setting a value on a file whose old token was an integer
+  silently lost it. Pinned by
+  `paragraph_float_setters_always_write_a_decimal_point`.
+- `psd-companion`: the `.abr` sample rows are a `u16` length table followed by
+  the row data, not interleaved rows, and the pattern channel rows follow the
+  same framing; section padding rounds the length up to the next four-byte
+  boundary instead of adding `size % 4`. Both were caught by real
+  Photoshop-written brush files from a third-party corpus — the hand-built
+  fixtures had encoded the reader's own mistakes, so they agreed with it. The new
+  `tests/real_fixtures.rs` sweeps a directory named by
+  `PSD_COMPANION_FIXTURES`, and the reader now asserts every sampled preset
+  references a sample the file carries by UUID (Photoshop does not keep the
+  two lists in a matching order).
+
 ## [0.6.12] - 2026-09-28
 
 ### Added

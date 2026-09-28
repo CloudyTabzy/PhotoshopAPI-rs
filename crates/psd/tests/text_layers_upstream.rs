@@ -1936,6 +1936,57 @@ mod proxies {
         );
     }
 
+    /// Photoshop reads a bare integer token for the float paragraph
+    /// properties as 16.16 fixed point: `SpaceBefore 24` comes back as
+    /// 0.000366 px, silently losing the value. A typed set must therefore
+    /// write the decimal spelling even when the file's old token was an
+    /// integer, and the bytes on disk must carry it. (Pinned against a
+    /// Photoshop readback: a bare integer token reads back as 16.16 fixed
+    /// point.)
+    #[test]
+    fn paragraph_float_setters_always_write_a_decimal_point() {
+        let mut file = open("TextLayers_Paragraph.psd");
+        let id = containing(&file, PARAGRAPH);
+        let layer = file.layer_mut(id).unwrap();
+
+        // Force the old token into the integer spelling first, which is the
+        // shape a third-party writer can leave behind.
+        layer
+            .paragraph_run_mut(0)
+            .set_property("SpaceBefore", EngineValue::integer(0))
+            .unwrap();
+        assert_eq!(
+            layer
+                .paragraph_run(0)
+                .unwrap()
+                .property("SpaceBefore")
+                .and_then(EngineValue::as_number)
+                .and_then(|number| number.integer),
+            Some(0)
+        );
+
+        layer.paragraph_run_mut(0).set_space_before(24.0).unwrap();
+        let number = layer
+            .paragraph_run(0)
+            .unwrap()
+            .property("SpaceBefore")
+            .and_then(EngineValue::as_number)
+            .unwrap();
+        assert_eq!(number.value, 24.0);
+        assert_eq!(
+            number.integer, None,
+            "the token must carry the decimal point"
+        );
+
+        // And the saved EngineData carries the decimal spelling.
+        let saved = file.to_bytes().unwrap();
+        let needle = b"/SpaceBefore 24.0";
+        assert!(
+            saved.windows(needle.len()).any(|window| window == needle),
+            "saved EngineData must contain {needle:?}"
+        );
+    }
+
     fn first_text_layer(file: &LayeredFile<u8>) -> usize {
         file.layers().position(Layer::is_text_layer).unwrap()
     }

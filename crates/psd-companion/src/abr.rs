@@ -811,9 +811,14 @@ fn read_sample_alpha(
             alpha.copy_from_slice(bytes);
         }
         (8, 1) => {
-            // One channel, one PackBits row per height, u16 row lengths.
-            for row in alpha.chunks_mut(w) {
-                let length = reader.u16()? as usize;
+            // One channel: a u16 length per row comes first as a table, then
+            // the PackBits rows themselves. Both references read it this way,
+            // and real Photoshop files confirm it.
+            let mut lengths = vec![0usize; h];
+            for length in &mut lengths {
+                *length = reader.u16()? as usize;
+            }
+            for (row, length) in alpha.chunks_mut(w).zip(lengths) {
                 let bytes = reader.take(length)?;
                 decode_packbits_row(bytes, row);
             }
@@ -945,8 +950,9 @@ pub fn read_abr(bytes: &[u8]) -> Result<Abr> {
             }
         }
 
-        // Sections are padded to a four-byte boundary.
-        reader.skip(size % 4)?;
+        // Sections are padded up to a four-byte boundary; a size already on
+        // the boundary has no padding at all.
+        reader.skip(size.next_multiple_of(4) - size)?;
     }
 
     Ok(abr)
@@ -1134,10 +1140,13 @@ mod tests {
         let raw = sample_body("raw", 1, 2, 2, 8, 0, &[10, 20, 30, 40]);
         // One PackBits row per height, each preceded by its u16 length: a
         // literal packet (header 1) of two bytes, twice.
+        // The length table comes first, then the rows: each row is a literal
+        // packet (header 1) of two bytes, and its length covers the header.
         let mut rle_pixels = Vec::new();
-        for row in [[200u8, 201], [202, 203]] {
-            // The length covers the packet header and its two literals.
+        for _ in 0..2 {
             rle_pixels.extend_from_slice(&3u16.to_be_bytes());
+        }
+        for row in [[200u8, 201], [202, 203]] {
             rle_pixels.extend_from_slice(&[1, row[0], row[1]]);
         }
         let rle = sample_body("rle", 1, 2, 2, 8, 1, &rle_pixels);
