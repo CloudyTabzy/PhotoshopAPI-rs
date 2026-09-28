@@ -53,7 +53,7 @@ impl DeltaSample for u16 {
     }
 }
 
-fn check_sample_count(samples: usize, width: usize, height: usize) -> Result<()> {
+pub(crate) fn check_sample_count(samples: usize, width: usize, height: usize) -> Result<()> {
     let expected = width
         .checked_mul(height)
         .ok_or(CodecError::InvalidInput("image dimensions overflow"))?;
@@ -68,7 +68,7 @@ fn check_sample_count(samples: usize, width: usize, height: usize) -> Result<()>
 /// `width * bytes_per_sample` with an overflow check: the callers pass
 /// file-derived geometry where a hostile `width` could otherwise wrap and
 /// slip past the sample-count check.
-fn row_bytes(width: usize, bytes_per_sample: usize) -> Result<usize> {
+pub(crate) fn row_bytes(width: usize, bytes_per_sample: usize) -> Result<usize> {
     width
         .checked_mul(bytes_per_sample)
         .ok_or(CodecError::InvalidInput("image dimensions overflow"))

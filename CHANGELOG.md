@@ -12,6 +12,21 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.23] - 2026-09-28
+
+### Added
+
+- Experimental: a `fearless` feature on `psd-codecs` that builds a
+  portable-SIMD prototype of the f32 ZipPrediction decode
+  (`prediction_fearless`), off by default so the shipping build is unchanged.
+  Measured against the scalar code on a 4 MB channel: 1.98x on the byte-wise
+  prefix sum, 1.47x on the four-plane transpose, 1.12x for the whole call
+  (the rest is allocation traffic). The prototype exists to answer whether
+  the portable API can express these loops without raw intrinsics — it can —
+  and it records that the `#[simd]` attribute is mandatory in practice: the
+  same kernel measured 0.42x without it. Parity with the scalar decode is
+  pinned by tests across vector boundaries.
+
 ## [0.6.22] - 2026-09-28
 
 ### Fixed
