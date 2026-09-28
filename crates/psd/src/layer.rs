@@ -315,16 +315,28 @@ impl<T: BitDepth> Layer<T> {
     /// Every layer-effects block in source order, parsed on demand. The raw
     /// blocks in [`blocks`](Self::blocks) remain the write source, including
     /// fields that these typed views do not interpret.
+    ///
+    /// A block that does not parse is skipped with a warning rather than
+    /// failing the call: a file with one unreadable effects block still has
+    /// its other layers and effects, and the raw block is preserved for
+    /// writing either way.
     pub fn effects(&self) -> Result<Vec<LayerEffectsBlock>> {
-        self.blocks
+        Ok(self
+            .blocks
             .blocks
             .iter()
             .filter_map(|block| match LayerEffectsBlock::read(block) {
-                Ok(Some(effects)) => Some(Ok(effects)),
+                Ok(Some(effects)) => Some(effects),
                 Ok(None) => None,
-                Err(error) => Some(Err(error)),
+                Err(error) => {
+                    tracing::warn!(
+                        "skipping unreadable layer-effects block {:?}: {error}",
+                        block.key
+                    );
+                    None
+                }
             })
-            .collect()
+            .collect())
     }
 
     /// Whether the layer carries an adjustment or fill-layer settings block

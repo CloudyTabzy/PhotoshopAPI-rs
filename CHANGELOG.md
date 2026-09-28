@@ -12,6 +12,22 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.20] - 2026-09-28
+
+### Changed
+
+- A channel whose stream does not decode is replaced with a zero-filled
+  channel of its declared size instead of failing the document: one corrupt
+  channel costs that channel, not the file. This is the recovery a mature
+  reader has shipped for years (corrected once so the substitute matches the
+  channel's byte count). An unknown compression marker still fails at the
+  header, so only damaged data of a known codec is covered, and the raw
+  bytes remain reachable through the raw-channel read option.
+- An unreadable layer-effects block — or a single effect inside one whose
+  value is not the object the format requires — is skipped with a warning
+  rather than failing the call. The raw block stays the write source, so
+  nothing is lost and a file renders without that one effect.
+
 ## [0.6.19] - 2026-09-28
 
 ### Fixed

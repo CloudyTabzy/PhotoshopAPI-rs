@@ -477,3 +477,46 @@ fn empty_real_user_mask_channel_does_not_fail_the_read() {
         Some(&[10, 20, 30, 40][..])
     );
 }
+
+/// A channel whose stream does not decode is replaced with a zero-filled
+/// channel of its declared size rather than failing the document — one
+/// corrupt channel costs that channel, not the file.
+#[test]
+fn a_corrupt_channel_reads_as_a_zero_filled_channel() {
+    let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 2, 2).unwrap();
+    let mut layer = Layer::new_image("Damaged", Rect::new(0, 0, 2, 2));
+    for channel in 0..3 {
+        layer
+            .image_mut()
+            .unwrap()
+            .channels
+            .insert(ChannelKey::color(channel), vec![200; 4]);
+    }
+    document.add_layer(layer);
+    let mut file = document.to_photoshop_file().unwrap();
+
+    // Point the first channel at a ZIP stream that cannot inflate.
+    let channel_data = &mut file.layer_and_mask_info.layer_info.channel_image_data[0].channels[0];
+    *channel_data = psd::core::ChannelData {
+        compression: Compression::Zip,
+        data: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33],
+    };
+    file.layer_and_mask_info.layer_info.layer_records[0].channels[0].size =
+        channel_data.data.len() as u64 + 2;
+
+    let mut writer = BeWriter::new();
+    file.write(&mut writer).unwrap();
+    let bytes = writer.into_inner();
+
+    let back = LayeredFile::<u8>::from_bytes(&bytes).expect("the document must still read");
+    let id = back.find_layer("Damaged").unwrap();
+    let pixels = back.layer(id).unwrap().image().unwrap();
+    assert_eq!(
+        pixels.channels.get(ChannelKey::color(0)),
+        Some(&[0, 0, 0, 0][..])
+    );
+    assert_eq!(
+        pixels.channels.get(ChannelKey::color(1)),
+        Some(&[200, 200, 200, 200][..])
+    );
+}

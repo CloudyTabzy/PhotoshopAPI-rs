@@ -669,9 +669,7 @@ impl<T: BitDepth> LayeredFile<T> {
                         // Older Photoshop files carry compression-marker-only
                         // or undersized `-3` records. Photoshop ignores that
                         // plane's payload, so a record that does not decode is
-                        // kept raw rather than failing the whole read. `-2`,
-                        // the rendered mask Photoshop actually reads, stays
-                        // strict.
+                        // kept raw rather than failing the whole read.
                         Err(_) if key == ChannelKey::REAL_USER_MASK => {
                             channels.insert_raw(
                                 key,
@@ -684,7 +682,19 @@ impl<T: BitDepth> LayeredFile<T> {
                                 ),
                             );
                         }
-                        Err(error) => return Err(error),
+                        // Any other channel whose stream does not decode is
+                        // replaced with a zero-filled channel of its declared
+                        // size, the way mature readers recover: one corrupt
+                        // channel costs that channel, not the document. An
+                        // unknown compression marker already failed above, so
+                        // this only covers damaged data of a known codec.
+                        Err(error) => {
+                            tracing::warn!(
+                                "channel {key:?} of layer {:?} did not decode ({error});                                  substituting a zero-filled channel",
+                                record.name.value()
+                            );
+                            channels.insert(key, vec![T::ZERO; width * height]);
+                        }
                     }
                 }
             }

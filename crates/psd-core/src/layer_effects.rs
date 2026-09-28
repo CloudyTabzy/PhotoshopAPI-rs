@@ -117,6 +117,11 @@ impl ModernLayerEffects {
 
     /// Effects in descriptor order, with separate entries for multi-effect lists.
     /// Unknown root fields remain available through `descriptor`.
+    ///
+    /// An effect whose value is not the object the format requires is skipped
+    /// with a warning rather than failing the block: such a file renders
+    /// without that effect, and the raw block stays the write source, so
+    /// nothing is lost by reading past it.
     pub fn effects(&self) -> Result<Vec<EffectDescriptor<'_>>> {
         let mut effects = Vec::new();
         for item in &self.descriptor.items {
@@ -124,9 +129,15 @@ impl ModernLayerEffects {
                 continue;
             };
             if multi {
-                let list = item.value.as_list().ok_or_else(invalid_effect)?;
+                let Some(list) = item.value.as_list() else {
+                    tracing::warn!("skipping malformed multi-effect list {:?}", item.key);
+                    continue;
+                };
                 for (index, value) in list.iter().enumerate() {
-                    let descriptor = value.as_descriptor().ok_or_else(invalid_effect)?;
+                    let Some(descriptor) = value.as_descriptor() else {
+                        tracing::warn!("skipping malformed effect {index} in {:?}", item.key);
+                        continue;
+                    };
                     effects.push(EffectDescriptor {
                         kind,
                         source_key: &item.key,
@@ -135,7 +146,10 @@ impl ModernLayerEffects {
                     });
                 }
             } else {
-                let descriptor = item.value.as_descriptor().ok_or_else(invalid_effect)?;
+                let Some(descriptor) = item.value.as_descriptor() else {
+                    tracing::warn!("skipping malformed effect {:?}", item.key);
+                    continue;
+                };
                 effects.push(EffectDescriptor {
                     kind,
                     source_key: &item.key,
@@ -221,12 +235,10 @@ fn read_modern(data: &[u8]) -> Result<ModernLayerEffects> {
     }
     let descriptor = Descriptor::read(&mut reader)?;
     let trailing_bytes = reader.take(reader.remaining())?.to_vec();
-    let parsed = ModernLayerEffects {
+    Ok(ModernLayerEffects {
         descriptor,
         trailing_bytes,
-    };
-    parsed.effects()?;
-    Ok(parsed)
+    })
 }
 
 fn read_legacy(data: &[u8]) -> Result<LegacyLayerEffects> {
@@ -403,6 +415,34 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_effect_is_skipped_and_the_rest_read() {
+        // One effect carries the object the format requires; the other is a
+        // bare string. The block still parses, exposing the good effect and
+        // skipping the bad one: the raw block stays the write source, so
+        // nothing is lost, and the file renders without that one effect.
+        let shadow = descriptor(vec![item("enab", DescriptorValue::Boolean(true))]);
+        let root = descriptor(vec![
+            item("DrSh", DescriptorValue::Descriptor(shadow)),
+            item(
+                "IrSh",
+                DescriptorValue::String(UnicodeString::new("bad", 1).unwrap()),
+            ),
+        ]);
+        let mut writer = BeWriter::new();
+        writer.u32(0);
+        writer.u32(16);
+        root.write(&mut writer).unwrap();
+        let block = TaggedBlock::new(TaggedBlockKey::new(*b"lfx2"), writer.into_inner());
+        let parsed = LayerEffectsBlock::read(&block).unwrap().unwrap();
+        let LayerEffectsData::Modern(modern) = parsed.data else {
+            panic!("modern expected")
+        };
+        let effects = modern.effects().unwrap();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].kind, EffectKind::DropShadow);
+    }
+
+    #[test]
     fn all_modern_keys_expose_single_and_multi_effects() {
         let shadow = descriptor(vec![
             item("enab", DescriptorValue::Boolean(true)),
@@ -517,19 +557,12 @@ mod tests {
     }
 
     #[test]
-    fn malformed_effect_views_fail_without_changing_raw_blocks() {
+    fn malformed_effect_blocks_fail_without_changing_raw_blocks() {
+        // A block that does not parse at all still reports an error — the
+        // document layer skips it — and the raw bytes are untouched.
         let invalid = TaggedBlock::new(TaggedBlockKey::new(*b"lfx2"), vec![0; 8]);
         assert!(LayerEffectsBlock::read(&invalid).is_err());
         assert_eq!(invalid.data, vec![0; 8]);
-
-        let mut writer = BeWriter::new();
-        writer.u32(0);
-        writer.u32(16);
-        descriptor(vec![item("dropShadowMulti", DescriptorValue::Integer(1))])
-            .write(&mut writer)
-            .unwrap();
-        let invalid = TaggedBlock::new(TaggedBlockKey::new(*b"lmfx"), writer.into_inner());
-        assert!(LayerEffectsBlock::read(&invalid).is_err());
 
         let mut bytes = vec![0, 0, 0, 1]; // legacy version and count
         bytes.extend_from_slice(b"8BIMnewE");
@@ -538,5 +571,21 @@ mod tests {
         let invalid = TaggedBlock::new(TaggedBlockKey::new(*b"lrFX"), bytes.clone());
         assert!(LayerEffectsBlock::read(&invalid).is_err());
         assert_eq!(invalid.data, bytes);
+
+        // A malformed EFFECT inside a well-formed block no longer fails the
+        // block: the view skips it and the rest stays readable (a multi-list
+        // that is not a list at all exposes nothing).
+        let mut writer = BeWriter::new();
+        writer.u32(0);
+        writer.u32(16);
+        descriptor(vec![item("dropShadowMulti", DescriptorValue::Integer(1))])
+            .write(&mut writer)
+            .unwrap();
+        let block = TaggedBlock::new(TaggedBlockKey::new(*b"lmfx"), writer.into_inner());
+        let parsed = LayerEffectsBlock::read(&block).unwrap().unwrap();
+        let LayerEffectsData::Modern(modern) = parsed.data else {
+            panic!("modern expected")
+        };
+        assert!(modern.effects().unwrap().is_empty());
     }
 }
