@@ -12,6 +12,19 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.11] - 2026-09-28
+
+### Changed
+
+- The vendored `psd-png` is synced to its 0.4.0: SIMD conversion kernels behind the
+  decoder's existing dispatch layer, each claimed only where it measured faster than the
+  autovectorised scalar loop and pinned to it by exhaustive parity tests. The shapes the
+  port's fallback path consumes benefit most: a palette PNG decoded through
+  `decode_to_rgba16` pays 56–60 % less conversion, a 4-bit palette 30–33 % less, and a
+  16-bit RGBA source narrowed to 8-bit output 15–19 % less. Shapes where the kernel lost to
+  the scalar loop — sub-byte greyscale, gray8→rgba16, equal-width RGB — declined and stay on
+  the unchanged scalar path. No public `psd` API changes.
+
 ## [0.6.10] - 2026-09-25
 
 ### Changed
