@@ -333,15 +333,54 @@ fn corpus_failures_match_the_pinned_list() {
     assert!(files.len() >= 80, "corpus shrank to {} files", files.len());
 }
 
+/// Deliberate differences in an external corpus: files whose round trip is
+/// *normalized* rather than byte-exact, each with its reason. Anything not
+/// listed here is a failure, so a new one stands out in the report.
+const EXTRA_CORPUS_KNOWN: &[(&str, &str, &str)] = &[(
+    "visibility.psd",
+    "roundtrip",
+    concat!(
+        "the record carries no transparency channel, which Photoshop reads as ",
+        "its Background layer; the writer synthesizes one (the 0.6.14 rule)"
+    ),
+)];
+
 #[test]
 fn extra_corpus_passes_every_check() {
     let Some(dir) = std::env::var_os("PSD_EXTRA_CORPUS") else {
         return;
     };
     let failures = sweep(Path::new(&dir));
-    let report: Vec<_> = failures
-        .iter()
-        .map(|(name, message)| format!("  {name}: {message}"))
-        .collect();
-    assert!(report.is_empty(), "failures:\n{}", report.join("\n"));
+    let mut unknown = Vec::new();
+    let mut known = Vec::new();
+    for (name, message) in &failures {
+        let (file, check) = name.split_once(':').unwrap_or((name.as_str(), ""));
+        match EXTRA_CORPUS_KNOWN
+            .iter()
+            .find(|(known_file, known_check, _)| {
+                file.ends_with(known_file) && check == *known_check
+            }) {
+            Some((_, _, reason)) => known.push(format!("  {name}: {message} ({reason})")),
+            None => unknown.push(format!("  {name}: {message}")),
+        }
+    }
+    if !known.is_empty() {
+        eprintln!(
+            "known deliberate differences:
+{}",
+            known.join(
+                "
+"
+            )
+        );
+    }
+    assert!(
+        unknown.is_empty(),
+        "failures:
+{}",
+        unknown.join(
+            "
+"
+        )
+    );
 }
