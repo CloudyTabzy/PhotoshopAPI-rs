@@ -297,6 +297,9 @@ fn raw_rle_channels_are_decoded_before_psd_psb_conversion() {
 
 #[test]
 fn memory_budget_is_cumulative_across_decoded_channels() {
+    // The bottom layer covers the canvas, so it keeps its single color
+    // channel; the layer above it gains the synthesized transparency channel.
+    // The document therefore needs three 4-byte channels decoded.
     let bytes = document_bytes(2);
     let err = LayeredFile::<u8>::from_bytes_with_options(
         &bytes,
@@ -306,7 +309,6 @@ fn memory_budget_is_cumulative_across_decoded_channels() {
         },
     )
     .unwrap_err();
-
     assert!(matches!(
         err,
         PsdError::ExceededMemoryLimit {
@@ -314,10 +316,29 @@ fn memory_budget_is_cumulative_across_decoded_channels() {
             available: 3
         }
     ));
+
+    // The budget accumulates across channels: two fit in 11 bytes, the third
+    // runs out.
+    let err = LayeredFile::<u8>::from_bytes_with_options(
+        &bytes,
+        ReadOptions {
+            total_memory_limit: Some(11),
+            ..ReadOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        PsdError::ExceededMemoryLimit {
+            requested: 4,
+            available: 3
+        }
+    ));
+
     LayeredFile::<u8>::from_bytes_with_options(
         &bytes,
         ReadOptions {
-            total_memory_limit: Some(8),
+            total_memory_limit: Some(12),
             ..ReadOptions::default()
         },
     )

@@ -172,21 +172,54 @@ impl TaggedBlock {
     }
 
     /// Write the block with its length marker and alignment padding.
+    ///
+    /// `padding` aligns the block on disk *outside* its declared length, which
+    /// is what the document-level (global) block list uses: those blocks are
+    /// four-byte aligned after the declared length. Per-layer blocks follow a
+    /// different rule — see [`write_layer_block`](Self::write_layer_block).
     pub fn write(&self, writer: &mut BeWriter, header: &FileHeader, padding: usize) -> Result<()> {
+        let declared = self.data.len();
+        let pad = round_up(declared, padding) - declared;
+        self.write_with_declared(writer, header, declared, pad)
+    }
+
+    /// Write a per-layer block the way Photoshop's layer-record walk requires:
+    /// the declared length is even, and an odd payload carries its pad byte
+    /// *inside* that length.
+    ///
+    /// Photoshop advances by the declared length rounded up to an even count,
+    /// and its own files never declare an odd length (a scan of the test
+    /// corpora shows zero odd per-layer blocks). An odd declared length makes
+    /// it walk one byte past the block, after which every later block in the
+    /// record reads as unknown data. Keeping the pad inside the declared
+    /// length leaves both an exact-advance reader and Photoshop's rounding
+    /// walk on the same layout; even-length blocks — every block Photoshop
+    /// writes — are byte-identical to what the input carried.
+    pub fn write_layer_block(&self, writer: &mut BeWriter, header: &FileHeader) -> Result<()> {
+        let pad = self.data.len() % 2;
+        self.write_with_declared(writer, header, self.data.len() + pad, pad)
+    }
+
+    fn write_with_declared(
+        &self,
+        writer: &mut BeWriter,
+        header: &FileHeader,
+        declared: usize,
+        pad: usize,
+    ) -> Result<()> {
         writer.bytes(&self.signature);
         writer.bytes(&self.key.as_bytes());
-        let length = self.data.len() as u64;
+        let declared = declared as u64;
         if self.length_width(header) == 8 {
-            writer.u64(length);
+            writer.u64(declared);
         } else {
-            let narrowed = u32::try_from(length).map_err(|_| PsdError::LengthOverflow {
-                actual: length,
+            let narrowed = u32::try_from(declared).map_err(|_| PsdError::LengthOverflow {
+                actual: declared,
                 width: 4,
             })?;
             writer.u32(narrowed);
         }
         writer.bytes(&self.data);
-        let pad = round_up(self.data.len(), padding) - self.data.len();
         writer.bytes(&ZEROS[..pad]);
         Ok(())
     }
@@ -257,10 +290,20 @@ impl AdditionalLayerInfo {
         Ok(Self { blocks })
     }
 
-    /// Write all blocks with the given alignment (`padding`).
+    /// Write all blocks with the given alignment (`padding`), for the
+    /// document-level list. See [`TaggedBlock::write`].
     pub fn write(&self, writer: &mut BeWriter, header: &FileHeader, padding: usize) -> Result<()> {
         for block in &self.blocks {
             block.write(writer, header, padding)?;
+        }
+        Ok(())
+    }
+
+    /// Write a layer record's block list, every block declaring an even
+    /// length. See [`TaggedBlock::write_layer_block`].
+    pub fn write_layer_blocks(&self, writer: &mut BeWriter, header: &FileHeader) -> Result<()> {
+        for block in &self.blocks {
+            block.write_layer_block(writer, header)?;
         }
         Ok(())
     }
@@ -358,6 +401,43 @@ mod tests {
             block
         );
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn layer_blocks_declare_an_even_length_with_the_pad_inside() {
+        // An odd payload gains one pad byte, counted in the declared length.
+        let block = TaggedBlock::new(TaggedBlockKey::new(*b"tes1"), vec![1, 2, 3]);
+        let mut writer = BeWriter::new();
+        block
+            .write_layer_block(&mut writer, &header(Version::Psd))
+            .unwrap();
+        let bytes = writer.into_inner();
+        assert_eq!(&bytes[..4], b"8BIM");
+        assert_eq!(&bytes[4..8], b"tes1");
+        assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()), 4);
+        assert_eq!(
+            &bytes[12..],
+            &[1, 2, 3, 0],
+            "the pad byte is inside the declared length"
+        );
+
+        // An even payload is written exactly as it was read.
+        let block = TaggedBlock::new(TaggedBlockKey::new(*b"tes2"), vec![1, 2, 3, 4]);
+        let mut writer = BeWriter::new();
+        block
+            .write_layer_block(&mut writer, &header(Version::Psd))
+            .unwrap();
+        let bytes = writer.into_inner();
+        assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()), 4);
+        assert_eq!(&bytes[12..], &[1, 2, 3, 4]);
+
+        // The document-level form still aligns outside the declared length.
+        let block = TaggedBlock::new(TaggedBlockKey::new(*b"tes3"), vec![1, 2, 3]);
+        let mut writer = BeWriter::new();
+        block.write(&mut writer, &header(Version::Psd), 4).unwrap();
+        let bytes = writer.into_inner();
+        assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()), 3);
+        assert_eq!(&bytes[12..], &[1, 2, 3, 0], "global blocks pad outside");
     }
 
     #[test]

@@ -482,7 +482,7 @@ impl<'a> LayerRecord<'a> {
         self.blending_ranges.write(writer)?;
         self.name.write(writer)?;
         if let Some(ali) = &self.additional_layer_info {
-            ali.write(writer, header, 1)?;
+            ali.write_layer_blocks(writer, header)?;
         }
         writer.pad_to_relative(content_start, 2);
         let end = writer.position();
@@ -1092,6 +1092,18 @@ impl ChannelImageData {
         let mut channels = Vec::with_capacity(record.channels.len().min(64));
         for info in &record.channels {
             let offset = reader.position() as u64;
+            // Old Photoshop writes empty layers (a 0x0 rectangle) with
+            // zero-length channel data: no payload and no two-byte
+            // compression marker at all. Treat that as an empty channel
+            // instead of erroring, the way Photoshop reads it back. A rewrite
+            // normalizes it to the marker-only form.
+            if info.size == 0 {
+                channels.push(ChannelData {
+                    compression: Compression::Raw,
+                    data: Vec::new(),
+                });
+                continue;
+            }
             let compression = Compression::from_raw(reader.u16()?)?;
             let payload_len = info.size.checked_sub(2).ok_or(PsdError::InvalidData {
                 offset,
@@ -1371,6 +1383,20 @@ mod tests {
         let back = LayerBlendingRanges::read(&mut r, w.position()).unwrap();
         assert_eq!(back, ranges);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn zero_length_channels_read_as_empty() {
+        // No bytes at all for the channel: no payload, no compression marker.
+        let mut record = sample_record();
+        record.channels.truncate(1);
+        record.channels[0].size = 0;
+        let mut reader = BeReader::new(&[]);
+        let data = ChannelImageData::read(&mut reader, &record).unwrap();
+        assert_eq!(data.channels.len(), 1);
+        assert_eq!(data.channels[0].compression, Compression::Raw);
+        assert!(data.channels[0].data.is_empty());
+        assert!(reader.is_empty());
     }
 
     #[test]

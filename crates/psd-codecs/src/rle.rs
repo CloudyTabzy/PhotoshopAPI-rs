@@ -185,6 +185,55 @@ pub fn pack_bits_decompress_into(data: &[u8], out: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+/// Decompress one PackBits row the way Photoshop recovers damaged image data.
+///
+/// Real legacy files carry corrupt scanlines and Photoshop still opens them,
+/// so the image-channel path cannot reject what the strict decoder rejects: a
+/// run or literal that overruns the row is clipped to it, a stream that ends
+/// early leaves the rest of the row at zero, and a `128` header is a no-op.
+/// Each row is positioned by its own declared size in the scanline table, so
+/// a damaged row cannot desync the rows after it. [`pack_bits_decompress_into`]
+/// remains the exact-length contract everywhere else (patterns, brushes and
+/// the crate's own tests), where a mismatch is a genuine misparse.
+pub fn pack_bits_decompress_row_lenient(data: &[u8], out: &mut [u8]) {
+    let out_len = out.len();
+    let mut produced = 0usize;
+    let mut pos = 0usize;
+    while produced < out_len {
+        let Some(&header) = data.get(pos) else {
+            break; // A short stream leaves the rest of the row at zero.
+        };
+        pos += 1;
+        match header {
+            0..=127 => {
+                let count = (header as usize + 1).min(out_len - produced);
+                match data.get(pos..pos + count) {
+                    Some(chunk) => {
+                        out[produced..produced + count].copy_from_slice(chunk);
+                        pos += count;
+                    }
+                    None => {
+                        // The literal runs past the stream: copy what exists.
+                        let rest = &data[pos..];
+                        let count = rest.len().min(out_len - produced);
+                        out[produced..produced + count].copy_from_slice(&rest[..count]);
+                        break;
+                    }
+                }
+                produced += count;
+            }
+            128 => {}
+            _ => {
+                let count = (257 - header as usize).min(out_len - produced);
+                let Some(&byte) = data.get(pos) else { break };
+                pos += 1;
+                out[produced..produced + count].fill(byte);
+                produced += count;
+            }
+        }
+    }
+}
+
 /// Compress an image channel as PSD/PSB RLE: a big-endian scanline-size table
 /// (2-byte entries for PSD, 4 for PSB) followed by the PackBits data of every
 /// scanline. Mirrors upstream `CompressRLE` (`Compress_RLE.h`).
@@ -245,6 +294,12 @@ pub fn compress_scanlines(
 }
 
 /// Decompress a PSD/PSB RLE channel produced by [`compress_scanlines`].
+///
+/// The scanline table is structural and stays strict (a row that runs past
+/// the stream, or trailing bytes after the last row, are errors), but each
+/// row's content is decoded leniently — see
+/// [`pack_bits_decompress_row_lenient`] — because Photoshop opens files whose
+/// scanlines are damaged.
 pub fn decompress_scanlines(
     data: &[u8],
     scanline_bytes: usize,
@@ -300,10 +355,10 @@ pub fn decompress_scanlines(
         scanlines
             .into_par_iter()
             .zip(out.par_chunks_mut(scanline_bytes))
-            .try_for_each(|(scanline, dst)| pack_bits_decompress_into(scanline, dst))?;
+            .for_each(|(scanline, dst)| pack_bits_decompress_row_lenient(scanline, dst));
     } else {
         for (scanline, dst) in scanlines.iter().zip(out.chunks_mut(scanline_bytes)) {
-            pack_bits_decompress_into(scanline, dst)?;
+            pack_bits_decompress_row_lenient(scanline, dst);
         }
     }
     Ok(out)
@@ -452,6 +507,30 @@ mod tests {
             decompress_scanlines(&[0, 2, 0xFF, 0x00, 0xAA], 2, 2, 1),
             Err(CodecError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn lenient_rows_clip_overruns_and_zero_fill_short_streams() {
+        // A run of 5 (header 0xFC) in a 4-byte row: clipped to the row.
+        let mut out = [9u8; 4];
+        pack_bits_decompress_row_lenient(&[0xFC, 0x2A], &mut out);
+        assert_eq!(out, [0x2A; 4]);
+
+        // A literal that claims 4 bytes but carries 2: copies what exists and
+        // leaves the rest of the caller's (zeroed) row alone.
+        let mut out = [0u8; 4];
+        pack_bits_decompress_row_lenient(&[3, 1, 2], &mut out);
+        assert_eq!(out, [1, 2, 0, 0]);
+
+        // A stream that ends after one run leaves the rest of the row alone.
+        let mut out = [0u8; 4];
+        pack_bits_decompress_row_lenient(&[0x00, 0x11], &mut out);
+        assert_eq!(out, [0x11, 0x00, 0x00, 0x00]);
+
+        // A no-op 128 header between packets changes nothing.
+        let mut out = [0u8; 4];
+        pack_bits_decompress_row_lenient(&[128, 0x01, 7, 7, 0x01, 8, 8], &mut out);
+        assert_eq!(out, [7, 7, 8, 8]);
     }
 
     #[test]

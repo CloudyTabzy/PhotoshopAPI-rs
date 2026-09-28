@@ -906,6 +906,16 @@ impl<T: BitDepth> LayeredFile<T> {
         }
     }
 
+    /// Whether a layer's bounds cover the whole canvas (Photoshop's
+    /// Background form for the bottom record).
+    fn covers_canvas(&self, layer: &Layer<T>) -> bool {
+        let bounds = layer.bounds;
+        bounds.top == 0
+            && bounds.left == 0
+            && bounds.right == self.width as i32
+            && bounds.bottom == self.height as i32
+    }
+
     /// Whether any image layer carries an alpha channel.
     pub fn has_alpha(&self) -> bool {
         self.layers().any(|layer| match &layer.kind {
@@ -1046,16 +1056,29 @@ impl<T: BitDepth> LayeredFile<T> {
         // computes this dynamically). The max keeps read documents with extra
         // channels at their file's count.
         let color_channels = color_channel_count(self.color_mode);
-        let num_channels = self
-            .num_channels
-            .max(color_channels + u16::from(self.has_alpha() || self.has_merged_alpha));
+        // A pixel record with no transparency channel gains a synthesized one
+        // on write unless it is the canvas-covering bottom record (Photoshop's
+        // Background form), so the document's channel count has to include the
+        // plane those records will carry.
+        let bottom_id = self.root_children.first().copied();
+        let synthesizes_alpha = self.layers_with_ids().any(|(id, layer)| {
+            matches!(layer.kind, LayerKind::Image(_) | LayerKind::Text(_))
+                && !layer
+                    .channels()
+                    .is_some_and(|channels| channels.contains(ChannelKey::ALPHA))
+                && !(bottom_id == Some(id) && self.covers_canvas(layer))
+        });
+        let num_channels = self.num_channels.max(
+            color_channels
+                + u16::from(self.has_alpha() || self.has_merged_alpha || synthesizes_alpha),
+        );
         // Photoshop reads an extra composite channel as a saved alpha channel
         // ("Alpha 1") unless the layer count is negative, which marks it as the
         // merged transparency. When the channel exists only because layers are
         // transparent, flag it so created documents do not gain a phantom
         // alpha channel; read files keep their own flag and saved channels.
-        let has_merged_alpha =
-            self.has_merged_alpha || (self.has_alpha() && self.num_channels <= color_channels);
+        let has_merged_alpha = self.has_merged_alpha
+            || ((self.has_alpha() || synthesizes_alpha) && self.num_channels <= color_channels);
         let header = FileHeader::new(
             self.version,
             num_channels,
@@ -1200,7 +1223,7 @@ impl<T: BitDepth> LayeredFile<T> {
                         progress,
                     )?;
                     let (record, data) =
-                        self.build_record(layer, self.blocks_for_record(layer)?)?;
+                        self.build_record(layer, self.blocks_for_record(layer)?, *index == 0)?;
                     progress(ProgressEvent::Layer {
                         name: layer.name.as_str(),
                         index: *index,
@@ -1213,7 +1236,7 @@ impl<T: BitDepth> LayeredFile<T> {
                 }
                 LayerKind::SectionDivider(_) | LayerKind::Image(_) | LayerKind::Text(_) => {
                     let (record, data) =
-                        self.build_record(layer, self.blocks_for_record(layer)?)?;
+                        self.build_record(layer, self.blocks_for_record(layer)?, *index == 0)?;
                     progress(ProgressEvent::Layer {
                         name: layer.name.as_str(),
                         index: *index,
@@ -1383,6 +1406,7 @@ impl<T: BitDepth> LayeredFile<T> {
         &'a self,
         layer: &'a Layer<T>,
         blocks: Option<Cow<'a, AdditionalLayerInfo>>,
+        is_bottom_record: bool,
     ) -> Result<(LayerRecord<'a>, ChannelImageData)> {
         let bounds = layer.bounds;
         let stub_channels = matches!(
@@ -1405,7 +1429,24 @@ impl<T: BitDepth> LayeredFile<T> {
                 keys
             }
         };
+        // Photoshop reads a pixel record without a transparency channel as its
+        // Background layer: opaque over the WHOLE canvas whatever the record
+        // bounds say, hiding everything beneath it. It omits the channel only
+        // for the bottom record covering exactly the canvas, so an opaque
+        // pixel record anywhere else gets an all-opaque transparency channel.
+        let synthesize_alpha = matches!(layer.kind, LayerKind::Image(_) | LayerKind::Text(_))
+            && !keys.contains(&ChannelKey::ALPHA)
+            && !(is_bottom_record && self.covers_canvas(layer));
+        if synthesize_alpha {
+            keys.push(ChannelKey::ALPHA);
+        }
         keys.sort_by_key(|key| channel_sort_key(*key));
+        let opaque_alpha = if synthesize_alpha {
+            let samples = (bounds.width().max(0) as usize) * (bounds.height().max(0) as usize);
+            vec![T::from_f32(1.0); samples]
+        } else {
+            Vec::new()
+        };
 
         let mut channels = Vec::new();
         let mut data = Vec::new();
@@ -1472,10 +1513,14 @@ impl<T: BitDepth> LayeredFile<T> {
                     }
                     (raw.compression, raw.payload.clone())
                 } else {
-                    let samples: &[T] = layer
-                        .channels()
-                        .and_then(|channels| channels.get(key))
-                        .unwrap_or(&[]);
+                    let samples: &[T] = if key == ChannelKey::ALPHA && synthesize_alpha {
+                        &opaque_alpha
+                    } else {
+                        layer
+                            .channels()
+                            .and_then(|channels| channels.get(key))
+                            .unwrap_or(&[])
+                    };
                     compress_channel(
                         samples,
                         rect.width().max(0) as usize,

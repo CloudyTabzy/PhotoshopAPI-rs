@@ -348,3 +348,64 @@ fn removing_a_text_layer_marks_the_text_cache_stale() {
     document.remove_layer(text).unwrap();
     assert!(document.text_cache_is_stale());
 }
+
+/// Photoshop reads a pixel record with no transparency channel as its
+/// Background layer: opaque over the whole canvas, whatever the record bounds
+/// say. An authored pixel record anywhere but the canvas-covering bottom slot
+/// therefore gets an all-opaque transparency channel on write, while the
+/// bottom record covering exactly the canvas keeps the channel-free form.
+#[test]
+fn authored_pixel_records_carry_a_transparency_channel() {
+    let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 8, 8).unwrap();
+    let mut background = Layer::new_image("Background", Rect::new(0, 0, 8, 8));
+    for channel in 0..3 {
+        background
+            .image_mut()
+            .unwrap()
+            .set_channel(ChannelKey::color(channel), vec![200u8; 64]);
+    }
+    document.add_layer(background);
+    let mut floating = Layer::new_image("Floating", Rect::new(0, 0, 4, 4));
+    for channel in 0..3 {
+        floating
+            .image_mut()
+            .unwrap()
+            .set_channel(ChannelKey::color(channel), vec![100u8; 16]);
+    }
+    document.add_layer(floating);
+
+    let back = roundtrip(&document);
+    let keys = |name: &str| -> Vec<i16> {
+        let id = back.find_layer(name).unwrap();
+        back.layer(id)
+            .unwrap()
+            .channels()
+            .unwrap()
+            .keys()
+            .map(|key| key.index())
+            .collect()
+    };
+    assert_eq!(
+        keys("Background"),
+        vec![0, 1, 2],
+        "the canvas-covering bottom record is the one channel-free form"
+    );
+    assert_eq!(
+        keys("Floating"),
+        vec![-1, 0, 1, 2],
+        "a floating pixel record gains a transparency channel"
+    );
+    let id = back.find_layer("Floating").unwrap();
+    let alpha = back
+        .layer(id)
+        .unwrap()
+        .channels()
+        .unwrap()
+        .get(ChannelKey::ALPHA)
+        .expect("decoded alpha");
+    assert_eq!(alpha.len(), 16);
+    assert!(
+        alpha.iter().all(|&value| value == 255),
+        "the synthesized alpha is opaque"
+    );
+}

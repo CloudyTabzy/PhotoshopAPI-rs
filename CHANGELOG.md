@@ -12,6 +12,39 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.14] - 2026-09-28
+
+### Fixed
+
+- Per-layer tagged blocks now declare an even length, with an odd payload's
+  pad byte inside the declared length. Photoshop advances by the declared
+  length rounded up to an even count, so an odd declared length made it walk
+  one byte past the block and read the rest of the layer record as unknown
+  data. Photoshop's own files never declare an odd length (a scan of 8,245
+  per-layer blocks across the test corpora shows none), so every even-length
+  block an input carries stays byte-identical; the change closes the hole for
+  odd payloads an editor could introduce. The document-level block list keeps
+  its four-byte alignment outside the declared length, which is what
+  Photoshop does there.
+- Image channels decode damaged RLE scanlines the way Photoshop does: an
+  overrunning packet is clipped to its row, a stream that ends early leaves
+  the rest of the row at zero, and each row is still positioned by its own
+  declared size, so one damaged row cannot desync the rows after it.
+  Previously a corrupt scanline failed the whole read, rejecting legacy files
+  Photoshop opens. The strict exact-length decoder remains the contract for
+  every other payload (patterns, brushes, this crate's own round trips).
+- A zero-length channel — how old Photoshop writes the channels of an empty
+  layer, with no payload and no compression marker — reads as an empty
+  channel instead of an error.
+- Authored pixel records match Photoshop's invariants. A new image layer
+  carries layer-record flag bit 3 (every Photoshop pixel record does, and a
+  record without it gets legacy semantics), and an image or text layer
+  written without a transparency channel gains an all-opaque one unless it is
+  the bottom record covering exactly the canvas. Photoshop reads a pixel
+  record with no transparency channel as its Background layer — opaque over
+  the whole canvas whatever its bounds say — so a floating RGB-only layer
+  used to hide everything beneath it.
+
 ## [0.6.13] - 2026-09-28
 
 ### Fixed

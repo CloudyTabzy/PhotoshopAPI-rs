@@ -166,7 +166,10 @@ impl<T: BitDepth> Layer<T> {
             bounds,
             opacity: 255,
             blend_mode: BlendMode::NORMAL,
-            flags: LayerFlags::default(),
+            // Bit 3 marks bit 4 as meaningful; every Photoshop pixel layer
+            // carries it (0x08), and a record without it gets legacy
+            // semantics from Photoshop.
+            flags: LayerFlags::from_bits(LayerFlags::BIT4_USEFUL),
             clipping: 0,
             mask: None,
             blocks: AdditionalLayerInfo::new(),
