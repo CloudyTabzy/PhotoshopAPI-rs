@@ -81,7 +81,8 @@ mod _native {
                 let header = psd::core::FileHeader::read(&mut psd::core::BeReader::new(&bytes))
                     .map_err(psd_error)?;
                 return Ok(match header.depth {
-                    BitDepth::Eight => Py::new(
+                    // A 1-bit document reads as an 8-bit one.
+                    BitDepth::One | BitDepth::Eight => Py::new(
                         py,
                         depth8::PyDocument::from_rust(
                             LayeredFile::from_bytes_with_options(&bytes, options)
@@ -109,7 +110,9 @@ mod _native {
             }
         };
         Ok(match depth {
-            BitDepth::Eight => Py::new(py, depth8::PyDocument::open(path, options)?)?.into_any(),
+            BitDepth::One | BitDepth::Eight => {
+                Py::new(py, depth8::PyDocument::open(path, options)?)?.into_any()
+            }
             BitDepth::Sixteen => Py::new(py, depth16::PyDocument::open(path, options)?)?.into_any(),
             BitDepth::ThirtyTwo => {
                 Py::new(py, depth32::PyDocument::open(path, options)?)?.into_any()

@@ -12,6 +12,24 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.21] - 2026-09-28
+
+### Added
+
+- 1-bit (bitmap mode) documents read as 8-bit ones: the packed pixels are
+  expanded during channel decode — eight pixels per byte, MSB first, with the
+  inked (set) bits black and a row stride of `ceil(width / 8)` — and saving
+  writes 8-bit, since the port has no sample type for packed bits. The
+  document reports its on-disk depth as `LayeredFile::source_depth`, so a
+  caller can see that a conversion happened. All three bitmap fixtures in the
+  reference corpus now pass the read, views, roundtrip and stable checks
+  (302 of 302).
+
+### Fixed
+
+- A 1-bit channel body that ends mid-row degrades to black padding — all-ones
+  bytes, since zero bytes would paint white — rather than failing the read.
+
 ## [0.6.20] - 2026-09-28
 
 ### Changed

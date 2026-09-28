@@ -205,6 +205,7 @@ pub fn decompress_channel<T: BitDepth>(
     width: usize,
     height: usize,
     version: Version,
+    source_depth: u16,
 ) -> Result<Vec<T>> {
     let samples = width * height;
     if samples == 0 {
@@ -216,6 +217,9 @@ pub fn decompress_channel<T: BitDepth>(
         // those into a zero-filled buffer.
         tracing::warn!("empty channel payload for a {width}x{height} channel, filling with zeros");
         return Ok(vec![T::ZERO; samples]);
+    }
+    if source_depth == 1 {
+        return decode_one_bit_channel::<T>(compression, payload, width, height, version);
     }
     let bytes = match compression {
         Compression::Raw => {
@@ -240,6 +244,63 @@ pub fn decompress_channel<T: BitDepth>(
         }
     };
     decode_be_bytes::<T>(&bytes).map_err(codec_error)
+}
+
+/// Decode a 1-bit (bitmap mode) channel: eight pixels per byte, MSB first,
+/// with a row stride of `ceil(width / 8)`. A set bit is *black* — Photoshop
+/// writes a bitmap document with the inked pixels set — so the expansion
+/// yields `0` for a set bit and full scale for a clear one, one 8-bit sample
+/// per pixel, and black padding is all-ones bytes (zero bytes would paint
+/// white). The rows go through the same codecs as any other depth; ZIP
+/// with prediction is not defined at 1 bit (writers downgrade it to ZIP), so
+/// a stream marked that way is read as plain ZIP.
+fn decode_one_bit_channel<T: BitDepth>(
+    compression: Compression,
+    payload: &[u8],
+    width: usize,
+    height: usize,
+    version: Version,
+) -> Result<Vec<T>> {
+    let row_bytes = width.div_ceil(8).max(1);
+    let packed_len = row_bytes * height;
+    let packed = match compression {
+        Compression::Raw => {
+            // A body that ends mid-row cannot have its geometry recovered;
+            // the remainder is dropped and the rest zero-filled, which
+            // degrades the read rather than failing it.
+            let mut bytes = payload[..payload.len().min(packed_len)].to_vec();
+            if bytes.len() < packed_len {
+                tracing::warn!(
+                    "raw 1-bit channel is {} bytes, expected {packed_len}; filling the rest black",
+                    payload.len()
+                );
+                bytes.resize(packed_len, 0xFF);
+            }
+            bytes
+        }
+        Compression::Rle => {
+            let size_width = if version == Version::Psd { 2 } else { 4 };
+            rle::decompress_scanlines(payload, row_bytes, size_width, height)
+                .map_err(codec_error)?
+        }
+        Compression::Zip | Compression::ZipPrediction => {
+            let inflated = zip::decompress(payload, packed_len).map_err(codec_error)?;
+            let mut bytes = inflated;
+            bytes.resize(packed_len, 0xFF);
+            bytes
+        }
+    };
+
+    let black = T::from_f32(0.0);
+    let white = T::from_f32(1.0);
+    let mut samples = Vec::with_capacity(width * height);
+    for row in packed.chunks_exact(row_bytes) {
+        for x in 0..width {
+            let bit = (row[x / 8] >> (7 - (x % 8))) & 1;
+            samples.push(if bit == 1 { black } else { white });
+        }
+    }
+    Ok(samples)
 }
 
 /// Compress typed samples into `(codec, payload)` for one channel.
@@ -361,17 +422,17 @@ mod tests {
             ] {
                 let (used, payload) = compress_channel(&data8, 8, 8, version, Some(codec)).unwrap();
                 assert_eq!(used, codec);
-                let back = decompress_channel::<u8>(used, &payload, 8, 8, version).unwrap();
+                let back = decompress_channel::<u8>(used, &payload, 8, 8, version, 8).unwrap();
                 assert_eq!(back, data8, "u8 {codec:?} {version:?}");
 
                 let (used, payload) =
                     compress_channel(&data16, 8, 8, version, Some(codec)).unwrap();
-                let back = decompress_channel::<u16>(used, &payload, 8, 8, version).unwrap();
+                let back = decompress_channel::<u16>(used, &payload, 8, 8, version, 16).unwrap();
                 assert_eq!(back, data16, "u16 {codec:?} {version:?}");
 
                 let (used, payload) =
                     compress_channel(&data32, 8, 8, version, Some(codec)).unwrap();
-                let back = decompress_channel::<f32>(used, &payload, 8, 8, version).unwrap();
+                let back = decompress_channel::<f32>(used, &payload, 8, 8, version, 32).unwrap();
                 assert_eq!(back, data32, "f32 {codec:?} {version:?}");
             }
         }
@@ -405,10 +466,93 @@ mod tests {
         assert_eq!(codec, Compression::Raw);
         assert!(payload.is_empty());
         assert!(
-            decompress_channel::<u8>(codec, &payload, 0, 0, Version::Psd)
+            decompress_channel::<u8>(codec, &payload, 0, 0, Version::Psd, 8)
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn one_bit_channels_expand_msb_first_with_black_set() {
+        // 10 pixels wide: two packed bytes per row, MSB first, and a set bit
+        // is black. This row alternates black and white.
+        let payload = [0b1010_1010, 0b1000_0000];
+        let samples =
+            decompress_channel::<u8>(Compression::Raw, &payload, 10, 1, Version::Psd, 1).unwrap();
+        assert_eq!(
+            samples,
+            vec![0, 255, 0, 255, 0, 255, 0, 255, 0, 255],
+            "set bits are black, clear bits are white"
+        );
+
+        // A body that ends mid-row degrades the read: the missing pixels are
+        // filled black (all-ones), not white.
+        let samples =
+            decompress_channel::<u8>(Compression::Raw, &[0b1010_1010], 10, 1, Version::Psd, 1)
+                .unwrap();
+        assert_eq!(samples, vec![0, 255, 0, 255, 0, 255, 0, 255, 0, 0]);
+
+        // A 16-pixel row packs into two bytes, one sample per pixel.
+        let samples = decompress_channel::<u8>(
+            Compression::Raw,
+            &[0b0101_0101, 0b0101_0101],
+            16,
+            1,
+            Version::Psd,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            samples,
+            vec![255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0]
+        );
+    }
+
+    #[test]
+    fn a_real_bitmap_mode_stream_decodes_to_its_inked_pixels() {
+        // Four rows of a 4x4 bitmap-mode image as Photoshop wrote them
+        // (raw 1-bit channel data). The inked pixels are the set bits:
+        //   B B W W
+        //   B B B B
+        //   W B B B
+        //   W W B B
+        let packed = [0xC0, 0xF0, 0x70, 0x30];
+        let samples =
+            decompress_channel::<u8>(Compression::Raw, &packed, 4, 4, Version::Psd, 1).unwrap();
+        let rendered: Vec<&str> = samples
+            .chunks_exact(4)
+            .map(|row| {
+                if row.iter().all(|&sample| sample == 0) {
+                    "BBBB"
+                } else if row == [0, 0, 255, 255] {
+                    "BBWW"
+                } else if row == [255, 0, 0, 0] {
+                    "WBBB"
+                } else if row == [255, 255, 0, 0] {
+                    "WWBB"
+                } else {
+                    "????"
+                }
+            })
+            .collect();
+        assert_eq!(rendered, ["BBWW", "BBBB", "WBBB", "WWBB"]);
+    }
+
+    #[test]
+    fn one_bit_rle_channels_decode_row_by_row() {
+        // Two rows of 10 pixels: 2 packed bytes each. RLE framing is the same
+        // as every other depth: a u16 length per row, then the row bodies
+        // (a literal packet of two bytes).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&3u16.to_be_bytes());
+        payload.extend_from_slice(&3u16.to_be_bytes());
+        payload.extend_from_slice(&[1, 0b1010_1010, 0b1000_0000]);
+        payload.extend_from_slice(&[1, 0b0101_0101, 0b0000_0000]);
+        let samples =
+            decompress_channel::<u8>(Compression::Rle, &payload, 10, 2, Version::Psd, 1).unwrap();
+        assert_eq!(&samples[..10], &[0, 255, 0, 255, 0, 255, 0, 255, 0, 255]);
+        // The second row's last two bits are clear, so those pixels are white.
+        assert_eq!(&samples[10..], &[255, 0, 255, 0, 255, 0, 255, 0, 255, 255]);
     }
 
     #[test]

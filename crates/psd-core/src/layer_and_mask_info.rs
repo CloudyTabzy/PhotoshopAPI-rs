@@ -161,7 +161,9 @@ impl<'a> LayerAndMaskInformation<'a> {
         let key = match header.depth {
             BitDepth::Sixteen => TaggedBlockKey::LR16,
             BitDepth::ThirtyTwo => TaggedBlockKey::LR32,
-            BitDepth::Eight => return Ok(()),
+            // 1-bit and 8-bit documents keep their records in the main
+            // section.
+            BitDepth::One | BitDepth::Eight => return Ok(()),
         };
         let Some(block) = self
             .additional_layer_info
@@ -210,7 +212,7 @@ impl<'a> LayerAndMaskInformation<'a> {
         let nested_key = match header.depth {
             BitDepth::Sixteen => Some(TaggedBlockKey::LR16),
             BitDepth::ThirtyTwo => Some(TaggedBlockKey::LR32),
-            BitDepth::Eight => None,
+            BitDepth::One | BitDepth::Eight => None,
         };
 
         // Regenerate the nested layer data when the document is 16/32-bit and

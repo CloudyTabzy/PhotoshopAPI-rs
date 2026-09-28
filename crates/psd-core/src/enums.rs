@@ -35,10 +35,13 @@ impl Version {
 }
 
 /// Channel bit depth. The port supports 8/16/32-bit documents; the format
-/// also defines 1-bit (bitmap) which we reject here for now, matching upstream's
-/// supported-feature set.
+/// also defines 1-bit (bitmap), which has no sample type of its own: its
+/// pixels are packed eight per byte, so a document layer reads it by
+/// expanding each bit into an 8-bit sample. Upstream's enum lists `BD_1`
+/// but never handles it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BitDepth {
+    One,
     Eight,
     Sixteen,
     ThirtyTwo,
@@ -47,6 +50,7 @@ pub enum BitDepth {
 impl BitDepth {
     pub fn from_raw(raw: u16) -> Result<Self> {
         match raw {
+            1 => Ok(Self::One),
             8 => Ok(Self::Eight),
             16 => Ok(Self::Sixteen),
             32 => Ok(Self::ThirtyTwo),
@@ -56,18 +60,39 @@ impl BitDepth {
 
     pub const fn as_raw(self) -> u16 {
         match self {
+            Self::One => 1,
             Self::Eight => 8,
             Self::Sixteen => 16,
             Self::ThirtyTwo => 32,
         }
     }
 
-    /// Bytes per channel sample on disk.
+    /// Bytes per channel sample on disk. One-bit pixels are packed, so they
+    /// have no byte-per-sample figure; callers must use
+    /// [`packed_row_bytes`](Self::packed_row_bytes) for that depth.
     pub const fn bytes_per_sample(self) -> u32 {
         match self {
+            Self::One => 1,
             Self::Eight => 1,
             Self::Sixteen => 2,
             Self::ThirtyTwo => 4,
+        }
+    }
+
+    /// Bytes one channel row occupies on disk for a given pixel width.
+    pub const fn packed_row_bytes(self, width: u32) -> u32 {
+        match self {
+            // Clamped so a zero width still divides; a channel with no pixels
+            // never reaches the codec anyway.
+            Self::One => {
+                let packed = width.div_ceil(8);
+                if packed == 0 {
+                    1
+                } else {
+                    packed
+                }
+            }
+            _ => width * self.bytes_per_sample(),
         }
     }
 }
@@ -578,9 +603,11 @@ mod tests {
             Version::from_raw(3),
             Err(PsdError::UnsupportedVersion(3))
         ));
+        // One bit is representable (bitmap mode); two is not a depth.
+        assert!(matches!(BitDepth::from_raw(1), Ok(BitDepth::One)));
         assert!(matches!(
-            BitDepth::from_raw(1),
-            Err(PsdError::UnsupportedBitDepth(1))
+            BitDepth::from_raw(2),
+            Err(PsdError::UnsupportedBitDepth(2))
         ));
         assert!(matches!(
             ColorMode::from_raw(5),

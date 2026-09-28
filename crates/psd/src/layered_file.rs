@@ -222,6 +222,10 @@ pub struct LayeredFile<T: BitDepth> {
     /// Read documents keep the file's value; created documents start at the
     /// color-mode channel count.
     pub num_channels: u16,
+    /// The file's on-disk bit depth. It differs from the document type only
+    /// for 1-bit (bitmap mode) documents, whose packed pixels are expanded to
+    /// 8-bit samples on read; saving such a document writes 8-bit.
+    pub source_depth: u16,
     /// Document resolution in dots per inch.
     pub dpi: f32,
     /// Raw ICC profile bytes (empty = no profile).
@@ -264,6 +268,7 @@ pub struct LayeredFile<T: BitDepth> {
 impl<T: BitDepth> PartialEq for LayeredFile<T> {
     fn eq(&self, other: &Self) -> bool {
         self.version == other.version
+            && self.source_depth == other.source_depth
             && self.width == other.width
             && self.height == other.height
             && self.color_mode == other.color_mode
@@ -296,6 +301,7 @@ impl<T: BitDepth> LayeredFile<T> {
         )?;
         Ok(Self {
             version: Version::Psd,
+            source_depth: T::DEPTH,
             width,
             height,
             color_mode,
@@ -422,7 +428,17 @@ impl<T: BitDepth> LayeredFile<T> {
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<Self> {
         let header = file.header;
-        if header.depth.as_raw() != T::DEPTH {
+        // A 1-bit (bitmap mode) document is read as an 8-bit one: its packed
+        // pixels are expanded during channel decode. Saving writes 8-bit —
+        // the port has no sample type for packed bits.
+        let one_bit = header.depth == CoreBitDepth::One;
+        if one_bit && T::DEPTH != 8 {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "a 1-bit (bitmap mode) document reads as an 8-bit document",
+            });
+        }
+        if !one_bit && header.depth.as_raw() != T::DEPTH {
             return Err(PsdError::InvalidData {
                 offset: 0,
                 message: "file bit depth does not match the document type",
@@ -443,6 +459,7 @@ impl<T: BitDepth> LayeredFile<T> {
 
         let mut document = Self {
             version: header.version,
+            source_depth: header.depth.as_raw(),
             width: header.width,
             height: header.height,
             color_mode: header.color_mode,
@@ -553,6 +570,7 @@ impl<T: BitDepth> LayeredFile<T> {
         options: ReadOptions,
         remaining_bitmap_memory: &mut Option<usize>,
     ) -> Result<LayerId> {
+        let source_depth = self.source_depth;
         let blocks = record
             .additional_layer_info
             .as_ref()
@@ -661,6 +679,7 @@ impl<T: BitDepth> LayeredFile<T> {
                         width,
                         height,
                         version,
+                        source_depth,
                     );
                     match decoded {
                         Ok(samples) => {
@@ -788,6 +807,7 @@ impl<T: BitDepth> LayeredFile<T> {
     /// Decoded samples become canonical channel data; no second cache is kept.
     pub fn decode_layer_channel(&mut self, id: LayerId, key: ChannelKey) -> Result<bool> {
         let mut remaining = self.remaining_bitmap_memory;
+        let source_depth = self.source_depth;
         let decoded = {
             let layer = self.layer_mut(id).ok_or(PsdError::InvalidData {
                 offset: 0,
@@ -806,6 +826,7 @@ impl<T: BitDepth> LayeredFile<T> {
                 raw.width,
                 raw.height,
                 raw.version,
+                source_depth,
             )?;
             channels.insert(key, samples);
             true
@@ -822,6 +843,7 @@ impl<T: BitDepth> LayeredFile<T> {
     /// Decoded samples become canonical channel data; no second cache is kept.
     pub fn decode_layer_pixels(&mut self, id: LayerId) -> Result<()> {
         let mut remaining = self.remaining_bitmap_memory;
+        let source_depth = self.source_depth;
         let decoded_count = {
             let layer = self.layer_mut(id).ok_or(PsdError::InvalidData {
                 offset: 0,
@@ -839,6 +861,7 @@ impl<T: BitDepth> LayeredFile<T> {
                     raw.width,
                     raw.height,
                     raw.version,
+                    source_depth,
                 )?;
                 decoded.push((key, samples));
             }

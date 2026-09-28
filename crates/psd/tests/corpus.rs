@@ -290,7 +290,9 @@ fn sweep(dir: &Path) -> Vec<(String, String)> {
             .replace('\\', "/");
         let bytes = std::fs::read(&path).unwrap();
         let found = match header_depth(&bytes) {
-            Some(8) => check_document::<u8>(&bytes),
+            // A 1-bit document is read as an 8-bit one: its packed pixels are
+            // expanded during channel decode.
+            Some(1) | Some(8) => check_document::<u8>(&bytes),
             Some(16) => check_document::<u16>(&bytes),
             Some(32) => check_document::<f32>(&bytes),
             other => CHECKS
