@@ -12,6 +12,24 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.17] - 2026-09-28
+
+### Fixed
+
+- `psd-companion`: pattern records now read their channel slots
+  positionally — the first slots are the colour planes and the slot after the
+  declared channel count is the transparency plane, as the format defines it.
+  The previous present-channel counting could mistake a present user-mask slot
+  for the transparency plane. A present slot that is neither (the user-mask
+  slot among them) is now length-checked and skipped without decoding, so a
+  malformed unused plane can no longer fail the record or force a large
+  decode.
+- `psd-companion`: a multichannel pattern record (image mode 7, the CS-era
+  bevel-texture presets) decodes as grayscale instead of being refused;
+  Photoshop reads its single plane exactly like grayscale. A written slot
+  declaring a zero or impossible length is also handled: zero means the slot
+  carries nothing and a length below the header size is rejected.
+
 ## [0.6.16] - 2026-09-28
 
 ### Fixed

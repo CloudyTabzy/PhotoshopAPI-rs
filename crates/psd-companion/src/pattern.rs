@@ -2,7 +2,8 @@
 //! layout as the PSD `Patt` image resource.
 //!
 //! One record: a length-prefixed body holding a version (1), a colour mode
-//! (RGB, grayscale or indexed), an offset, a Unicode name and Pascal id, an
+//! (RGB, grayscale, indexed or multichannel), an offset, a Unicode name and
+//! Pascal id, an
 //! optional 256-entry palette for indexed mode, then a "virtual memory array
 //! list" of channels — each with its own rectangle, pixel depth and
 //! compression (raw or per-row PackBits). The channels are composited into one
@@ -76,10 +77,10 @@ pub fn read_pattern(reader: &mut BeReader<'_>) -> Result<Pattern> {
     let y = f64::from(reader.i16()?);
     if !matches!(
         color_mode,
-        ColorMode::Rgb | ColorMode::Grayscale | ColorMode::Indexed
+        ColorMode::Rgb | ColorMode::Grayscale | ColorMode::Indexed | ColorMode::Multichannel
     ) {
         return Err(Error::Unsupported(format!(
-            "pattern colour mode {color_mode:?}; this reader knows RGB, grayscale and indexed"
+            "pattern colour mode {color_mode:?}; this reader knows RGB, grayscale, indexed and multichannel"
         )));
     }
 
@@ -125,22 +126,37 @@ pub fn read_pattern(reader: &mut BeReader<'_>) -> Result<Pattern> {
     }
 
     let channels = reader.u32()?;
-    let mut channel_index = 0usize;
-    // The list carries one slot per colour channel plus an absent slot and the
-    // alpha slot, so the reference walks `count + 2` entries.
-    for _ in 0..channels.saturating_add(2) {
+    // The list carries one slot per colour channel plus a user-mask slot and
+    // the transparency slot, so `count + 2` entries are walked. Slots are
+    // positional: the first `color_plane_count` slots are the colour planes
+    // and the slot after the declared count is the transparency plane. Any
+    // other present slot - the user-mask slot among them - is skipped without
+    // decoding; its payload is still length-checked so the walk stays in sync,
+    // and a malformed unused plane cannot fail the record or force a large
+    // decode.
+    for slot in 0..channels.saturating_add(2) {
         if reader.u32()? == 0 {
             continue;
         }
         let channel_length = reader.u32()? as usize;
+        if channel_length == 0 {
+            continue;
+        }
+        if channel_length < 23 {
+            return Err(invalid(reader, "pattern channel length is too small"));
+        }
         let pixel_depth = reader.u32()?;
         let (ctop, cleft, cbottom, cright) =
             (reader.u32()?, reader.u32()?, reader.u32()?, reader.u32()?);
         let pixel_depth2 = reader.u16()?;
         let compression = reader.u8()?;
 
-        let data_length = channel_length.saturating_sub(4 + 16 + 2 + 1);
-        let channel_data = reader.take(data_length)?;
+        let channel_data = reader.take(channel_length - 23)?;
+
+        let role = slot_role(color_mode, channels, slot);
+        if role == SlotRole::Unused {
+            continue;
+        }
 
         if u32::from(pixel_depth2) != pixel_depth {
             return Err(invalid(
@@ -186,7 +202,7 @@ pub fn read_pattern(reader: &mut BeReader<'_>) -> Result<Pattern> {
                 ox,
                 oy,
                 width,
-                channel_index,
+                role,
                 &mut data,
             ),
             1 => decode_rle_channel(
@@ -197,7 +213,7 @@ pub fn read_pattern(reader: &mut BeReader<'_>) -> Result<Pattern> {
                 ox,
                 oy,
                 width,
-                channel_index,
+                role,
                 &mut data,
             ),
             _ => {
@@ -207,8 +223,6 @@ pub fn read_pattern(reader: &mut BeReader<'_>) -> Result<Pattern> {
                 ))
             }
         }?;
-
-        channel_index += 1;
     }
 
     reader.seek(end)?;
@@ -228,9 +242,30 @@ pub fn read_pattern(reader: &mut BeReader<'_>) -> Result<Pattern> {
     })
 }
 
-/// Which present channel carries transparency for a colour mode: the fourth
-/// plane of an RGB record, the second of a grayscale or indexed one.
-fn alpha_channel(color_mode: ColorMode) -> usize {
+/// Which plane a present slot carries. The file's slots are positional: the
+/// first [`color_plane_count`] slots are colour planes, the slot after the
+/// declared channel count is the transparency plane, and everything else
+/// (the user-mask slot among them) is unused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotRole {
+    Color(usize),
+    Alpha,
+    Unused,
+}
+
+fn slot_role(color_mode: ColorMode, declared_channels: u32, slot: u32) -> SlotRole {
+    if slot < color_plane_count(color_mode) as u32 {
+        SlotRole::Color(slot as usize)
+    } else if slot == declared_channels.saturating_add(1) {
+        SlotRole::Alpha
+    } else {
+        SlotRole::Unused
+    }
+}
+
+/// Colour planes a pattern record carries for its mode. Multichannel records
+/// carry one plane, which Photoshop reads exactly like grayscale.
+fn color_plane_count(color_mode: ColorMode) -> usize {
     match color_mode {
         ColorMode::Rgb => 3,
         _ => 1,
@@ -272,51 +307,55 @@ fn decode_raw_channel(
     ox: usize,
     oy: usize,
     width: usize,
-    channel_index: usize,
+    role: SlotRole,
     data: &mut [u8],
 ) -> Result<()> {
     for yy in 0..h {
         for xx in 0..w {
             // The pixel's first channel in the composed bitmap.
             let dst = (ox + xx + (yy + oy) * width) * 4;
-            if channel_index == alpha_channel(color_mode) {
+            match role {
                 // The transparency plane, present on records that carry one
                 // (real Photoshop patterns can have transparent pixels).
-                let src = (xx + yy * w) * sample_bytes;
-                let Some(sample) = channel_data.get(src..src + sample_bytes) else {
-                    continue;
-                };
-                put_channel(data, dst + 3, sample_to_u8(sample, pixel_depth));
-                continue;
-            }
-            match color_mode {
-                ColorMode::Rgb if channel_index < 3 => {
+                SlotRole::Alpha => {
                     let src = (xx + yy * w) * sample_bytes;
                     let Some(sample) = channel_data.get(src..src + sample_bytes) else {
                         continue;
                     };
-                    put_channel(data, dst + channel_index, sample_to_u8(sample, pixel_depth));
+                    put_channel(data, dst + 3, sample_to_u8(sample, pixel_depth));
                 }
-                ColorMode::Grayscale if channel_index < 1 => {
-                    let src = (xx + yy * w) * sample_bytes;
-                    let Some(sample) = channel_data.get(src..src + sample_bytes) else {
-                        continue;
-                    };
-                    let value = sample_to_u8(sample, pixel_depth);
-                    for channel in 0..3 {
-                        put_channel(data, dst + channel, value);
+                SlotRole::Color(index) => match color_mode {
+                    ColorMode::Rgb if index < 3 => {
+                        let src = (xx + yy * w) * sample_bytes;
+                        let Some(sample) = channel_data.get(src..src + sample_bytes) else {
+                            continue;
+                        };
+                        put_channel(data, dst + index, sample_to_u8(sample, pixel_depth));
                     }
-                }
-                ColorMode::Indexed if channel_index < 1 => {
-                    let Some(&index) = channel_data.get(xx + yy * w) else {
-                        continue;
-                    };
-                    let color = palette[usize::from(index)];
-                    for (channel, &value) in color.iter().enumerate() {
-                        put_channel(data, dst + channel, value);
+                    // Multichannel carries one plane that Photoshop reads
+                    // exactly like grayscale.
+                    ColorMode::Grayscale | ColorMode::Multichannel if index < 1 => {
+                        let src = (xx + yy * w) * sample_bytes;
+                        let Some(sample) = channel_data.get(src..src + sample_bytes) else {
+                            continue;
+                        };
+                        let value = sample_to_u8(sample, pixel_depth);
+                        for channel in 0..3 {
+                            put_channel(data, dst + channel, value);
+                        }
                     }
-                }
-                _ => {}
+                    ColorMode::Indexed if index < 1 => {
+                        let Some(&index) = channel_data.get(xx + yy * w) else {
+                            continue;
+                        };
+                        let color = palette[usize::from(index)];
+                        for (channel, &value) in color.iter().enumerate() {
+                            put_channel(data, dst + channel, value);
+                        }
+                    }
+                    _ => {}
+                },
+                SlotRole::Unused => {}
             }
         }
     }
@@ -332,10 +371,10 @@ fn decode_rle_channel(
     ox: usize,
     oy: usize,
     width: usize,
-    channel_index: usize,
+    role: SlotRole,
     data: &mut [u8],
 ) -> Result<()> {
-    if color_mode == ColorMode::Indexed {
+    if color_mode == ColorMode::Indexed && role == SlotRole::Color(0) {
         return Err(Error::Unsupported(
             "run-length-encoded indexed patterns are not decoded".to_owned(),
         ));
@@ -352,14 +391,14 @@ fn decode_rle_channel(
         decode_packbits_row(bytes, row);
     }
 
-    let channels: &[usize] = if channel_index == alpha_channel(color_mode) {
-        &[3]
-    } else {
-        match color_mode {
-            ColorMode::Rgb if channel_index < 3 => &[channel_index],
-            ColorMode::Grayscale if channel_index < 1 => &[0, 1, 2],
+    let channels: &[usize] = match role {
+        SlotRole::Alpha => &[3],
+        SlotRole::Color(index) => match color_mode {
+            ColorMode::Rgb if index < 3 => &[index],
+            ColorMode::Grayscale | ColorMode::Multichannel if index < 1 => &[0, 1, 2],
             _ => &[],
-        }
+        },
+        SlotRole::Unused => &[],
     };
     for (yy, row) in scratch.chunks(w).enumerate() {
         for (xx, &value) in row.iter().enumerate() {
@@ -407,6 +446,26 @@ mod tests {
         palette: Option<&[[u8; 3]]>,
         channels: &[ChannelFixture],
     ) -> Vec<u8> {
+        // Slots are positional: the colour planes, then an absent user-mask
+        // slot, then the transparency plane, then a final absent slot.
+        let colors: Vec<ChannelFixture> = channels
+            .iter()
+            .filter(|channel| !channel.alpha)
+            .cloned()
+            .collect();
+        let alpha = channels.iter().find(|channel| channel.alpha).cloned();
+        fixture_with_extra_slots(color_mode, palette, &colors, &[None, alpha, None])
+    }
+
+    /// A record whose slot list continues past the colour planes with the
+    /// given extra slots (`None` = absent), for exercising the user-mask and
+    /// transparency slot positions.
+    pub(crate) fn fixture_with_extra_slots(
+        color_mode: u32,
+        palette: Option<&[[u8; 3]]>,
+        channels: &[ChannelFixture],
+        extras: &[Option<ChannelFixture>],
+    ) -> Vec<u8> {
         let mut body = BeWriter::new();
         body.u32(1); // version
         body.u32(color_mode);
@@ -435,13 +494,20 @@ mod tests {
         body.u32(0); // left
         body.u32(2); // bottom
         body.u32(2); // right
+                     // Slots are positional; the caller lists the colour planes first and
+                     // the slots after them in `extras`, in order.
         body.u32(channels.len() as u32);
         for channel in channels {
             channel.write(&mut body);
         }
-        // The list closes with an absent slot and the alpha slot, both empty.
-        body.u32(0);
-        body.u32(0);
+        for slot in extras {
+            match slot {
+                Some(channel) => channel.write(&mut body),
+                None => {
+                    body.u32(0);
+                }
+            }
+        }
 
         let mut out = BeWriter::new();
         let mut length = body.position();
@@ -456,11 +522,15 @@ mod tests {
         out.into_inner()
     }
 
+    #[derive(Clone)]
     pub(crate) struct ChannelFixture {
         pub(crate) depth: u32,
         pub(crate) rect: [u32; 4],
         pub(crate) compression: u8,
         pub(crate) data: Vec<u8>,
+        /// Marked fixtures are laid out in the transparency slot (the slot
+        /// after the declared channel count), not among the colour planes.
+        pub(crate) alpha: bool,
     }
 
     impl ChannelFixture {
@@ -470,6 +540,16 @@ mod tests {
                 rect,
                 compression: 0,
                 data,
+                alpha: false,
+            }
+        }
+
+        /// A transparency-plane fixture; the builder places it in the slot
+        /// the file's positional layout reserves for it.
+        pub(crate) fn alpha(depth: u32, rect: [u32; 4], data: Vec<u8>) -> Self {
+            Self {
+                alpha: true,
+                ..Self::raw(depth, rect, data)
             }
         }
 
@@ -532,6 +612,57 @@ mod tests {
     }
 
     #[test]
+    fn a_multichannel_record_decodes_as_grayscale() {
+        // CS-era bevel-texture presets store image mode 7 (Multichannel) with
+        // one plane; Photoshop reads that plane exactly like grayscale.
+        let bytes = fixture(
+            7,
+            None,
+            &[ChannelFixture::raw(8, [0, 0, 2, 2], vec![10, 20, 200, 250])],
+        );
+        let reader = &mut BeReader::new(&bytes);
+        let pattern = read_pattern(reader).expect("decode");
+        assert_eq!(
+            pattern.data.chunks_exact(4).collect::<Vec<_>>(),
+            vec![
+                &[10, 10, 10, 255],
+                &[20, 20, 20, 255],
+                &[200, 200, 200, 255],
+                &[250, 250, 250, 255],
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unused_present_slot_is_skipped_without_decoding() {
+        // The user-mask slot (index `declared`) is neither a colour plane nor
+        // the transparency plane. A present-but-malformed plane there must be
+        // length-checked and skipped, never decoded: this one declares a huge
+        // rectangle with a truncated RLE body.
+        let bogus = ChannelFixture {
+            depth: 8,
+            rect: [0, 0, 1024, 8191],
+            compression: 1,
+            alpha: false,
+            data: vec![0, 0, 0, 0],
+        };
+        let bytes = fixture_with_extra_slots(
+            3,
+            None,
+            &[
+                ChannelFixture::raw(8, [0, 0, 2, 2], (0..4).collect()),
+                ChannelFixture::raw(8, [0, 0, 2, 2], (4..8).collect()),
+                ChannelFixture::raw(8, [0, 0, 2, 2], (8..12).collect()),
+            ],
+            &[Some(bogus), None, None],
+        );
+        let reader = &mut BeReader::new(&bytes);
+        let pattern = read_pattern(reader).expect("decode");
+        assert_eq!(&pattern.data[0..4], &[0, 4, 8, 255]);
+        assert_eq!(&pattern.data[12..16], &[3, 7, 11, 255]);
+    }
+
+    #[test]
     fn decodes_a_raw_indexed_pattern_through_its_palette() {
         let palette = [[1u8, 2, 3], [40, 50, 60]];
         let bytes = fixture(
@@ -557,7 +688,7 @@ mod tests {
                 ChannelFixture::raw(8, [0, 0, 2, 2], (0..4).collect()),
                 ChannelFixture::raw(8, [0, 0, 2, 2], (4..8).collect()),
                 ChannelFixture::raw(8, [0, 0, 2, 2], (8..12).collect()),
-                ChannelFixture::raw(8, [0, 0, 2, 2], vec![9, 18, 200, 255]),
+                ChannelFixture::alpha(8, [0, 0, 2, 2], vec![9, 18, 200, 255]),
             ],
         );
         let reader = &mut BeReader::new(&bytes);
@@ -594,18 +725,21 @@ mod tests {
                     depth: 8,
                     rect: [0, 0, 2, 2],
                     compression: 1,
+                    alpha: false,
                     data: run(1),
                 },
                 ChannelFixture {
                     depth: 8,
                     rect: [0, 0, 2, 2],
                     compression: 1,
+                    alpha: false,
                     data: run(2),
                 },
                 ChannelFixture {
                     depth: 8,
                     rect: [0, 0, 2, 2],
                     compression: 1,
+                    alpha: false,
                     data: run(3),
                 },
             ],
@@ -619,8 +753,9 @@ mod tests {
     #[test]
     fn rejects_inverted_rectangles_and_depth_mismatches() {
         let mut inverted = fixture(3, None, &[]);
-        // Patch the rectangle: top=2, bottom=0.
-        let rect_at = inverted.len() - 4 - 4 * 4 - 4 - 4;
+        // Patch the rectangle: top=2, bottom=0. The record closes with the
+        // declared count and three absent slots, then the record padding.
+        let rect_at = inverted.len() - 12 - 4 - 16;
         inverted[rect_at + 8..rect_at + 12].copy_from_slice(&0u32.to_be_bytes());
         inverted[rect_at..rect_at + 4].copy_from_slice(&2u32.to_be_bytes());
         let reader = &mut BeReader::new(&inverted);
@@ -633,6 +768,7 @@ mod tests {
                 depth: 8,
                 rect: [0, 0, 2, 2],
                 compression: 0,
+                alpha: false,
                 data: vec![0; 4],
             }],
         );
