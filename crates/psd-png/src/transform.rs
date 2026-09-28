@@ -100,15 +100,19 @@ pub(crate) struct RowConverter {
 ///
 /// Built once per image, so converting a pixel is one bounds comparison and one table load,
 /// instead of a slice lookup into `PLTE` and another into `tRNS` for every pixel.
-struct Palette {
+pub(crate) struct Palette {
     /// One entry per possible index. Entries at or past `len` are never read.
-    rgba: [[u8; 4]; 256],
+    pub(crate) rgba: [[u8; 4]; 256],
+    /// The same entries widened to 16-bit: `v * 257` is the byte doubled, so each
+    /// big-endian `u16` is the 8-bit channel written twice — `[r, r, g, g, b, b, a, a]`.
+    /// A 16-bit conversion is then a copy out of this table, with no per-sample maths.
+    pub(crate) rgba16: [[u8; 8]; 256],
     /// Entries `PLTE` defines; an index at or past this is out of range.
-    len: usize,
+    pub(crate) len: usize,
 }
 
 impl Palette {
-    fn new(plte: &[u8], trns: Option<&[u8]>) -> Self {
+    pub(crate) fn new(plte: &[u8], trns: Option<&[u8]>) -> Self {
         let mut rgba = [[0, 0, 0, 255]; 256];
         for (entry, rgb) in rgba.iter_mut().zip(plte.chunks_exact(3)) {
             entry[..3].copy_from_slice(rgb);
@@ -117,7 +121,14 @@ impl Palette {
         for (entry, &alpha) in rgba.iter_mut().zip(trns.unwrap_or_default()) {
             entry[3] = alpha;
         }
-        Self { rgba, len: plte.len() / 3 }
+        let mut rgba16 = [[0u8; 8]; 256];
+        for (wide, entry) in rgba16.iter_mut().zip(rgba.iter()) {
+            for (channel, &value) in entry.iter().enumerate() {
+                wide[2 * channel] = value;
+                wide[2 * channel + 1] = value;
+            }
+        }
+        Self { rgba, rgba16, len: plte.len() / 3 }
     }
 }
 
@@ -186,6 +197,23 @@ impl RowConverter {
             target.copy_from_slice(&row[..target.len()]);
             return Ok(());
         }
+
+        // The accelerated paths claim only the shapes they cover completely; anything
+        // declined — including every `CHANNELS == 3` target and keyed `tRNS` cases the
+        // kernels do not express — falls through to the scalar helpers below.
+        let spec = crate::simd::RowConversion {
+            color_type: self.color_type,
+            bit_depth: self.bit_depth,
+            channels: CHANNELS,
+            wide: S::WIDTH == 2,
+            grey_key: self.grey_key,
+            rgb_key: self.rgb_key,
+            palette: self.palette.as_deref(),
+        };
+        if crate::simd::convert_row(&spec, row, target)? {
+            return Ok(());
+        }
+
         let (grey_key, rgb_key) = (self.grey_key, self.rgb_key);
 
         // Colour type and bit depth belong to the file, not to the pixel, so they are
@@ -290,7 +318,7 @@ fn write_pixel<const CHANNELS: usize, S: RowSample>(pixel: &mut [u8], values: [S
 }
 
 /// Grey levels, scaled to the full output range, with `tRNS` matched against the raw sample.
-fn grey_row<const CHANNELS: usize, const BITS: usize, S: RowSample>(
+pub(crate) fn grey_row<const CHANNELS: usize, const BITS: usize, S: RowSample>(
     row: &[u8],
     target: &mut [u8],
     key: Option<u16>,
@@ -304,7 +332,7 @@ fn grey_row<const CHANNELS: usize, const BITS: usize, S: RowSample>(
 }
 
 /// Grey plus alpha. `tRNS` does not apply: the alpha channel is already explicit.
-fn grey_alpha_row<const CHANNELS: usize, const WIDE: bool, S: RowSample>(
+pub(crate) fn grey_alpha_row<const CHANNELS: usize, const WIDE: bool, S: RowSample>(
     row: &[u8],
     target: &mut [u8],
 ) {
@@ -320,7 +348,7 @@ fn grey_alpha_row<const CHANNELS: usize, const WIDE: bool, S: RowSample>(
     }
 }
 
-fn rgb_row<const CHANNELS: usize, const WIDE: bool, S: RowSample>(
+pub(crate) fn rgb_row<const CHANNELS: usize, const WIDE: bool, S: RowSample>(
     row: &[u8],
     target: &mut [u8],
     key: Option<[u16; 3]>,
@@ -357,7 +385,10 @@ fn rgb_row<const CHANNELS: usize, const WIDE: bool, S: RowSample>(
     }
 }
 
-fn rgba_row<const CHANNELS: usize, const WIDE: bool, S: RowSample>(row: &[u8], target: &mut [u8]) {
+pub(crate) fn rgba_row<const CHANNELS: usize, const WIDE: bool, S: RowSample>(
+    row: &[u8],
+    target: &mut [u8],
+) {
     // RGBA asked for as RGBA at its own width never reaches here: `RowConverter::convert`
     // copies it through whole.
     let stride = if WIDE { 8 } else { 4 };
@@ -374,7 +405,7 @@ fn rgba_row<const CHANNELS: usize, const WIDE: bool, S: RowSample>(row: &[u8], t
     }
 }
 
-fn indexed_row<const CHANNELS: usize, const BITS: usize, S: RowSample>(
+pub(crate) fn indexed_row<const CHANNELS: usize, const BITS: usize, S: RowSample>(
     row: &[u8],
     target: &mut [u8],
     palette: &Palette,

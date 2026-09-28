@@ -6,6 +6,36 @@ no `repository` URL, so no version headings carry compare links.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-28
+
+### Added
+
+- SIMD conversion kernels behind the F1 dispatch layer (F2). `RowConverter::convert` now
+  offers the accelerated paths a row before the scalar helpers run, and every decline falls
+  through untouched. Claimed, each pinned to the scalar helpers by exhaustive parity tests
+  and measured faster than the autovectorised scalar loop: palette expansion at depth 8
+  (both output widths, `tRNS` alpha folded into the resolved table), palette sub-byte
+  expansion for 16-bit output, greyscale 8→RGBA8 and 16→RGBA8/16 with `tRNS` keys,
+  greyscale-alpha at both depths and output widths, RGBA 8→16 and 16→8, and keyless RGB
+  widening as portable scalar. The 16-bit palette table is pre-expanded
+  (`[r, r, g, g, b, b, a, a]` per entry), so a 16-bit conversion is one fixed-size copy per
+  pixel. Measured, conversion-only, against the scalar helper each kernel replaces:
+  palette8→rgba16 0.16×, rgba16→rgba8 0.25×, graya8→rgba16 0.38×, gray8→rgba8 0.48×,
+  rgba8→rgba16 0.51×, palette8→rgba8 0.68×. End to end on the 1920×1080 fixtures:
+  palette8 rgba16 −56…−60 %, palette4 rgba16 −30…−33 %, rgba16→rgba8 −15…−19 %.
+
+### Changed
+
+- Shapes where the kernel measured slower than the autovectorised scalar loop declined
+  instead: every sub-byte greyscale target, gray8→rgba16, rgb8→rgba8, rgb16→rgba16 and
+  palette sub-byte→rgba8. The scalar helpers keep them, unchanged. A first indexed kernel
+  with a runtime output stride measured 2× slower than scalar — a runtime-length
+  `copy_from_slice` is a `memcpy` call per pixel — and was replaced by a const-generic
+  fixed-size copy before anything shipped.
+- The `stream_decode` bench reuses its output buffers across timed runs. A fresh 8.3 MB
+  `Vec` per iteration paid page faults scaled to the output size, which masqueraded as
+  conversion cost and flipped the sign of the palette8 comparison.
+
 ## [0.3.0] - 2026-09-25
 
 ### Removed
