@@ -12,6 +12,40 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.19] - 2026-09-28
+
+### Fixed
+
+- A layer-mask block's reverse-ordered second header now follows the record's
+  `-3` (real user mask) channel instead of the block length. A parameter
+  block that pushes the record past 36 bytes used to be read as that header —
+  turning a 22.8 px feather into a bogus rectangle — or the parameters were
+  dropped entirely; they are now read whenever a mask flag asks for them.
+- A channel declaring a length of one — malformed, the spec allows zero or at
+  least two — no longer fails the file: the stray byte is consumed so the
+  channels after it stay aligned, and the channel reads as empty.
+- Truncated mask parameters (a flag byte promising more than the block holds)
+  keep the fields that fit and warn, instead of failing the whole read.
+- A `ResolutionInfo` image resource smaller than its fixed payload is kept
+  raw instead of failing the file.
+- A layer whose channels all carry no payload reads with degenerate bounds —
+  an empty gradient-fill layer with a `0 x -1` rectangle — instead of being
+  rejected.
+- A layer-and-mask tail shorter than a mask length no longer underflows; the
+  padding is consumed and the section ends cleanly. This was a reachable
+  panic.
+- Group records keep whichever pass-through spelling the document uses:
+  `pass` on the record with a type-only `lsct`, or `norm` on the record with
+  the mode on a longer `lsct`. The writer used to upgrade the short form,
+  changing files it round-tripped.
+
+### Changed
+
+- One-bit (bitmap mode) documents keep a clear error that names the reason:
+  their pixels are packed per byte, a layout this port has no sample type
+  for, and the C++ upstream has the same limitation. Tracked as a future
+  feature.
+
 ## [0.6.18] - 2026-09-28
 
 ### Fixed

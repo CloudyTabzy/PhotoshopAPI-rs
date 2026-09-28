@@ -224,13 +224,19 @@ impl ImageResources {
         }
 
         let block = match id {
+            ID_RESOLUTION_INFO if data_size < 16 => {
+                // Smaller than its fixed payload: keep the bytes raw rather
+                // than failing the file, the way mature readers do.
+                tracing::warn!(
+                    "ResolutionInfo block declares {data_size} bytes, smaller than its                      16-byte payload; keeping it raw"
+                );
+                ResourceBlock::Raw(RawResourceBlock {
+                    id,
+                    name,
+                    data: reader.take(data_size)?.to_vec(),
+                })
+            }
             ID_RESOLUTION_INFO => {
-                if data_size < 16 {
-                    return Err(PsdError::InvalidData {
-                        offset,
-                        message: "ResolutionInfo block is smaller than its 16-byte payload",
-                    });
-                }
                 if data_size != 16 {
                     tracing::warn!(
                         "ResolutionInfo block declares {data_size} bytes, expected 16; \

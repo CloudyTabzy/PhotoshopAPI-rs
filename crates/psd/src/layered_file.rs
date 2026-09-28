@@ -601,7 +601,24 @@ impl<T: BitDepth> LayeredFile<T> {
         }
         let mut channel_iter = channel_data.channels.into_iter();
         let layer_rect = Rect::new(record.top, record.left, record.bottom, record.right);
-        let layer_extents = read_rect_extents(layer_rect, "layer", version)?;
+        // A layer whose non-mask channels all carry no payload has no pixels
+        // to allocate, so a degenerate rectangle (an empty gradient-fill
+        // layer with a 0 x -1 rectangle, say) is read as zero-area rather
+        // than rejected. Photoshop opens these files.
+        let layer_extents = match read_rect_extents(layer_rect, "layer", version) {
+            Ok(extents) => extents,
+            Err(error @ PsdError::InvalidImageBounds { .. })
+                if record
+                    .channels
+                    .iter()
+                    .filter(|info| !ChannelKey(info.index).is_mask())
+                    .all(|info| info.size <= 2) =>
+            {
+                let _ = error;
+                (0, 0)
+            }
+            Err(error) => return Err(error),
+        };
         let is_group = matches!(
             divider,
             Some(SectionDivider::OpenFolder | SectionDivider::ClosedFolder)
@@ -1300,7 +1317,14 @@ impl<T: BitDepth> LayeredFile<T> {
             .blocks
             .get(TaggedBlockKey::LUNI)
             .and_then(|block| UnicodeString::read(&mut BeReader::new(&block.data), 1).ok());
-        if current_name.as_ref().map(UnicodeString::value) != Some(layer.name.as_str()) {
+        // An unnamed layer that never had the block does not gain one: an
+        // empty `luni` says nothing, and adding it changes a file that
+        // round-tripped without it (Photoshop writes dividers with `lsct`
+        // alone).
+        let needs_name_block = current_name.as_ref().map(UnicodeString::value)
+            != Some(layer.name.as_str())
+            && !(layer.name.is_empty() && current_name.is_none());
+        if needs_name_block {
             let mut writer = BeWriter::new();
             UnicodeString::new(layer.name.as_str(), 4)?.write_verbatim(&mut writer)?;
             upsert_block(
@@ -1326,9 +1350,15 @@ impl<T: BitDepth> LayeredFile<T> {
                         data[LSCT_BLEND_KEY].copy_from_slice(&blend);
                         data
                     }
-                    // A short `lsct` has no blend key: the record's mode
-                    // applies, which cannot say pass-through.
-                    Some(data) if layer.blend_mode != BlendMode::PASSTHROUGH => {
+                    // A short `lsct` has no blend key, so the record's mode
+                    // is the one that applies. Keep the short form: a
+                    // pass-through group then keeps `pass` on the record
+                    // (Photoshop writes that spelling when the `lsct` is
+                    // type-only), and any other mode is already on the record.
+                    Some(data)
+                        if layer.blend_mode != BlendMode::PASSTHROUGH
+                            || data.len() < LSCT_BLEND_KEY.end =>
+                    {
                         let mut data = data.clone();
                         let len = data.len().min(4);
                         data[..len].copy_from_slice(&kind.as_raw().to_be_bytes()[..len]);
@@ -1563,10 +1593,23 @@ impl<T: BitDepth> LayeredFile<T> {
             });
         }
 
-        // Pass-through is spelled on the group's `lsct` block with `norm` on
-        // the record, as Photoshop and upstream write it.
+        // Pass-through is spelled one of two ways in the wild: `pass` on the
+        // record when the group's `lsct` is the short, type-only form, or
+        // `norm` on the record with `pass` on the `lsct`'s blend key. The
+        // layer's own `lsct` says which one this document uses, and the
+        // spelling is preserved rather than normalized.
         let blend_mode = match layer.kind {
-            LayerKind::Group(_) if layer.blend_mode == BlendMode::PASSTHROUGH => BlendMode::NORMAL,
+            LayerKind::Group(_) if layer.blend_mode == BlendMode::PASSTHROUGH => {
+                let short_lsct = blocks
+                    .as_ref()
+                    .and_then(|blocks| blocks.get(TaggedBlockKey::LSCT))
+                    .is_some_and(|block| block.data.len() < LSCT_BLEND_KEY.end);
+                if short_lsct {
+                    BlendMode::PASSTHROUGH
+                } else {
+                    BlendMode::NORMAL
+                }
+            }
             _ => layer.blend_mode,
         };
         let record = LayerRecord {

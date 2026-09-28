@@ -26,7 +26,11 @@ pub enum PsdError {
     UnsupportedVersion(u16),
 
     /// The header declared a bit depth the port does not handle (8/16/32 only).
-    #[error("unsupported bit depth: {0}")]
+    /// One-bit documents are the common case: bitmap-mode files pack eight
+    /// pixels per byte, a layout this port has no sample type for.
+    #[error(
+        "unsupported bit depth: {0}; this port reads 8-, 16- and 32-bit documents          (1-bit bitmap mode packs pixels per byte and is not supported)"
+    )]
     UnsupportedBitDepth(u16),
 
     /// The header declared a color mode outside the known on-disk values.

@@ -116,6 +116,12 @@ impl<'a> LayerAndMaskInformation<'a> {
 
         let mut global_layer_mask_info = GlobalLayerMaskInfo::default();
         let mut additional_layer_info = None;
+        // One to three trailing bytes cannot hold a mask length; they are
+        // padding and are consumed so the position lands on the section end.
+        if end.saturating_sub(reader.position()) < 4 {
+            let padding = end - reader.position();
+            reader.skip(padding)?;
+        }
         if reader.position() < end {
             let glmi_len = reader.u32()? as usize;
             // A mask length that runs past the section is clamped rather than
@@ -466,7 +472,8 @@ impl<'a> LayerRecord<'a> {
                 message: "layer record extra data length overflows",
             })?;
 
-        let mask_data = LayerMaskData::read(reader, extra_end)?;
+        let has_real_mask = channels.iter().any(|info| info.index == -3);
+        let mask_data = LayerMaskData::read(reader, extra_end, has_real_mask)?;
         let blending_ranges = LayerBlendingRanges::read(reader, extra_end)?;
         let name = PascalString::read(reader, 4)?;
         if reader.position() > extra_end {
@@ -644,7 +651,11 @@ pub struct LayerMaskData {
 impl LayerMaskData {
     /// Read the mask section (its own u32 marker). Returns `None` for the
     /// common empty section.
-    pub fn read(reader: &mut BeReader, section_end: usize) -> Result<Option<Self>> {
+    pub fn read(
+        reader: &mut BeReader,
+        section_end: usize,
+        has_real_mask: bool,
+    ) -> Result<Option<Self>> {
         let offset = reader.position() as u64;
         let len = reader.u32()? as usize;
         if len == 0 {
@@ -676,24 +687,37 @@ impl LayerMaskData {
 
         let mut first = LayerMask::read_forward(reader)?;
         let first_has_params_flag = first.flags.has_mask_params();
-        // A single-mask section carries its parameters right after the mask;
-        // room for a second mask means the parameters (if any) belong to it.
-        if first_has_params_flag && end - reader.position() < 18 {
-            first.params = Some(MaskParams::read(reader)?);
-        }
-        let (vector_mask, mut pixel_mask) = if first.flags.is_vector() {
-            (Some(first), None)
-        } else {
-            (None, Some(first))
-        };
 
-        if end.saturating_sub(reader.position()) >= 18 {
-            let mut second = LayerMask::read_reverse(reader)?;
-            if first_has_params_flag || second.flags.has_mask_params() {
-                second.params = Some(MaskParams::read(reader)?);
-            }
-            pixel_mask = Some(second);
+        // The reverse-ordered header after the first carries the real user
+        // mask (`-3`) geometry, so it is present only when the record stores
+        // that channel. Deciding by the remaining length alone reads a large
+        // parameter block as a header (or drops the parameters entirely),
+        // which Photoshop-written files do exhibit.
+        let mut second = None;
+        if has_real_mask && end.saturating_sub(reader.position()) >= 18 {
+            second = Some(LayerMask::read_reverse(reader)?);
         }
+
+        // Parameters follow the header(s) when a flag asks for them; the first
+        // mask's flag is the documented one and a second mask's flag is
+        // honored too, since some writers set it there.
+        if first_has_params_flag
+            || second
+                .as_ref()
+                .is_some_and(|mask| mask.flags.has_mask_params())
+        {
+            let params = MaskParams::read(reader)?;
+            match &mut second {
+                Some(mask) => mask.params = Some(params),
+                None => first.params = Some(params),
+            }
+        }
+
+        let (vector_mask, pixel_mask) = if first.flags.is_vector() {
+            (Some(first), second)
+        } else {
+            (None, Some(second.unwrap_or(first)))
+        };
 
         let position = reader.position();
         if position > end {
@@ -1013,26 +1037,48 @@ impl MaskParams {
 
     fn read(reader: &mut BeReader) -> Result<Self> {
         let flags = reader.u8()?;
-        let user_mask_density = if flags & Self::USER_MASK_DENSITY != 0 {
-            Some(reader.u8()?)
-        } else {
-            None
-        };
-        let user_mask_feather = if flags & Self::USER_MASK_FEATHER != 0 {
-            Some(reader.f64()?)
-        } else {
-            None
-        };
-        let vector_mask_density = if flags & Self::VECTOR_MASK_DENSITY != 0 {
-            Some(reader.u8()?)
-        } else {
-            None
-        };
-        let vector_mask_feather = if flags & Self::VECTOR_MASK_FEATHER != 0 {
-            Some(reader.f64()?)
-        } else {
-            None
-        };
+        // A block can end mid-parameters: real files carry a flag byte that
+        // promises more than the block holds (a third-party writer, a real
+        // bug report). Read what is there, leave the rest absent, and warn —
+        // failing the whole file over it would be worse.
+        let mut truncated = false;
+        fn field<T>(
+            present: bool,
+            truncated: &mut bool,
+            read: impl FnOnce() -> Result<T>,
+        ) -> Option<T> {
+            if !present {
+                return None;
+            }
+            match read() {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    *truncated = true;
+                    None
+                }
+            }
+        }
+        let user_mask_density = field(flags & Self::USER_MASK_DENSITY != 0, &mut truncated, || {
+            reader.u8()
+        });
+        let user_mask_feather = field(flags & Self::USER_MASK_FEATHER != 0, &mut truncated, || {
+            reader.f64()
+        });
+        let vector_mask_density = field(
+            flags & Self::VECTOR_MASK_DENSITY != 0,
+            &mut truncated,
+            || reader.u8(),
+        );
+        let vector_mask_feather = field(
+            flags & Self::VECTOR_MASK_FEATHER != 0,
+            &mut truncated,
+            || reader.f64(),
+        );
+        if truncated {
+            tracing::warn!(
+                "truncated mask parameters (flags {flags:#04x}); some fields are missing"
+            );
+        }
         Ok(Self {
             flags,
             user_mask_density,
@@ -1171,6 +1217,18 @@ impl ChannelImageData {
             // instead of erroring, the way Photoshop reads it back. A rewrite
             // normalizes it to the marker-only form.
             if info.size == 0 {
+                channels.push(ChannelData {
+                    compression: Compression::Raw,
+                    data: Vec::new(),
+                });
+                continue;
+            }
+            // A length of one is malformed — the spec requires zero or at
+            // least two, for the compression marker — but files carry it.
+            // Consume the stray byte so the channels after it stay aligned
+            // and read the channel as empty.
+            if info.size == 1 {
+                reader.skip(1)?;
                 channels.push(ChannelData {
                     compression: Compression::Raw,
                     data: Vec::new(),
@@ -1331,7 +1389,10 @@ mod tests {
         let mut w = BeWriter::new();
         mask_data.write(&mut w).unwrap();
         let mut r = BeReader::new(w.as_slice());
-        let back = LayerMaskData::read(&mut r, w.position()).unwrap().unwrap();
+        // Two masks: the second header is the real user mask slot.
+        let back = LayerMaskData::read(&mut r, w.position(), true)
+            .unwrap()
+            .unwrap();
         assert_eq!(back, mask_data);
         assert!(r.is_empty());
     }
@@ -1370,7 +1431,9 @@ mod tests {
         let mut w = BeWriter::new();
         mask_data.write(&mut w).unwrap();
         let mut r = BeReader::new(w.as_slice());
-        let back = LayerMaskData::read(&mut r, w.position()).unwrap().unwrap();
+        let back = LayerMaskData::read(&mut r, w.position(), true)
+            .unwrap()
+            .unwrap();
         assert_eq!(back, mask_data);
         assert_eq!(back.user_mask_feather(), Some(5.0));
 
@@ -1384,7 +1447,9 @@ mod tests {
         cleared.write(&mut w).unwrap();
         let mut r = BeReader::new(w.as_slice());
         assert_eq!(
-            LayerMaskData::read(&mut r, w.position()).unwrap().unwrap(),
+            LayerMaskData::read(&mut r, w.position(), true)
+                .unwrap()
+                .unwrap(),
             cleared
         );
         assert!(cleared.set_user_mask_feather(Some(f64::NAN)).is_err());
@@ -1426,7 +1491,7 @@ mod tests {
     fn empty_mask_section_is_none() {
         let bytes = 0u32.to_be_bytes();
         let mut r = BeReader::new(&bytes);
-        assert!(LayerMaskData::read(&mut r, 4).unwrap().is_none());
+        assert!(LayerMaskData::read(&mut r, 4, false).unwrap().is_none());
     }
 
     #[test]
@@ -1439,7 +1504,7 @@ mod tests {
         bytes.extend_from_slice(&[0; 8]);
         let mut r = BeReader::new(&bytes);
         assert!(matches!(
-            LayerMaskData::read(&mut r, 12),
+            LayerMaskData::read(&mut r, 12, false),
             Err(PsdError::InvalidData { .. })
         ));
     }
@@ -1469,6 +1534,85 @@ mod tests {
         assert_eq!(data.channels.len(), 1);
         assert_eq!(data.channels[0].compression, Compression::Raw);
         assert!(data.channels[0].data.is_empty());
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn a_long_parameter_block_is_not_read_as_a_real_mask_header() {
+        // A single pixel mask whose parameter block pushes the record past 36
+        // bytes: the length alone must not invent a real-mask header — that
+        // header follows the record's `-3` channel, and there is none here.
+        let params = MaskParams {
+            flags: 0x0F,
+            user_mask_density: Some(200),
+            user_mask_feather: Some(3.5),
+            vector_mask_density: Some(100),
+            vector_mask_feather: Some(7.25),
+        };
+        let pixel = LayerMask {
+            top: 0,
+            left: 0,
+            bottom: 2,
+            right: 2,
+            default_color: 255,
+            flags: LayerMaskFlags::from_bits(LayerMaskFlags::HAS_MASK_PARAMS),
+            params: Some(params),
+        };
+        let mask_data = LayerMaskData {
+            pixel_mask: Some(pixel),
+            vector_mask: None,
+        };
+
+        let mut w = BeWriter::new();
+        mask_data.write(&mut w).unwrap();
+        assert!(
+            w.position() >= 36,
+            "the block must reach the ambiguous length to exercise the case"
+        );
+        let mut r = BeReader::new(w.as_slice());
+        let back = LayerMaskData::read(&mut r, w.position(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(back, mask_data);
+        assert_eq!(back.user_mask_feather(), Some(3.5));
+        let params = back.pixel_mask.unwrap().params.unwrap();
+        assert_eq!(params.vector_mask_density, Some(100));
+        assert_eq!(params.vector_mask_feather, Some(7.25));
+    }
+
+    #[test]
+    fn truncated_mask_parameters_keep_the_fields_that_fit() {
+        // The flag byte promises a feather `f64`, the block holds two bytes:
+        // the fields that fit survive, the rest are absent, and the read
+        // succeeds rather than failing the file.
+        let bytes = [0x01 | 0x02, 200, 0x40, 0x00];
+        let mut reader = BeReader::new(&bytes);
+        let params = MaskParams::read(&mut reader).unwrap();
+        assert_eq!(params.flags, 0x03);
+        assert_eq!(params.user_mask_density, Some(200));
+        assert_eq!(params.user_mask_feather, None);
+    }
+
+    #[test]
+    fn a_one_byte_channel_reads_as_empty_and_keeps_alignment() {
+        // The spec allows a channel length of zero or at least two (the
+        // compression marker); one is malformed but appears in files. The
+        // stray byte is consumed so the following channel stays aligned.
+        let mut record = sample_record();
+        record.channels.truncate(2);
+        record.channels[0].size = 1;
+        record.channels[1].size = 6;
+        let mut bytes = BeWriter::new();
+        bytes.u8(0xAB); // the stray byte
+        bytes.u16(1); // second channel: RLE marker
+        bytes.bytes(&[0x00, 0x02, 0x00, 0xFF]);
+        let payload = bytes.into_inner();
+        let mut reader = BeReader::new(&payload);
+        let data = ChannelImageData::read(&mut reader, &record).unwrap();
+        assert_eq!(data.channels.len(), 2);
+        assert!(data.channels[0].data.is_empty());
+        assert_eq!(data.channels[1].compression, Compression::Rle);
+        assert_eq!(data.channels[1].data, vec![0x00, 0x02, 0x00, 0xFF]);
         assert!(reader.is_empty());
     }
 
