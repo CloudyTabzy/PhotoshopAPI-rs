@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "psd"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "image",
  "memmap2",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "psd-codecs"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "libdeflater",
  "rayon",
@@ -604,8 +604,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "psd-companion"
+version = "0.6.12"
+dependencies = [
+ "psd-codecs",
+ "psd-core",
+ "thiserror",
+]
+
+[[package]]
 name = "psd-core"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -619,7 +628,7 @@ version = "0.4.0"
 
 [[package]]
 name = "psd-py"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "numpy",
  "psd",

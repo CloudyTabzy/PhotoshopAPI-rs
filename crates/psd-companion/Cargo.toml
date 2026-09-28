@@ -1,0 +1,12 @@
+[package]
+name = "psd-companion"
+description = "Readers for Adobe's companion formats: .abr brushes, .csh custom shapes, .ase swatch palettes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+psd-core = { workspace = true }
+psd-codecs = { workspace = true }
+thiserror = { workspace = true }

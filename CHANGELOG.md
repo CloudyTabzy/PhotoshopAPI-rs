@@ -12,6 +12,29 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.12] - 2026-09-28
+
+### Added
+
+- The `psd-companion` crate: readers for the small Adobe formats that travel
+  beside PSD files — `.abr` brush presets, `.csh` custom shapes and `.ase`
+  swatch palettes. All three are read-only over a byte slice, following the
+  workspace's ag-psd port as the format reference (none of the three has an
+  official Adobe specification). The crate reuses `psd-core`'s machinery
+  instead of carrying its own: `.csh` paths parse through the same
+  `VectorPath` records a layer's vector mask does, and `.abr` presets are PSD
+  action descriptors read through the shared descriptor parser, with a typed
+  brush model (computed/sampled/tips/dynamic shapes, dynamics, texture, dual
+  brush, tool options) over it. `.abr` major versions 1 and 2 — the pre-CS
+  entry-stream layout, for which no fixture or reference exists here — are
+  rejected with a named error rather than decoded from guesswork, as are
+  16-bit run-length-encoded samples and run-length-encoded indexed patterns.
+  Fixture suites are hand-built through `psd-core`'s own writers: 20 tests
+  covering every colour model, group nesting, both sample compressions, the
+  pattern channel list, and the malformed-input rejections. (Resolves the
+  scope decision in TODO item 8: the formats live in their own crate and do
+  not expand the PSD ones.)
+
 ## [0.6.11] - 2026-09-28
 
 ### Changed
