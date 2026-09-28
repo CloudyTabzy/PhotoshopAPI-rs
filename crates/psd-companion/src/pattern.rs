@@ -228,6 +228,15 @@ pub fn read_pattern(reader: &mut BeReader<'_>) -> Result<Pattern> {
     })
 }
 
+/// Which present channel carries transparency for a colour mode: the fourth
+/// plane of an RGB record, the second of a grayscale or indexed one.
+fn alpha_channel(color_mode: ColorMode) -> usize {
+    match color_mode {
+        ColorMode::Rgb => 3,
+        _ => 1,
+    }
+}
+
 /// Narrows one big-endian sample to a byte, the way the reference does: the
 /// high byte of 16-bit samples, a clamped `f32` scaled to 0–255 for 32-bit.
 fn sample_to_u8(sample: &[u8], pixel_depth: u32) -> u8 {
@@ -270,6 +279,16 @@ fn decode_raw_channel(
         for xx in 0..w {
             // The pixel's first channel in the composed bitmap.
             let dst = (ox + xx + (yy + oy) * width) * 4;
+            if channel_index == alpha_channel(color_mode) {
+                // The transparency plane, present on records that carry one
+                // (real Photoshop patterns can have transparent pixels).
+                let src = (xx + yy * w) * sample_bytes;
+                let Some(sample) = channel_data.get(src..src + sample_bytes) else {
+                    continue;
+                };
+                put_channel(data, dst + 3, sample_to_u8(sample, pixel_depth));
+                continue;
+            }
             match color_mode {
                 ColorMode::Rgb if channel_index < 3 => {
                     let src = (xx + yy * w) * sample_bytes;
@@ -288,7 +307,7 @@ fn decode_raw_channel(
                         put_channel(data, dst + channel, value);
                     }
                 }
-                ColorMode::Indexed => {
+                ColorMode::Indexed if channel_index < 1 => {
                     let Some(&index) = channel_data.get(xx + yy * w) else {
                         continue;
                     };
@@ -333,10 +352,14 @@ fn decode_rle_channel(
         decode_packbits_row(bytes, row);
     }
 
-    let channels: &[usize] = match color_mode {
-        ColorMode::Rgb if channel_index < 3 => &[channel_index],
-        ColorMode::Grayscale if channel_index < 1 => &[0, 1, 2],
-        _ => &[],
+    let channels: &[usize] = if channel_index == alpha_channel(color_mode) {
+        &[3]
+    } else {
+        match color_mode {
+            ColorMode::Rgb if channel_index < 3 => &[channel_index],
+            ColorMode::Grayscale if channel_index < 1 => &[0, 1, 2],
+            _ => &[],
+        }
     };
     for (yy, row) in scratch.chunks(w).enumerate() {
         for (xx, &value) in row.iter().enumerate() {
@@ -520,6 +543,33 @@ mod tests {
         let pattern = read_pattern(reader).expect("decode");
         assert_eq!(&pattern.data[0..4], &[1, 2, 3, 255]);
         assert_eq!(&pattern.data[4..8], &[40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn a_present_alpha_plane_becomes_the_pattern_alpha() {
+        // A record may carry a fourth, transparency plane; without it every
+        // pixel is opaque. Real Photoshop patterns can have transparent
+        // pixels, so the plane is honored rather than ignored.
+        let bytes = fixture(
+            3,
+            None,
+            &[
+                ChannelFixture::raw(8, [0, 0, 2, 2], (0..4).collect()),
+                ChannelFixture::raw(8, [0, 0, 2, 2], (4..8).collect()),
+                ChannelFixture::raw(8, [0, 0, 2, 2], (8..12).collect()),
+                ChannelFixture::raw(8, [0, 0, 2, 2], vec![9, 18, 200, 255]),
+            ],
+        );
+        let reader = &mut BeReader::new(&bytes);
+        let pattern = read_pattern(reader).expect("decode");
+        assert_eq!(
+            pattern
+                .data
+                .chunks_exact(4)
+                .map(|pixel| pixel[3])
+                .collect::<Vec<_>>(),
+            vec![9, 18, 200, 255]
+        );
     }
 
     #[test]

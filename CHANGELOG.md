@@ -12,6 +12,19 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.16] - 2026-09-28
+
+### Fixed
+
+- `psd-companion`: a pattern record that carries a transparency plane now
+  uses it as the pattern's alpha instead of writing every pixel opaque. Real
+  Photoshop patterns can have transparent pixels, and the plane is the
+  record's own fourth channel; the parser this reader was modelled on ignores
+  it. Found by cross-validating the decoder against a real-world `.pat`
+  fixture whose pixels are pinned by a second implementation — the three
+  opaque pixels matched before the fix and the semi-transparent one did not.
+  Pinned by a hand-built fixture test.
+
 ## [0.6.15] - 2026-09-28
 
 ### Fixed
