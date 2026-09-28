@@ -12,6 +12,28 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.24] - 2026-09-28
+
+### Changed
+
+- The ZIP-prediction kernels are now portable-vector (`fearless_simd`) and the
+  f32 decode is fused. It used to copy the whole channel and allocate a second
+  full-size buffer; it now scans each compressed row straight into a small
+  reusable row buffer and transposes from there, so the only large allocation
+  is the result. Measured on a 4 MB channel, best of 15: `decode_f32` 2.459 →
+  0.411 ms (**5.98x**, now faster than the libdeflate inflate that feeds it),
+  `decode::<u8>` 1.40x, `decode::<u16>` 1.10x, and a 32-bit document read end
+  to end 11.35 → 8.64 ms (1.31x). The encode kernels measure 1.01–1.02x — the
+  write path is deflate- and allocation-bound — and are kept for the code
+  shape rather than for speed.
+- `psd-codecs` gains `fearless_simd` (and its `#[simd]` attribute crate) as
+  dependencies: the portable vectors dispatch at runtime across SSE2/SSE4.2/
+  AVX2/AVX-512, NEON and WASM SIMD with a scalar backend, so every platform
+  keeps working. The pre-SIMD chains stay behind a `scalar-override` feature
+  with `PSD_CODECS_FORCE_SCALAR=1`, so one binary can measure and test the two
+  against each other; parity is pinned across vector boundaries and all
+  corpora re-verified.
+
 ## [0.6.23] - 2026-09-28
 
 ### Added

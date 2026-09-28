@@ -9,15 +9,18 @@ version.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
 libdeflater.workspace = true
-# Optional: the portable-SIMD experiment (port TODO §F2b). The default build
-# keeps the current scalar kernels; this is pulled in only when the `fearless`
-# feature asks for it, so one binary can A/B the two implementations.
-fearless_simd = { version = "1.0", optional = true }
-# The `#[simd]` attribute: without it the code compiles but the per-level
-# inlining the kernels need is not applied.
-fearless_simd_macros = { version = "0.1", optional = true }
+# The prediction kernels are written with `fearless_simd`'s portable vectors
+# (port TODO §F2b): measured 1.98x on the byte prefix sum and 1.47x on the
+# transpose over the serial chains, with a scalar backend for platforms
+# without SIMD.
+fearless_simd = "1.0"
+# The `#[simd]` attribute: without it the same kernels measured 2.4x *slower*
+# than scalar, so it is required, not an optimization.
+fearless_simd_macros = "0.1"
 
 [features]
-# Portable-SIMD kernels behind `fearless_simd` (prototype; see
-# `prediction::fearless`). Off by default.
-fearless = ["dep:fearless_simd", "dep:fearless_simd_macros"]
+# `PSD_CODECS_FORCE_SCALAR=1` switches the prediction kernels to the pre-SIMD
+# scalar chains for the whole process, so one binary can measure and test the
+# two against each other. Off by default: without it the environment has no
+# say in which code runs.
+scalar-override = []

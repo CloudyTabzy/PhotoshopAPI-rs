@@ -27,8 +27,6 @@ pub mod endian;
 mod error;
 pub mod interleave;
 pub mod prediction;
-#[cfg(feature = "fearless")]
-pub mod prediction_fearless;
 pub mod rle;
 pub mod zip;
 
