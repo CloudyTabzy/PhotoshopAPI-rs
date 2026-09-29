@@ -321,7 +321,7 @@ assert descriptor serialization in tests.
 
 ### Transitive dependencies
 
-With `--all-features` the resolved graph is **116 crates**, and every one of them
+With `--all-features` the resolved graph is **106 crates**, and every one of them
 is permissively licensed: MIT, Apache-2.0, BSD-2-Clause / BSD-3-Clause, Zlib,
 0BSD, Unlicense, Unicode-3.0, and Apache-2.0-with-LLVM-exception. There is **no
 GPL, AGPL, SSPL, EUPL or MPL** anywhere in the tree, so linking this library
@@ -350,10 +350,10 @@ The full list is in [CHANGELOG.md](CHANGELOG.md) under *Changed* and *Fixed*.
 
 ## Testing
 
-- **840 Rust tests** across 56 suites (2 ignored), plus **227 Python tests** — of which 184
+- **875 Rust tests** across 58 suites (2 ignored), plus **227 Python tests** — of which 184
   are ported one-for-one from upstream's `psapi-test` suite, keeping upstream's
   own assertions.
-- A vendored corpus of **71 PSD/PSB documents** covering bit depth × color mode ×
+- A vendored corpus of **80 PSD/PSB documents** covering bit depth × color mode ×
   container × compression, all written by Photoshop 2022.
 - Byte-exact codec vectors, and read → write → read structural plus pixel
   round-trip assertions.
