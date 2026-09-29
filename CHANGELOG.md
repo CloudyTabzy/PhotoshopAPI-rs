@@ -12,6 +12,17 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-09-30
+
+### Changed
+
+- RLE channel compression packs its scanlines a block at a time into one buffer instead of
+  allocating and growing a `Vec` per scanline. Writing a 4000 x 3000, 12-layer, 8-bit
+  document made about 624,000 heap allocations before and about 23,000 now, and the output
+  is byte for byte the same. `psd_codecs::rle::pack_bits_compress_into` appends one packed
+  row (padding included) to a caller's buffer and returns its length; `pack_bits_compress`
+  is unchanged in behavior.
+
 ## [0.8.3] - 2026-09-30
 
 ### Fixed
