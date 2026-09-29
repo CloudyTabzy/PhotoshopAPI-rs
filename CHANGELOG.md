@@ -12,6 +12,43 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.28] - 2026-09-29
+
+Typed models of every layer effect, the second step towards authoring them. As before, nothing
+that reads or writes a document changes: the models read from, patch and build the descriptors
+in an effects block, and a later release connects them to layers.
+
+### Added
+
+- `Shadow` (drop and inner, chosen by `ShadowKind`), `Glow` (outer and inner, `GlowKind`),
+  `Bevel`, `ColorOverlay`, `Satin`, `GradientOverlay`, `PatternOverlay` and `Stroke`, each a
+  struct of `Option` fields that mirrors what its descriptor holds. `from_descriptor` reads the
+  fields a file has and leaves `None` for the rest; `apply_to` writes only a `Some` field that
+  differs from what the descriptor already says, placing a new item where Photoshop puts it
+  and leaving unknown items, their order, their key encodings and any value spelled another
+  way but equal exactly as they were; `to_descriptor` builds a fresh descriptor. `Default`
+  (`Shadow::new`, `Glow::new` for the two that have variants) is Photoshop's default effect
+  with every field set, so a new effect has the full layout Photoshop writes. Percentages are
+  the file's 0-100, lengths pixels, angles degrees.
+- The enumerators effects use, as public types with a `code()` and a `from_id()` that reads
+  both the historical four-character value and the long spelling Photoshop 2026 writes:
+  `StrokePosition`, `StrokeFill`, `BevelStyle`, `BevelTechnique`, `BevelDirection`,
+  `GlowTechnique`, `GlowSource`, `GradientStyle` (with the stroke-only shape burst) and
+  `GradientInterpolation`.
+
+### Verified
+
+- Against all 2,764 effects found in about 420 Photoshop-authored documents, in single form
+  and in `*Multi` lists: for every one, a patch that changes nothing changes no bytes, and 2,757
+  fresh builds from the fields read reproduce Photoshop's bytes exactly (compared with each
+  file's blend-mode spelling normalised, since a model does not keep whether a file wrote
+  `multiply` or `Mltp`). The other seven are pre-CS6 files that write items in an older order
+  (a colour overlay with its colour last, an inner glow with two items swapped); a fresh build
+  uses the modern order, and those two layouts are pinned by name in the test so that any other
+  difference fails it. Getting there fixed two things the first run showed: an effect's
+  descriptor carries its own key as its class ID (`DrSh`, `ebbl`, `patternFill`), and item
+  order differs from the one the public `ag-psd-rs` reference writes.
+
 ## [0.6.27] - 2026-09-29
 
 The groundwork for writing layer effects and adjustment layers: typed values that read from,

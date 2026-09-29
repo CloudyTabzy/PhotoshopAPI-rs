@@ -16,6 +16,7 @@
 //! - [`photoshop_file`]: the five sections read/written in order (`PhotoshopFile/PhotoshopFile.h`)
 //! - [`tagged_blocks`]: 4-char-keyed additional-layer-info registry with raw passthrough (`Core/TaggedBlocks/`)
 //! - [`descriptor`], [`engine_data`]: Photoshop's action-descriptor and text-engine formats (`Core/Struct/`)
+//! - [`effects`], [`effect_enums`]: typed models of the effects in `lfx2`/`lmfx`/`lfxs` descriptors (read, patch in place, build fresh)
 //! - [`color`], [`gradient`], [`style_values`]: typed values (colours, gradients, contours, points, pattern references) that read from, patch and build descriptors, shared by effects and fills
 //! - [`text_tool`], [`placed_layer`], [`linked_layer`], [`layer_effects`], [`adjustments`], [`vector`], [`artboard`]: typed views over text, placed/linked data, effect blocks, adjustment/fill settings, vector paths/shapes, and artboards
 //! - `serialize` (feature `serde`): `Serialize` views of descriptors and EngineData (upstream `to_json`)
@@ -29,6 +30,8 @@ pub mod color;
 mod color_mode_data;
 pub mod descriptor;
 mod descriptor_build;
+pub mod effect_enums;
+pub mod effects;
 pub mod engine_data;
 mod enums;
 mod error;
@@ -61,6 +64,14 @@ pub use descriptor::{
     DescriptorPayloadSpans, DescriptorValue, ObjectArray,
 };
 pub use descriptor_build::{UNIT_ANGLE, UNIT_PERCENT, UNIT_PIXELS};
+pub use effect_enums::{
+    BevelDirection, BevelStyle, BevelTechnique, GlowSource, GlowTechnique, GradientInterpolation,
+    GradientStyle, StrokeFill, StrokePosition,
+};
+pub use effects::{
+    Bevel, ColorOverlay, Glow, GlowKind, GradientOverlay, PatternOverlay, Satin, Shadow,
+    ShadowKind, Stroke,
+};
 pub use engine_data::{EngineNumber, EngineValue, EngineValueKind, PayloadPatch};
 pub use enums::{
     BitDepth, BlendMode, ChannelId, ColorMode, Compression, DisplayUnit, LayerColor,
