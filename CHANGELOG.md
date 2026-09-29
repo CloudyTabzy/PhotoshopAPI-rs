@@ -46,6 +46,17 @@ no `repository` URL, so no version headings carry compare links.
   the running-`a` term carried in a vector, every lane sized to stay under the same `NMAX`
   bound as the scalar recurrence; a test runs a full block of saturated bytes from the largest
   possible starting pair on every backend.
+- **The CRC-32 is `crc32fast`'s, and the crate has a third dependency for it.** The chunk CRC
+  runs over every compressed byte of a default decode, and the crate's own slice-by-16 ran at
+  3.2 GB/s against 60-80 GB/s for a carry-less-multiply CRC (PCLMULQDQ on x86, PMULL on
+  aarch64), which safe code and `fearless_simd` cannot reach. On well-compressed images that
+  was the 2-5% the stage profile showed; on poorly compressible ones it was most of the
+  decode. Whole-PNG decode on this machine, summed over the 16 fixtures: -11.9%, with
+  `rgba16` -65%, `rgb16` -55%, `rgba8_noise` -54%, `gray16` -40% and the well-compressed
+  photographs and gradients unchanged. The hand-written aarch64 CRC-instruction path, which
+  could not be tested off that architecture, is gone with the rest of the CRC code. The
+  `unsafe` the carry-less multiply needs stays inside `crc32fast`, which is MIT OR Apache-2.0
+  and depends only on `cfg-if`. `Crc32::new` is no longer a `const fn`.
 - **The decoder's buffer allocation is safe code.** It called `alloc_zeroed` and
   `Vec::from_raw_parts` directly so that an allocation the system refuses became an error and
   not an abort, while keeping the operating system's free zero pages. It now probes with
@@ -76,9 +87,9 @@ no `repository` URL, so no version headings carry compare links.
   is not 3 or 4. Callers never pass either today.
 - The facade and the kernels take the backend from one `Level::new()` value rather than a
   private cache beside `fearless_simd`'s own.
-- Documentation states the crate's dependencies as they are: `fearless_simd` and the
-  build-time `#[simd]` macro crate, not `fearless_simd` alone, and not "nothing outside the
-  standard library".
+- Documentation states the crate's dependencies as they are: `fearless_simd`, its build-time
+  `#[simd]` macro crate and `crc32fast`, not `fearless_simd` alone, and not "nothing outside
+  the standard library".
 
 ## [0.5.0] - 2026-09-29
 

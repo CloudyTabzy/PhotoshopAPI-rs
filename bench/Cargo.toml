@@ -4,8 +4,9 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
-# Benchmark harness only. `psd-png` itself depends only on `fearless_simd` and its `#[simd]`
-# macro crate; these exist solely to compare against the crates this library aims to beat.
+# Benchmark harness only. `psd-png` itself depends only on `fearless_simd`, its `#[simd]`
+# macro crate and `crc32fast`; the rest exist solely to compare against the crates this
+# library aims to beat.
 [dependencies]
 # `scalar-override` keeps `PSD_PNG_FORCE_SCALAR=1` working for kernel-versus-scalar runs.
 psd-png = { path = "..", features = ["scalar-override"] }

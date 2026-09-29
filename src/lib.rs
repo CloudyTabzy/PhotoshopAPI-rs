@@ -1,11 +1,12 @@
 //! A streaming PNG decoder with portable SIMD kernels, built for the PhotoshopAPI-rs port.
 //!
 //! `psd-png` reads the whole PNG format — every colour type, every bit depth, interlaced
-//! or not — through its own DEFLATE implementation, its own checksums, and its own filter
-//! code. Its only dependencies are `fearless_simd`, which compiles the filter and conversion
-//! kernels for the CPU at hand, and `fearless_simd_macros`, the `#[simd]` attribute that
-//! kernels need to run at full speed. The second is a procedural macro, so it and the
-//! crates it uses (`syn`, `quote`, `proc-macro2`) are build-time only.
+//! or not — through its own DEFLATE implementation, its own Adler-32, and its own filter
+//! code. Its only dependencies are `fearless_simd`, which compiles the filter, conversion
+//! and Adler-32 kernels for the CPU at hand; `fearless_simd_macros`, the `#[simd]` attribute
+//! those kernels need to run at full speed, a procedural macro that, with the crates it uses
+//! (`syn`, `quote`, `proc-macro2`), is build-time only; and `crc32fast`, for the chunk CRC-32,
+//! which needs the carry-less multiply that safe code cannot reach.
 //!
 //! Its reason to exist is [`Decoder::decode_to`]: a decode that hands out one reconstructed
 //! scanline at a time while holding only DEFLATE's 32 KiB match window, a segment of
