@@ -35,6 +35,7 @@ pub struct TextLayerBuilder {
     text: String,
     font: String,
     font_size: f64,
+    dpi: f64,
     fill_color: [f64; 4],
     position: (f64, f64),
     box_size: Option<(f64, f64)>,
@@ -42,14 +43,15 @@ pub struct TextLayerBuilder {
 
 impl TextLayerBuilder {
     /// A layer named `name` showing `text`; `\n` becomes Photoshop's `\r`.
-    /// Defaults: ArialMT 24pt, opaque black, anchored at (20, 50), box size
-    /// estimated from the text.
+    /// Defaults: ArialMT 24pt, 72 dpi, opaque black, anchored at (20, 50), box
+    /// size estimated from the text.
     pub fn new(name: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             text: text.into(),
             font: "ArialMT".to_owned(),
             font_size: 24.0,
+            dpi: 72.0,
             fill_color: [1.0, 0.0, 0.0, 0.0],
             position: (20.0, 50.0),
             box_size: None,
@@ -62,9 +64,21 @@ impl TextLayerBuilder {
         self
     }
 
-    /// Font size in points.
+    /// Font size in points, the unit Photoshop's character panel shows.
+    ///
+    /// The layer stores pixels: the run's `FontSize` is written as
+    /// `points * dpi / 72` (see [`dpi`](Self::dpi)), and the box metrics are
+    /// computed from that. At the 72 dpi default the two are the same number.
     pub fn font_size(mut self, points: f64) -> Self {
         self.font_size = points;
+        self
+    }
+
+    /// Document resolution the points-to-pixels conversion uses; 72 by
+    /// default. At 300 dpi, 12pt renders as 50px, and a run written without
+    /// the conversion would come out four times too small.
+    pub fn dpi(mut self, dpi: f64) -> Self {
+        self.dpi = dpi;
         self
     }
 
@@ -100,6 +114,9 @@ impl TextLayerBuilder {
         if !self.font_size.is_finite() || self.font_size <= 0.0 {
             return Err(invalid("text font size must be finite and positive"));
         }
+        if !self.dpi.is_finite() || self.dpi <= 0.0 {
+            return Err(invalid("text dpi must be finite and positive"));
+        }
         if !self.fill_color.iter().all(|value| value.is_finite()) {
             return Err(invalid("text fill color values must be finite"));
         }
@@ -128,8 +145,9 @@ impl TextLayerBuilder {
             })
             .collect();
 
-        // Rough metrics (typical ascent 0.85em, average advance 0.55em).
-        let size = self.font_size;
+        // Rough metrics (typical ascent 0.85em, average advance 0.55em), in
+        // document pixels: the run stores pixels, the caller gives points.
+        let size = self.font_size * self.dpi / 72.0;
         let ascent = size * 0.85;
         let descent = size * 0.15;
         let lines: Vec<usize> = units
@@ -141,7 +159,15 @@ impl TextLayerBuilder {
             .box_size
             .unwrap_or((longest * size * 0.55, lines.len() as f64 * size * 1.2));
 
-        let engine = build_engine_data(&units, &self.font, size, self.fill_color, width, height)?;
+        let engine = build_engine_data(
+            &units,
+            &self.font,
+            size,
+            self.font_size,
+            self.fill_color,
+            width,
+            height,
+        )?;
         let text = build_text_descriptor(
             &units,
             engine,
@@ -375,10 +401,16 @@ fn resources(font_name: &str, fill_color: [f64; 4]) -> EngineValue {
     ])
 }
 
+/// `font_size_px` is what the run and its leading carry, in document pixels;
+/// `font_size_pt` is the nominal size the default style sheet keeps, in points.
+/// The two are different units on the wire: a run's `FontSize` is resolved
+/// pixels, while the default sheet's is nominal points that a run without its
+/// own value inherits, which Photoshop scales by the document resolution.
 fn build_engine_data(
     units: &[u16],
     font_name: &str,
-    font_size: f64,
+    font_size_px: f64,
+    font_size_pt: f64,
     fill_color: [f64; 4],
     box_width: f64,
     box_height: f64,
@@ -396,7 +428,7 @@ fn build_engine_data(
         .split_inclusive(|&unit| unit == u16::from(b'\r'))
         .map(|paragraph| paragraph.len() as i64)
         .collect();
-    let leading = (font_size * 1.2 * 10.0).round() / 10.0;
+    let leading = (font_size_px * 1.2 * 10.0).round() / 10.0;
 
     let paragraph_run = engine_dictionary([
         (
@@ -438,11 +470,11 @@ fn build_engine_data(
     // size for an insertion point after the last character.
     let default_style = engine_dictionary([
         ("Font", int(0)),
-        ("FontSize", float(font_size)),
+        ("FontSize", float(font_size_pt)),
         ("FauxBold", boolean(false)),
         ("FauxItalic", boolean(false)),
         ("AutoLeading", boolean(true)),
-        ("Leading", float(font_size * 1.2)),
+        ("Leading", float(font_size_pt * 1.2)),
         ("HorizontalScale", int(1)),
         ("VerticalScale", int(1)),
         ("Tracking", int(0)),
@@ -452,7 +484,7 @@ fn build_engine_data(
     ]);
     let run_style = engine_dictionary([
         ("Font", int(0)),
-        ("FontSize", float(font_size)),
+        ("FontSize", float(font_size_px)),
         ("FauxBold", boolean(false)),
         ("FauxItalic", boolean(false)),
         ("AutoLeading", boolean(true)),

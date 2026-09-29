@@ -409,3 +409,41 @@ fn authored_pixel_records_carry_a_transparency_channel() {
         "the synthesized alpha is opaque"
     );
 }
+
+/// A cloned layer repeats its `lyid`; Photoshop expects layer ids to be unique
+/// within a document, so adding one that collides assigns a fresh id. The
+/// original keeps its own, and a document read from disk is untouched.
+#[test]
+fn adding_a_layer_with_a_taken_id_assigns_a_fresh_one() {
+    let mut document =
+        LayeredFile::<u8>::read(fixture("ClippingMasks/clipping_masks.psd")).unwrap();
+    let first = document
+        .flatten()
+        .into_iter()
+        .find(|&id| document.layer(id).unwrap().layer_id().is_some())
+        .unwrap();
+    let original_id = document.layer(first).unwrap().layer_id().unwrap();
+
+    let clone = document.add_layer(document.layer(first).unwrap().clone());
+    let clone_id = document.layer(clone).unwrap().layer_id().unwrap();
+    assert_ne!(original_id, clone_id, "the clone must not repeat the id");
+    assert_eq!(document.layer(first).unwrap().layer_id(), Some(original_id));
+
+    // The fresh id survives a save and is unique there too.
+    let back = roundtrip(&document);
+    let ids: Vec<u32> = back
+        .flatten()
+        .into_iter()
+        .filter_map(|id| back.layer(id).unwrap().layer_id())
+        .collect();
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(ids.len(), unique.len(), "layer ids must be unique: {ids:?}");
+
+    // Adding a layer that has no id at all leaves it without one.
+    let mut fresh = Layer::new_image("Fresh", Rect::new(0, 0, 2, 2));
+    let id = document.add_layer(fresh.clone());
+    assert!(document.layer(id).unwrap().layer_id().is_none());
+    fresh.name = "Renamed".to_owned();
+}

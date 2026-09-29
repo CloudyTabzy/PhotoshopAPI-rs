@@ -5,8 +5,8 @@ use psd::{
         BeReader, BeWriter, Descriptor, DescriptorItem, DescriptorKey, DescriptorValue,
         EngineValue, TaggedBlock, TaggedBlockKey, TypeToolTaggedBlock, UnicodeString,
     },
-    FontScript, FontType, LayerKind, LayeredFile, TextBoxBounds, TextShape, TextWarpRotation,
-    TextWarpStyle, TextWritingDirection,
+    FontScript, FontType, LayerKind, LayeredFile, TextBoxBounds, TextLayerBuilder, TextShape,
+    TextWarpRotation, TextWarpStyle, TextWritingDirection,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -1213,4 +1213,75 @@ fn text_layers_round_trip_through_a_psb_container() {
     let layer = reread.layer(id).unwrap();
     assert_eq!(layer.text().as_deref(), Some("Alpha Betaaaa Gamma"));
     assert_eq!(layer.style_run_lengths(), Some(vec![5, 1, 7, 1, 6]));
+}
+
+/// The run's `FontSize` is resolved pixels, while the default style sheet's is
+/// nominal points: a run without its own value inherits the sheet's and
+/// Photoshop scales it by the document resolution. A builder at 300 dpi must
+/// therefore write 12pt as 50px in the run and keep 12 in the sheet, or the
+/// text comes out at the wrong size.
+#[test]
+fn text_builder_scales_points_to_pixels_by_document_resolution() {
+    let run_size = |file: &LayeredFile<u8>, id| {
+        file.layer(id)
+            .unwrap()
+            .style_run(0)
+            .and_then(|style| style.font_size())
+            .unwrap()
+    };
+    let sheet_size = |file: &LayeredFile<u8>, id| {
+        file.layer(id)
+            .unwrap()
+            .style_normal()
+            .and_then(|style| style.font_size())
+            .unwrap()
+    };
+
+    for (dpi, expected_run) in [(72.0, 12.0), (300.0, 50.0), (150.0, 25.0)] {
+        let mut file = LayeredFile::<u8>::new(psd::core::ColorMode::Rgb, 64, 64).unwrap();
+        let layer = TextLayerBuilder::new("Sized", "Text")
+            .font_size(12.0)
+            .dpi(dpi)
+            .build::<u8>()
+            .unwrap();
+        let id = file.add_layer(layer);
+        assert!(
+            (run_size(&file, id) - expected_run).abs() < 0.01,
+            "dpi {dpi}: run size {} != {expected_run}",
+            run_size(&file, id)
+        );
+        assert!(
+            (sheet_size(&file, id) - 12.0).abs() < 0.01,
+            "dpi {dpi}: the default sheet keeps nominal points"
+        );
+    }
+
+    // The box metrics follow the pixel size too: at 300 dpi the estimated box
+    // is 12 * 300 / 72 = 50px per line rather than 12.
+    let mut file = LayeredFile::<u8>::new(psd::core::ColorMode::Rgb, 64, 64).unwrap();
+    let small = TextLayerBuilder::new("Small", "Text")
+        .font_size(12.0)
+        .dpi(72.0)
+        .build::<u8>()
+        .unwrap();
+    let small_id = file.add_layer(small);
+    let big = TextLayerBuilder::new("Big", "Text")
+        .font_size(12.0)
+        .dpi(300.0)
+        .build::<u8>()
+        .unwrap();
+    let big_id = file.add_layer(big);
+    let text_box = |file: &LayeredFile<u8>, id| {
+        file.layer(id)
+            .unwrap()
+            .box_bounds()
+            .map(|bounds| (bounds.width(), bounds.height()))
+            .unwrap()
+    };
+    let (small_w, small_h) = text_box(&file, small_id);
+    let (big_w, big_h) = text_box(&file, big_id);
+    assert!(
+        big_h > small_h * 3.0 && big_w > small_w * 3.0,
+        "a 300 dpi 12pt box ({big_w}x{big_h}) should be about 4x the 72 dpi one ({small_w}x{small_h})"
+    );
 }

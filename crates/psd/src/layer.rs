@@ -969,6 +969,28 @@ impl<T: BitDepth> Layer<T> {
         self.protection_flags() & LOCK_ALL != 0
     }
 
+    /// Photoshop's layer id (`lyid`), when the block is present and well
+    /// formed.
+    ///
+    /// Ids are meant to be unique within a document. A layer cloned from
+    /// another, or copied between documents, keeps its id only when nothing in
+    /// the destination has it; the add methods assign a fresh one otherwise.
+    pub fn layer_id(&self) -> Option<u32> {
+        let block = self.blocks.get(TaggedBlockKey::LYID)?;
+        Some(u32::from_be_bytes(block.data.get(..4)?.try_into().ok()?))
+    }
+
+    /// Set the layer id, replacing an existing `lyid` block or adding one.
+    pub fn set_layer_id(&mut self, id: u32) {
+        let data = id.to_be_bytes().to_vec();
+        match self.blocks.get_mut(TaggedBlockKey::LYID) {
+            Some(block) => block.data = data,
+            None => self
+                .blocks
+                .push(TaggedBlock::new(TaggedBlockKey::LYID, data)),
+        }
+    }
+
     /// Lock or unlock the layer. Partial locks (position, pixels, …) are kept;
     /// the record's transparency-protected flag follows the lock like
     /// upstream's `BitFlags(m_IsLocked, …)`.

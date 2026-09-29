@@ -273,3 +273,44 @@ fn a_read_document_holds_its_icc_profile_once() {
     cleared.icc_profile = profile.clone();
     assert_eq!(cleared.to_bytes().unwrap(), written);
 }
+
+/// `write` replaces the target only once the whole document is on disk. A
+/// failure part way must leave whatever was at the path, which matters when a
+/// document is saved over its own source.
+#[test]
+fn write_replaces_the_target_only_after_the_document_is_written() {
+    let directory = std::env::temp_dir().join(format!("psd-atomic-write-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("document.psd");
+    std::fs::write(&path, b"the original file").unwrap();
+
+    let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 4, 4).unwrap();
+    document.add_layer(Layer::new_image("Layer", Rect::new(0, 0, 4, 4)));
+    document.write(&path).unwrap();
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(&written[..4], b"8BPS", "the document replaced the file");
+
+    // No temporary sibling survives a successful write.
+    let leftovers: Vec<String> = std::fs::read_dir(&directory)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temporary files left behind: {leftovers:?}"
+    );
+
+    // A document that cannot serialize leaves the target exactly as it was.
+    let mut broken = LayeredFile::<u8>::new(ColorMode::Rgb, 1, 1).unwrap();
+    broken.add_layer(Layer::new_image("Invalid", Rect::new(0, 0, -1, -1)));
+    assert!(broken.write(&path).is_err());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        written,
+        "a failed write must not touch the target"
+    );
+
+    std::fs::remove_dir_all(&directory).unwrap();
+}

@@ -12,6 +12,39 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-09-30
+
+### Fixed
+
+- A text layer built for a document that is not 72 dpi now renders at the size asked for.
+  The run's `FontSize` is stored in document pixels, not points, while the builder took its
+  argument as points and wrote it unchanged: at 300 dpi a 12pt request came out four times
+  too small, and the estimated text box was scaled the same way. `TextLayerBuilder` gained
+  `dpi` (72 by default, so nothing changes there) and converts points to pixels for the run,
+  its leading, and the box metrics; the default style sheet keeps the nominal point value,
+  which is the unit it is in. `CharacterStyle::font_size` and the builder now document the
+  units, since the two differ on the wire.
+- Adding a layer whose `lyid` another layer already has assigns a fresh id, so a clone or a
+  copy from another document cannot repeat an id that is meant to be unique within a
+  document. A document read from disk never passes through the add methods, so its own ids
+  round-trip untouched.
+- `LayeredFile::write` writes through a sibling temporary file and replaces the target only
+  once the whole document is on disk. It used to create the target directly and delete it if
+  the write failed part way, which destroyed the previous file — including a document saved
+  over its own source.
+
+### Added
+
+- `Layer::layer_id` and `Layer::set_layer_id`, and `TaggedBlockKey::LYID` with them.
+
+### Tests
+
+- A builder round trip at 72, 150 and 300 dpi pins the run size, the default sheet's nominal
+  size, and the box scale; a cloned layer with a taken id; a write that fails before the
+  bytes land leaving the target byte-identical with no temporary file left behind; and that a
+  section divider cannot be removed on its own, since that is the half-a-pair shape a group
+  linker has to survive.
+
 ## [0.9.2] - 2026-09-30
 
 ### Fixed

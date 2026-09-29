@@ -431,7 +431,12 @@ macro_rules! character_properties {
 }
 
 character_properties! {
-    /// Font size in points (`FontSize`); must be positive.
+    /// Font size in document pixels (`FontSize`); must be positive.
+    ///
+    /// The wire value is pixels, not points: Photoshop's character panel shows
+    /// points, which is `pixels * 72 / dpi` for the document. The default
+    /// style sheet's `FontSize` is the exception — nominal points that a run
+    /// without its own value inherits.
     font_size / set_font_size: f64 = "FontSize", check = positive;
     /// Explicit leading in points (`Leading`), used when auto leading is off.
     leading / set_leading: f64 = "Leading";

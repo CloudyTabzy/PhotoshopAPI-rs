@@ -494,6 +494,51 @@ mod tests {
         assert!(reread.find_layer("Bottom").is_none());
     }
 
+    /// A section divider is half of a pair: removing it on its own would leave
+    /// the group without its closing record, which is the malformed shape a
+    /// group linker has to survive. The API refuses the removal instead, and
+    /// removing the group takes both records with it.
+    #[test]
+    fn a_section_divider_cannot_be_removed_on_its_own() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/documents/Groups/Groups_8bit.psd"
+        );
+        let mut document = LayeredFile::<u8>::read(path).unwrap();
+        let group = document.find_layer("Group").unwrap();
+        let divider = document
+            .flatten()
+            .into_iter()
+            .find(|&id| {
+                matches!(
+                    document.layer(id).unwrap().kind,
+                    LayerKind::SectionDivider(_)
+                )
+            })
+            .unwrap();
+
+        let error = document.remove_layer(divider).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("removed together with their group"),
+            "unexpected error: {error}"
+        );
+        assert!(document.layer(divider).is_some(), "the divider stays");
+
+        // Removing the group takes its divider record with it: the document
+        // still round-trips, the group is gone, and the other groups keep their
+        // nesting (a dangling divider would mis-parent them on the next read).
+        document.remove_layer(group).unwrap();
+        let reread = LayeredFile::<u8>::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert!(reread.find_layer("Group").is_none());
+        assert!(reread.find_layer("Group/GroupedLayer").is_none());
+        assert!(reread.find_layer("GroupTopLevel/CollapsedGroup").is_some());
+        assert!(reread
+            .find_layer("GroupTopLevel/GroupNested/NestedGroupedLayer")
+            .is_some());
+    }
+
     #[test]
     fn move_keeps_read_dividers_paired_and_rejects_cycles() {
         let path = concat!(

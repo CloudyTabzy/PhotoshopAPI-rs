@@ -36,6 +36,20 @@ const DIVIDER_NAME: &str = "</Layer group>";
 /// default, and what a new document is created with.
 const DEFAULT_DPI: f32 = 72.0;
 
+/// A temporary path beside `path`, so replacing it is a rename within one
+/// filesystem. The process id keeps two writers from colliding; a leftover
+/// from a crashed process is overwritten, not read.
+fn temporary_sibling(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or(PsdError::InvalidData {
+            offset: 0,
+            message: "a document path needs a file name",
+        })?
+        .to_string_lossy();
+    Ok(path.with_file_name(format!(".{name}.tmp-{}", std::process::id())))
+}
+
 fn absolute_or_current_dir(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -952,13 +966,44 @@ impl<T: BitDepth> LayeredFile<T> {
 
     /// Append an ordinary layer at the top level.
     ///
+    /// A layer that carries a `lyid` block keeps its id unless another layer in
+    /// the document already has it, in which case it gets a fresh one: a clone,
+    /// or a copy from another document, would otherwise repeat an id that
+    /// Photoshop expects to be unique. A document read from disk never passes
+    /// through here, so its own ids round-trip untouched.
+    ///
     /// To add an artboard, use [`add_artboard`](Self::add_artboard), which
     /// also creates or updates the document-level artboard count.
-    pub fn add_layer(&mut self, layer: Layer<T>) -> LayerId {
+    pub fn add_layer(&mut self, mut layer: Layer<T>) -> LayerId {
+        self.ensure_unique_layer_id(&mut layer);
         self.layers.push(Some(layer));
         let id = self.layers.len() - 1;
         self.root_children.push(id);
         id
+    }
+
+    /// Give `layer` a fresh `lyid` when its own is already taken.
+    fn ensure_unique_layer_id(&mut self, layer: &mut Layer<T>) {
+        let Some(existing) = layer.layer_id() else {
+            return;
+        };
+        if !self
+            .layers
+            .iter()
+            .flatten()
+            .any(|other| other.layer_id() == Some(existing))
+        {
+            return;
+        }
+        let next = self
+            .layers
+            .iter()
+            .flatten()
+            .filter_map(Layer::layer_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        layer.set_layer_id(next);
     }
 
     /// Create a root artboard group and keep the document's artboard count in
@@ -1291,6 +1336,8 @@ impl<T: BitDepth> LayeredFile<T> {
                 message: "artboards cannot be nested inside other artboards",
             });
         }
+        let mut layer = layer;
+        self.ensure_unique_layer_id(&mut layer);
         let settings_update = if layer.is_artboard() {
             let count = self
                 .artboards()
@@ -1613,7 +1660,10 @@ impl<T: BitDepth> LayeredFile<T> {
     ///
     /// The file is streamed out channel by channel, so writing needs memory for
     /// the compressed channels but not for a second, whole-file copy of them.
-    /// A write that fails part way removes the partial file.
+    /// The bytes go to a sibling temporary file that replaces the target only
+    /// once the whole document is written: a failure part way leaves whatever
+    /// was at the path untouched, which matters when a document is saved over
+    /// its own source.
     pub fn write(&self, path: impl AsRef<Path>) -> Result<()> {
         self.write_with_progress(path, &mut ignore_progress)
     }
@@ -1626,16 +1676,23 @@ impl<T: BitDepth> LayeredFile<T> {
     ) -> Result<()> {
         use std::io::Write as _;
         let path = path.as_ref();
-        // Compression can fail; it happens before the file is created.
+        // Compression can fail; it happens before any file is created.
         let mut file = self.to_photoshop_file_with_progress(progress)?;
-        let sink = std::fs::File::create(path)?;
-        let mut sink = std::io::BufWriter::with_capacity(1 << 20, sink);
-        let written = file.write_to(&mut sink).and_then(|()| Ok(sink.flush()?));
-        if written.is_err() {
-            drop(sink);
-            let _ = std::fs::remove_file(path);
+        let temporary = temporary_sibling(path)?;
+        let written = (|| -> Result<()> {
+            let sink = std::fs::File::create(&temporary)?;
+            let mut sink = std::io::BufWriter::with_capacity(1 << 20, sink);
+            file.write_to(&mut sink)?;
+            sink.flush()?;
+            Ok(())
+        })();
+        match written {
+            Ok(()) => std::fs::rename(&temporary, path).map_err(PsdError::from),
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary);
+                Err(error)
+            }
         }
-        written
     }
 
     /// Number of records a subtree serializes to (groups gain a synthesized

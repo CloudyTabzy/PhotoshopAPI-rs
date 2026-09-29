@@ -39,6 +39,8 @@ impl TaggedBlockKey {
     pub const LR32: Self = Self(*b"Lr32");
     /// Protected (locked) settings (`lspf`): a `u32` lock-flag word.
     pub const LSPF: Self = Self(*b"lspf");
+    /// Layer id (`lyid`): a `u32`, unique within a document.
+    pub const LYID: Self = Self(*b"lyid");
     /// Sheet (display) color setting (`lclr`): `u16` color + 6 padding bytes.
     pub const LCLR: Self = Self(*b"lclr");
     /// Blend fill opacity (`iOpa`): `u8` fill + 3 padding bytes.
