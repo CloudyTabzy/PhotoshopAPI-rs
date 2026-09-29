@@ -112,7 +112,9 @@ requiring the caller to remember.
 Photoshop writes some descriptor keys with a zero-length marker and others with
 an explicit length, deciding via a large hardcoded list. This port records how
 each key was encoded on read and reproduces it on write — byte-exact without
-maintaining the list.
+maintaining the list. Keys the port creates follow the one rule real files show
+(a four-byte ID is a zero-length character ID, anything longer is explicit),
+which held for every descriptor in about 420 Photoshop-authored documents.
 
 ### Smart objects are typed, not descriptor soup
 
@@ -129,6 +131,10 @@ composite, and replacement is transactional.
 - Nested groups, layer insert / move / remove, group dividers kept paired
 - Editable text layers: create, style, inspect, range-edit, remap on reflow
 - Smart objects: create, replace, transform, warp, extract
+- Layer effects: read as typed models, and create or edit drop and inner shadows, glows,
+  bevel and emboss, colour, gradient and pattern overlays, satin and strokes (several
+  instances of each repeatable effect included). An edit changes what it names and keeps
+  every other byte
 - Pixel and group masks
 - Layer attributes: name, blend mode, opacity, fill, lock, clipping, display color
 - ICC profile and DPI

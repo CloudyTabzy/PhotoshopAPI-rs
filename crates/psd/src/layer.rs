@@ -11,13 +11,14 @@
 //! bits round-trip.
 
 use psd_core::artboard::is_artboard_key;
+use psd_core::layer_effects::LayerEffectsData;
 use psd_core::vector::is_vector_mask_key;
 use psd_core::Artboard;
 use psd_core::{
-    AdditionalLayerInfo, AdjustmentBlock, AdjustmentKind, BeReader, BlendMode, Compression,
-    LayerBlendingRanges, LayerColor, LayerEffectsBlock, LayerFlags, LayerMask, LayerMaskData,
-    LayerMaskFlags, PlacedLayer, PlacedLayerData, PsdError, Result, SectionDivider, TaggedBlock,
-    TaggedBlockKey, VectorBlock, VectorMask,
+    effects_block_data, AdditionalLayerInfo, AdjustmentBlock, AdjustmentKind, BeReader, BlendMode,
+    Compression, Descriptor, LayerBlendingRanges, LayerColor, LayerEffects, LayerEffectsBlock,
+    LayerFlags, LayerMask, LayerMaskData, LayerMaskFlags, PlacedLayer, PlacedLayerData, PsdError,
+    Result, SectionDivider, TaggedBlock, TaggedBlockKey, VectorBlock, VectorMask,
 };
 
 use crate::bitdepth::BitDepth;
@@ -127,6 +128,11 @@ fn invalid(message: &'static str) -> PsdError {
 const LOCK_ALL: u32 = 0x8000_0000;
 /// `lspf` bit for the transparency lock (mirrored in the record flags).
 const LOCK_TRANSPARENCY: u32 = 0x0000_0001;
+
+/// The blocks that hold layer effects: the three descriptor forms and the legacy `lrFX`.
+fn is_effects_key(key: TaggedBlockKey) -> bool {
+    matches!(&key.as_bytes(), b"lfx2" | b"lmfx" | b"lfxs" | b"lrFX")
+}
 
 /// A single layer: metadata plus its kind-specific payload.
 #[derive(Debug, Clone, PartialEq)]
@@ -337,6 +343,127 @@ impl<T: BitDepth> Layer<T> {
                 }
             })
             .collect())
+    }
+
+    /// The layer's effects as a typed, editable set.
+    ///
+    /// Read from the block Photoshop treats as authoritative: `lmfx` if the layer has one, else
+    /// `lfx2`, else `lfxs`. `None` when the layer has none of them; a layer that has only a
+    /// legacy `lrFX` block (which Photoshop ignores beside a descriptor block) has no set. A
+    /// block that cannot be read is an error here, unlike [`effects`](Self::effects), which
+    /// skips it.
+    pub fn layer_effects(&self) -> Result<Option<LayerEffects>> {
+        let Some(index) = self.effects_block_index() else {
+            return Ok(None);
+        };
+        let descriptor = Self::effects_descriptor(&self.blocks.blocks[index])?;
+        Ok(Some(LayerEffects::from_descriptor(&descriptor)))
+    }
+
+    /// Make the layer's effects exactly `effects`.
+    ///
+    /// The layer's existing effects block is edited in place, so what the set does not model
+    /// (unknown descriptor items, the form a file used for its effect lists) survives, and a
+    /// layer without one gets a new block placed where Photoshop puts it, after the layer's
+    /// content block and before its vector-mask and name blocks. That new block is `lmfx` when
+    /// the set has more than one instance of a repeatable effect, as Photoshop writes it, and
+    /// `lfx2` otherwise. An existing block keeps its key (`lfx2`, `lfxs` or `lmfx`), since
+    /// Photoshop-authored files hold several instances in either.
+    ///
+    /// Setting a layer's own effects back to what it has changes nothing: the block, and the
+    /// legacy `lrFX` mirror beside it, are left as they were. Any real change rewrites the
+    /// descriptor block and drops the `lrFX` mirror, which a later release regenerates from
+    /// the set; Photoshop ignores `lrFX` whenever a descriptor block is present.
+    ///
+    /// An existing block that cannot be read is replaced by a fresh one.
+    pub fn set_layer_effects(&mut self, effects: &LayerEffects) -> Result<()> {
+        let existing = self.effects_block_index();
+        let old_root = existing.and_then(|i| Self::effects_descriptor(&self.blocks.blocks[i]).ok());
+        let root = match &old_root {
+            Some(old) => {
+                let mut root = old.clone();
+                effects.apply_to(&mut root);
+                root
+            }
+            None => effects.to_descriptor(),
+        };
+
+        // An existing block keeps its key: Photoshop-authored files hold several instances in
+        // `lfx2` as well as in `lmfx`, and an edit has no reason to move a layer from one to
+        // the other. A new block uses `lmfx` for several instances, as Photoshop does, and
+        // `lfx2` otherwise.
+        let existing_key = existing.map(|i| self.blocks.blocks[i].key.as_bytes());
+        let key = existing_key.unwrap_or(if effects.has_multiple_instances() {
+            *b"lmfx"
+        } else {
+            *b"lfx2"
+        });
+
+        // Nothing changed when the same descriptor would be stored under the same key. That is
+        // decided on the descriptors and not on the block's bytes: the padding a file put after
+        // its descriptor is not ours to normalise.
+        if old_root.as_ref() == Some(&root) && existing_key == Some(key) {
+            return Ok(());
+        }
+        let data = effects_block_data(&root)?;
+
+        let position = existing.unwrap_or_else(|| self.new_effects_block_position());
+        let blocks = &mut self.blocks.blocks;
+        let dropped_before = blocks[..position]
+            .iter()
+            .filter(|b| is_effects_key(b.key))
+            .count();
+        blocks.retain(|block| !is_effects_key(block.key));
+        blocks.insert(
+            position - dropped_before,
+            TaggedBlock::new(TaggedBlockKey::new(key), data),
+        );
+        Ok(())
+    }
+
+    /// Remove every effects block from the layer, descriptor and legacy alike.
+    pub fn clear_layer_effects(&mut self) {
+        self.blocks
+            .blocks
+            .retain(|block| !is_effects_key(block.key));
+    }
+
+    /// Index of the block that holds the layer's effects: `lmfx`, then `lfx2`, then `lfxs`.
+    fn effects_block_index(&self) -> Option<usize> {
+        [*b"lmfx", *b"lfx2", *b"lfxs"].into_iter().find_map(|key| {
+            self.blocks
+                .blocks
+                .iter()
+                .position(|block| block.key.as_bytes() == key)
+        })
+    }
+
+    fn effects_descriptor(block: &TaggedBlock) -> Result<Descriptor> {
+        match LayerEffectsBlock::read(block)? {
+            Some(LayerEffectsBlock {
+                data: LayerEffectsData::Modern(modern),
+                ..
+            }) => Ok(modern.descriptor),
+            _ => Err(PsdError::InvalidData {
+                offset: 0,
+                message: "not a descriptor-based layer effects block",
+            }),
+        }
+    }
+
+    /// Where a layer with no effects block gets one: where an existing legacy `lrFX` block is,
+    /// else before the first vector-mask, vector-origination or name block, else last.
+    fn new_effects_block_position(&self) -> usize {
+        let blocks = &self.blocks.blocks;
+        blocks
+            .iter()
+            .position(|block| block.key.as_bytes() == *b"lrFX")
+            .or_else(|| {
+                blocks.iter().position(|block| {
+                    matches!(&block.key.as_bytes(), b"vmsk" | b"vsms" | b"vogk" | b"luni")
+                })
+            })
+            .unwrap_or(blocks.len())
     }
 
     /// Whether the layer carries an adjustment or fill-layer settings block

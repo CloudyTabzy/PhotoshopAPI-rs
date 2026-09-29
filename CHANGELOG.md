@@ -12,6 +12,44 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.29] - 2026-09-29
+
+Layer effects can now be created and edited on a layer.
+
+### Added
+
+- `LayerEffects`, every effect on a layer as the typed models from 0.6.28: a scale, the master
+  switch, drop and inner shadows, outer and inner glow, bevel, colour overlays, satin, gradient
+  overlays, pattern overlay and strokes. It reads from, patches in place and builds the root
+  descriptor of an `lfx2`, `lmfx` or `lfxs` block (`from_descriptor`, `apply_to`,
+  `to_descriptor`). Unlike a single effect, the set is the whole truth about a layer: a family
+  with no entries is removed from the descriptor and an entry with no counterpart is added.
+  Effects that repeat keep the form the file used, a single key or a list (newer files write
+  even one effect as a list), and a new set uses the single key for one and a list for several.
+  `effects_block_data` frames a root descriptor as a block payload.
+- `Layer::layer_effects`, `Layer::set_layer_effects` and `Layer::clear_layer_effects`. Reading
+  uses the block Photoshop treats as authoritative (`lmfx`, then `lfx2`, then `lfxs`). Setting
+  edits the existing block in place, or adds a block where Photoshop puts it: after the layer's
+  content block and before its vector-mask and name blocks, as `lmfx` for several instances of a
+  repeatable effect and `lfx2` otherwise. An existing block keeps its key, because
+  Photoshop-authored files hold several instances in `lfx2` as well as `lmfx`.
+  Setting a layer's own effects back to what it has changes nothing, including the legacy
+  `lrFX` mirror beside the block. A real change rewrites the descriptor block and drops that
+  mirror, which Photoshop ignores whenever a descriptor block exists; regenerating it from
+  the set follows in a later release. A block that cannot be read is replaced.
+- `numModifyingFX`, the tally newer files carry, moves by however much an edit changes the
+  number of enabled effects and is never recomputed: Photoshop's own value is not always the
+  plain count (a zero-width stroke is enabled and counted as 0).
+
+### Verified
+
+- On all 300 layers with effects in about 420 Photoshop-authored documents, setting a layer's
+  own effects back leaves every block of the layer exactly as it was, and every effects block's
+  length is a multiple of four, which is how a new block is padded. That sweep showed three
+  things the design now accounts for: a no-op is decided on the descriptor, not the block's
+  bytes (files pad their blocks differently); an existing `lfx2` may hold several instances; and
+  `numModifyingFX` is not always the enabled count.
+
 ## [0.6.28] - 2026-09-29
 
 Typed models of every layer effect, the second step towards authoring them. As before, nothing

@@ -31,6 +31,7 @@ mod color_mode_data;
 pub mod descriptor;
 mod descriptor_build;
 pub mod effect_enums;
+mod effect_set;
 pub mod effects;
 pub mod engine_data;
 mod enums;
@@ -68,6 +69,7 @@ pub use effect_enums::{
     BevelDirection, BevelStyle, BevelTechnique, GlowSource, GlowTechnique, GradientInterpolation,
     GradientStyle, StrokeFill, StrokePosition,
 };
+pub use effect_set::{effects_block_data, LayerEffects};
 pub use effects::{
     Bevel, ColorOverlay, Glow, GlowKind, GradientOverlay, PatternOverlay, Satin, Shadow,
     ShadowKind, Stroke,
