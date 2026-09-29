@@ -16,12 +16,14 @@ v0.9.1 that this project ports.
 
 ### Fixed
 
-- A 16-bit greyscale PNG with a `tRNS` key, decoded to 8-bit RGBA (the `image` feature's
-  smart-object and linked-data path), made the wrong pixels transparent: in each block of eight
-  pixels a keyed pixel in the first half turned its neighbours transparent instead of itself,
-  and one in the second half turned none. Only rows that contain the key were affected. The
-  portable kernel introduced in 0.6.25 had it; the parity tests missed it because random rows
-  almost never contain a given 16-bit key, and they now plant the key.
+- `psd-png` decoded a 16-bit greyscale PNG with a `tRNS` key to 8-bit RGBA (`to_rgba8`,
+  `decode_to_rgba8`) with the wrong pixels transparent: in each block of eight pixels a keyed
+  pixel in the first half turned its neighbours transparent instead of itself, and one in the
+  second half turned none. Only rows that contain the key were affected. The portable kernel
+  introduced in 0.6.25 had it; the parity tests missed it because random rows almost never
+  contain a given 16-bit key, and they now plant the key. The document read path never
+  reached it: smart-object PNGs go through native RGBA rows or the 16-bit RGBA route, and the
+  16-bit-output kernel was correct.
 
 ### Changed
 
