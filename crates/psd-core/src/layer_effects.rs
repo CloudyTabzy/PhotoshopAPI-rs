@@ -1,14 +1,15 @@
-//! Read-only views of layer effects stored in `lfx2`, `lmfx`, `lfxs`, and `lrFX`.
+//! Views of layer effects stored in `lfx2`, `lmfx`, `lfxs`, and `lrFX`, with a
+//! payload writer for modern descriptors.
 //!
-//! The four-key dispatch and effect names follow the public `ag-psd-rs` reference
-//! (<https://github.com/Vasyanator/ag-psd-rs>). Unlike that parser, these views
-//! retain every effect block and unknown legacy record. The original tagged
-//! block remains authoritative for writing, so reading effects changes no bytes.
+//! The four-key dispatch and effect names follow Photoshop's tagged-block
+//! layouts. These views retain every effect block and unknown legacy record.
+//! The original tagged block remains authoritative for writing, so reading
+//! effects changes no bytes.
 
 use crate::descriptor::{Descriptor, DescriptorKey};
 use crate::enums::BlendMode;
 use crate::error::{PsdError, Result};
-use crate::io::BeReader;
+use crate::io::{BeReader, BeWriter};
 use crate::tagged_blocks::{TaggedBlock, TaggedBlockKey};
 use crate::types::RawColor;
 
@@ -104,6 +105,16 @@ impl EffectDescriptor<'_> {
 }
 
 impl ModernLayerEffects {
+    /// Serialize the complete descriptor and preserved trailing bytes.
+    pub fn to_payload(&self) -> Result<Vec<u8>> {
+        let mut writer = BeWriter::new();
+        writer.u32(0);
+        writer.u32(16);
+        self.descriptor.write(&mut writer)?;
+        writer.bytes(&self.trailing_bytes);
+        Ok(writer.into_inner())
+    }
+
     pub fn scale_percent(&self) -> Option<f64> {
         self.descriptor
             .get("Scl ")?
@@ -163,7 +174,7 @@ impl ModernLayerEffects {
 }
 
 fn modern_kind(key: &[u8]) -> Option<(EffectKind, bool)> {
-    // Keys and multi-effect families are drawn from ag-psd-rs's `effects_keys.rs`.
+    // Keys and multi-effect families follow Photoshop's effects descriptors.
     Some(match key {
         b"DrSh" => (EffectKind::DropShadow, false),
         b"IrSh" => (EffectKind::InnerShadow, false),

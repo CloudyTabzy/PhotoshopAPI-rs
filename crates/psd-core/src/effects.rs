@@ -8,9 +8,8 @@
 //! items, their order, their key encodings, the spelling of a value that is unchanged) stays
 //! exactly as it was.
 //!
-//! Building a descriptor from scratch uses the item order Photoshop-authored files show, which
-//! is not the order the public `ag-psd-rs` reference (<https://github.com/Vasyanator/ag-psd-rs>)
-//! writes: the tables below were counted from real files, and a `Default` effect carries every
+//! Building a descriptor from scratch uses the item order measured in Photoshop-authored files:
+//! the tables below were counted from real files, and a `Default` effect carries every
 //! field so that a new effect has the full layout Photoshop writes (a gradient overlay in
 //! particular is reset to Normal by Photoshop unless it has the complete one).
 //!

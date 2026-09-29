@@ -10,12 +10,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use psd_core::{
-    AdditionalLayerInfo, BeReader, BeWriter, BitDepth as CoreBitDepth, BlendMode, ChannelData,
-    ChannelId as CoreChannelId, ChannelImageData, ChannelInfo, ColorMode, ColorModeData,
-    Compression, FileHeader, GlobalLayerMaskInfo, IccProfileBlock, ImageData, ImageResources,
-    LayerAndMaskInformation, LayerInfo, LayerRecord, PascalString, PhotoshopFile, PsdError,
-    ResolutionInfoBlock, Result, SectionDivider, TaggedBlock, TaggedBlockKey, UnicodeString,
-    Version,
+    AdditionalLayerInfo, AdjustmentBlock, AdjustmentKind, Artboard, ArtboardSettings, BeReader,
+    BeWriter, BitDepth as CoreBitDepth, BlendMode, ChannelData, ChannelId as CoreChannelId,
+    ChannelImageData, ChannelInfo, ColorMode, ColorModeData, Compression, FileHeader,
+    GlobalLayerMaskInfo, IccProfileBlock, ImageData, ImageResources, LayerAndMaskInformation,
+    LayerInfo, LayerRecord, PascalString, PhotoshopFile, PsdError, ResolutionInfoBlock, Result,
+    SectionDivider, TaggedBlock, TaggedBlockKey, UnicodeString, VectorBlock, Version,
 };
 
 use crate::bitdepth::BitDepth;
@@ -23,7 +23,9 @@ use crate::channels::{
     compress_channel, decompress_channel, ChannelKey, ChannelStore, RawChannelData,
 };
 use crate::layer::upsert_block;
-use crate::layer::{GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Rect, TextLayer};
+use crate::layer::{
+    AdjustmentLayer, GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Rect, ShapeLayer, TextLayer,
+};
 use crate::progress::{ignore_progress, ProgressEvent};
 use crate::text::TextCacheBaseline;
 
@@ -53,9 +55,9 @@ pub const DEFAULT_TOTAL_MEMORY_LIMIT: usize = 2 * 1024 * 1024 * 1024;
 
 /// Options for reading a PSD or PSB document.
 ///
-/// The cumulative bitmap budget follows the caller-controlled read-budget
-/// design in [ag-psd-rs](https://github.com/Vasyanator/ag-psd-rs), adapted to
-/// this crate's planar typed channel storage. The default is 2 GiB. Set
+/// The cumulative bitmap budget follows a caller-controlled design used by
+/// independent PSD parsers, adapted to this crate's planar typed channel
+/// storage. The default is 2 GiB. Set
 /// [`total_memory_limit`](Self::total_memory_limit) to `None` to disable the
 /// limit explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,8 +68,7 @@ pub struct ReadOptions {
     pub total_memory_limit: Option<usize>,
     /// Retain compressed layer and mask channels until explicitly decoded.
     /// Untouched raw channels are written from their stored payloads without
-    /// decoding. This follows `ReadOptions::use_raw_data` in ag-psd-rs
-    /// (<https://github.com/Vasyanator/ag-psd-rs>). The default is `false` to
+    /// decoding. The default is `false` to
     /// preserve eager pixel access.
     pub use_raw_data: bool,
 }
@@ -124,10 +125,8 @@ fn mask_channel_rect(mask: Option<&psd_core::LayerMaskData>, key: ChannelKey) ->
         .map(|mask| Rect::new(mask.top, mask.left, mask.bottom, mask.right))
 }
 
-/// Validate file-provided layer and mask bounds before deriving bitmap sizes.
-/// This follows the early rectangle check in ag-psd-rs
-/// (https://github.com/Vasyanator/ag-psd-rs), using 30,000 pixels per side for
-/// PSD and 300,000 for PSB while doing the subtraction in i64.
+/// Validate layer and mask bounds before deriving bitmap sizes,
+/// using the PSD/PSB dimension limits and doing subtraction in i64.
 fn read_rect_extents(rect: Rect, kind: &'static str, version: Version) -> Result<(usize, usize)> {
     let width_i64 = i64::from(rect.right) - i64::from(rect.left);
     let height_i64 = i64::from(rect.bottom) - i64::from(rect.top);
@@ -164,8 +163,8 @@ fn mask_channel_extents(
     match read_rect_extents(rect, kind, version) {
         Ok(extents) => Ok(extents),
         // PhotoshopAPI/src/PhotoshopFile/LayerAndMaskInformation.cpp passes
-        // mask extents to its decoder without checking them, while ag-psd-rs
-        // rejects inverted extents. The corpus has an empty vector-mask
+        // mask extents to its decoder without checking them, while other
+        // parsers reject inverted extents. The corpus has an empty vector-mask
         // channel with a 0x-1 placeholder; retain it as zero-area because it
         // has no bytes and cannot allocate pixels.
         Err(PsdError::InvalidImageBounds { width, height, .. })
@@ -178,8 +177,8 @@ fn mask_channel_extents(
 }
 
 /// Charge one retained channel plane before calling its decoder. This adapts
-/// ag-psd-rs's remaining-budget model
-/// (https://github.com/Vasyanator/ag-psd-rs) to planar typed channels.
+/// a remaining-budget model used by independent readers to planar typed
+/// channels.
 fn charge_decoded_bitmap(
     remaining: &mut Option<usize>,
     width: usize,
@@ -546,7 +545,10 @@ impl<T: BitDepth> LayeredFile<T> {
                     parent[id] = stack.last().copied();
                     stack.push(id);
                 }
-                LayerKind::Image(_) | LayerKind::Text(_) => parent[id] = stack.last().copied(),
+                LayerKind::Image(_)
+                | LayerKind::Text(_)
+                | LayerKind::Adjustment(_)
+                | LayerKind::Shape(_) => parent[id] = stack.last().copied(),
             }
         }
         // Fill children lists in on-disk (file) order.
@@ -720,6 +722,18 @@ impl<T: BitDepth> LayeredFile<T> {
             Ok(channels)
         };
 
+        let carries_adjustment_settings = blocks.blocks.iter().any(|block| {
+            AdjustmentKind::from_key(block.key).is_some_and(AdjustmentKind::marks_layer)
+        });
+        let has_vector_mask = blocks
+            .blocks
+            .iter()
+            .any(|block| psd_core::vector::is_vector_mask_key(block.key));
+        let has_shape_fill = blocks.blocks.iter().any(|block| {
+            block.key.as_bytes() == *b"vscg"
+                || AdjustmentKind::from_key(block.key).is_some_and(AdjustmentKind::is_fill)
+        });
+        let carries_shape_settings = has_vector_mask && has_shape_fill;
         let kind = match divider {
             Some(SectionDivider::BoundingSection) => {
                 LayerKind::SectionDivider(SectionDivider::BoundingSection)
@@ -738,6 +752,10 @@ impl<T: BitDepth> LayeredFile<T> {
                 let channels = decode_channels(|_| true)?;
                 if has_text_metadata {
                     LayerKind::Text(TextLayer { channels })
+                } else if carries_shape_settings {
+                    LayerKind::Shape(ShapeLayer { channels })
+                } else if carries_adjustment_settings {
+                    LayerKind::Adjustment(AdjustmentLayer { channels })
                 } else {
                     LayerKind::Image(ImageLayer { channels })
                 }
@@ -912,12 +930,325 @@ impl<T: BitDepth> LayeredFile<T> {
         &self.root_children
     }
 
-    /// Append a layer at the top level.
+    /// Append an ordinary layer at the top level.
+    ///
+    /// To add an artboard, use [`add_artboard`](Self::add_artboard), which
+    /// also creates or updates the document-level artboard count.
     pub fn add_layer(&mut self, layer: Layer<T>) -> LayerId {
         self.layers.push(Some(layer));
         let id = self.layers.len() - 1;
         self.root_children.push(id);
         id
+    }
+
+    /// Create a root artboard group and keep the document's artboard count in
+    /// its `artd` settings block.
+    pub fn add_artboard(
+        &mut self,
+        name: impl Into<String>,
+        artboard: &Artboard,
+    ) -> Result<LayerId> {
+        let count = self
+            .artboards()
+            .len()
+            .checked_add(1)
+            .ok_or(PsdError::InvalidData {
+                offset: 0,
+                message: "artboard count exceeds the descriptor integer range",
+            })?;
+        artboard.to_tagged_block()?;
+        let settings = self.artboard_settings_block_with_count(count)?;
+        let mut layer = Layer::new_group(name);
+        layer.set_artboard(artboard)?;
+        self.upsert_document_block(settings);
+        Ok(self.add_layer(layer))
+    }
+
+    /// Set the document-level `artd` artboard-tool settings.
+    pub fn set_artboard_settings(&mut self, settings: &ArtboardSettings) -> Result<()> {
+        let block = settings.to_tagged_block(self.version)?;
+        self.upsert_document_block(block);
+        Ok(())
+    }
+
+    pub(crate) fn upsert_document_block(&mut self, block: TaggedBlock) {
+        let document_blocks = self
+            .document_blocks
+            .get_or_insert_with(AdditionalLayerInfo::new);
+        match document_blocks
+            .blocks
+            .iter_mut()
+            .find(|existing| existing.key == block.key)
+        {
+            Some(existing) if existing.data == block.data => {}
+            Some(existing) => *existing = block,
+            None => document_blocks.push(block),
+        }
+    }
+
+    pub(crate) fn artboard_settings_block_with_count(&self, count: usize) -> Result<TaggedBlock> {
+        let count = i32::try_from(count).map_err(|_| PsdError::InvalidData {
+            offset: 0,
+            message: "artboard count exceeds the descriptor integer range",
+        })?;
+        let mut settings = self.artboard_settings()?.unwrap_or_default();
+        settings.set_count(count);
+        settings.to_tagged_block(self.version)
+    }
+
+    /// Set or replace an artboard block on an existing group. The document's
+    /// artboard count is adjusted when the group changes artboard status.
+    pub fn set_artboard(&mut self, id: LayerId, artboard: &Artboard) -> Result<()> {
+        let layer = self.layer(id).ok_or(PsdError::InvalidData {
+            offset: 0,
+            message: "artboard target layer does not exist",
+        })?;
+        if layer.group().is_none() {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "only a group layer can be an artboard",
+            });
+        }
+        if !layer.is_artboard()
+            && (self.parent_is_within_artboard(self.parent(id))
+                || self
+                    .artboards()
+                    .into_iter()
+                    .any(|artboard| self.is_descendant(artboard, id)))
+        {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "artboards cannot be nested inside other artboards",
+            });
+        }
+        artboard.to_tagged_block()?;
+        let was_artboard = layer.is_artboard();
+        let mut settings = self.artboard_settings()?;
+        if !was_artboard || settings.is_some() {
+            let count = self
+                .artboards()
+                .len()
+                .checked_add(usize::from(!was_artboard))
+                .and_then(|count| i32::try_from(count).ok())
+                .ok_or(PsdError::InvalidData {
+                    offset: 0,
+                    message: "artboard count exceeds the descriptor integer range",
+                })?;
+            let mut value = settings.take().unwrap_or_default();
+            value.set_count(count);
+            settings = Some(value);
+        }
+        let block = settings
+            .as_ref()
+            .map(|settings| settings.to_tagged_block(self.version))
+            .transpose()?;
+        self.layer_mut(id)
+            .expect("validated above")
+            .set_artboard(artboard)?;
+        if let Some(block) = block {
+            self.upsert_document_block(block);
+        }
+        Ok(())
+    }
+
+    /// Remove artboard metadata from an existing layer and update the document count.
+    pub fn clear_artboard(&mut self, id: LayerId) -> Result<bool> {
+        let was_artboard = self
+            .layer(id)
+            .ok_or(PsdError::InvalidData {
+                offset: 0,
+                message: "artboard target layer does not exist",
+            })?
+            .is_artboard();
+        if !was_artboard {
+            return Ok(false);
+        }
+        let settings = self.artboard_settings()?;
+        let block = if let Some(mut settings) = settings {
+            let remaining = self.artboards().len().saturating_sub(1);
+            let count = i32::try_from(remaining).map_err(|_| PsdError::InvalidData {
+                offset: 0,
+                message: "artboard count exceeds the descriptor integer range",
+            })?;
+            settings.set_count(count);
+            Some(settings.to_tagged_block(self.version)?)
+        } else {
+            None
+        };
+        let removed = self
+            .layer_mut(id)
+            .expect("validated above")
+            .clear_artboard();
+        if let Some(block) = block {
+            self.upsert_document_block(block);
+        }
+        Ok(removed)
+    }
+
+    /// Remove the document-level `artd` block, if present.
+    pub fn clear_artboard_settings(&mut self) -> bool {
+        let Some(blocks) = &mut self.document_blocks else {
+            return false;
+        };
+        let before = blocks.blocks.len();
+        blocks
+            .blocks
+            .retain(|block| block.key != TaggedBlockKey::new(*b"artd"));
+        let removed = before != blocks.blocks.len();
+        if blocks.blocks.is_empty() {
+            self.document_blocks = None;
+        }
+        removed
+    }
+
+    /// Create an adjustment or fill layer from one typed settings block.
+    ///
+    /// Adjustment layers use empty bounds; fill layers cover the document
+    /// canvas. Add companion data such as CgEd with
+    /// [`Layer::set_adjustment`](crate::Layer::set_adjustment) after creation.
+    pub fn add_adjustment_layer(
+        &mut self,
+        name: impl Into<String>,
+        settings: &psd_core::AdjustmentBlock,
+    ) -> Result<LayerId> {
+        let layer = self.build_adjustment_layer(name, settings)?;
+        Ok(self.add_layer(layer))
+    }
+
+    /// Create an adjustment or fill layer inside a group.
+    pub fn add_adjustment_layer_to_group(
+        &mut self,
+        group: LayerId,
+        name: impl Into<String>,
+        settings: &psd_core::AdjustmentBlock,
+    ) -> Result<LayerId> {
+        let layer = self.build_adjustment_layer(name, settings)?;
+        self.add_layer_to_group(group, layer)
+    }
+
+    /// Create a shape layer from typed fill, mask, stroke, and origination blocks.
+    pub fn add_shape_layer(
+        &mut self,
+        name: impl Into<String>,
+        bounds: Rect,
+        vector_blocks: &[psd_core::VectorBlock],
+    ) -> Result<LayerId> {
+        let layer = self.build_shape_layer(name, bounds, vector_blocks)?;
+        Ok(self.add_layer(layer))
+    }
+
+    /// Create a shape layer inside a group.
+    pub fn add_shape_layer_to_group(
+        &mut self,
+        group: LayerId,
+        name: impl Into<String>,
+        bounds: Rect,
+        vector_blocks: &[psd_core::VectorBlock],
+    ) -> Result<LayerId> {
+        let layer = self.build_shape_layer(name, bounds, vector_blocks)?;
+        self.add_layer_to_group(group, layer)
+    }
+
+    /// Create a shape layer from tagged blocks, accepting both legacy fill
+    /// blocks (`SoCo`/`GdFl`/`PtFl`) and modern `vscg` content.
+    pub fn add_shape_layer_from_blocks(
+        &mut self,
+        name: impl Into<String>,
+        bounds: Rect,
+        blocks: &[TaggedBlock],
+    ) -> Result<LayerId> {
+        let layer = self.build_shape_layer_from_blocks(name, bounds, blocks)?;
+        Ok(self.add_layer(layer))
+    }
+
+    /// Create a tagged-block shape layer inside a group.
+    pub fn add_shape_layer_from_blocks_to_group(
+        &mut self,
+        group: LayerId,
+        name: impl Into<String>,
+        bounds: Rect,
+        blocks: &[TaggedBlock],
+    ) -> Result<LayerId> {
+        let layer = self.build_shape_layer_from_blocks(name, bounds, blocks)?;
+        self.add_layer_to_group(group, layer)
+    }
+
+    fn build_shape_layer(
+        &self,
+        name: impl Into<String>,
+        bounds: Rect,
+        vector_blocks: &[psd_core::VectorBlock],
+    ) -> Result<Layer<T>> {
+        read_rect_extents(bounds, "shape layer", self.version)?;
+        let mut layer = Layer::new_shape(name, bounds);
+        for block in vector_blocks {
+            layer.set_vector_block(block)?;
+        }
+        if !layer.has_shape_markers() {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "a shape layer needs both a vector mask and a fill block",
+            });
+        }
+        Ok(layer)
+    }
+
+    fn build_shape_layer_from_blocks(
+        &self,
+        name: impl Into<String>,
+        bounds: Rect,
+        blocks: &[TaggedBlock],
+    ) -> Result<Layer<T>> {
+        read_rect_extents(bounds, "shape layer", self.version)?;
+        let mut layer = Layer::new_shape(name, bounds);
+        for block in blocks {
+            if let Some(adjustment) = AdjustmentBlock::read(block)? {
+                layer.set_adjustment(&adjustment)?;
+            } else if let Some(vector) = VectorBlock::read(block)? {
+                layer.set_vector_block(&vector)?;
+            } else {
+                return Err(PsdError::InvalidData {
+                    offset: 0,
+                    message: "shape-layer builder received an unsupported tagged block",
+                });
+            }
+        }
+        if !layer.has_shape_markers() {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "a shape layer needs both a vector mask and a fill block",
+            });
+        }
+        Ok(layer)
+    }
+
+    fn build_adjustment_layer(
+        &self,
+        name: impl Into<String>,
+        settings: &psd_core::AdjustmentBlock,
+    ) -> Result<Layer<T>> {
+        if !settings.kind.marks_layer() {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "CgEd accompanies an adjustment and cannot create a layer",
+            });
+        }
+        let bounds = if settings.kind.is_fill() {
+            let width = i32::try_from(self.width).map_err(|_| PsdError::InvalidData {
+                offset: 0,
+                message: "document width exceeds layer-coordinate range",
+            })?;
+            let height = i32::try_from(self.height).map_err(|_| PsdError::InvalidData {
+                offset: 0,
+                message: "document height exceeds layer-coordinate range",
+            })?;
+            Rect::new(0, 0, height, width)
+        } else {
+            Rect::default()
+        };
+        let mut layer = Layer::new_adjustment(name, bounds);
+        layer.set_adjustment(settings)?;
+        Ok(layer)
     }
 
     /// Append a layer inside a group.
@@ -934,11 +1265,33 @@ impl<T: BitDepth> LayeredFile<T> {
                 message: "target layer is not a group",
             });
         }
+        if self.parent_is_within_artboard(Some(group)) && layer.is_artboard() {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "artboards cannot be nested inside other artboards",
+            });
+        }
+        let settings_update = if layer.is_artboard() {
+            let count = self
+                .artboards()
+                .len()
+                .checked_add(1)
+                .ok_or(PsdError::InvalidData {
+                    offset: 0,
+                    message: "artboard count exceeds the descriptor integer range",
+                })?;
+            Some(self.artboard_settings_block_with_count(count)?)
+        } else {
+            None
+        };
         self.layers.push(Some(layer));
         let id = self.layers.len() - 1;
         match &mut self.slot_mut(group).kind {
             LayerKind::Group(group) => group.children.push(id),
             _ => unreachable!("validated as a group above"),
+        }
+        if let Some(block) = settings_update {
+            self.upsert_document_block(block);
         }
         Ok(id)
     }
@@ -994,6 +1347,8 @@ impl<T: BitDepth> LayeredFile<T> {
         self.layers().any(|layer| match &layer.kind {
             LayerKind::Image(image) => image.channels.contains(ChannelKey::ALPHA),
             LayerKind::Text(text) => text.channels.contains(ChannelKey::ALPHA),
+            LayerKind::Adjustment(adjustment) => adjustment.channels.contains(ChannelKey::ALPHA),
+            LayerKind::Shape(shape) => shape.channels.contains(ChannelKey::ALPHA),
             _ => false,
         })
     }
@@ -1250,7 +1605,10 @@ impl<T: BitDepth> LayeredFile<T> {
                     count += 1;
                     previous_was_divider = true;
                 }
-                LayerKind::Image(_) | LayerKind::Text(_) => {
+                LayerKind::Image(_)
+                | LayerKind::Text(_)
+                | LayerKind::Adjustment(_)
+                | LayerKind::Shape(_) => {
                     count += 1;
                     previous_was_divider = false;
                 }
@@ -1307,7 +1665,11 @@ impl<T: BitDepth> LayeredFile<T> {
                     channel_data.push(data);
                     previous_was_divider = false;
                 }
-                LayerKind::SectionDivider(_) | LayerKind::Image(_) | LayerKind::Text(_) => {
+                LayerKind::SectionDivider(_)
+                | LayerKind::Image(_)
+                | LayerKind::Text(_)
+                | LayerKind::Adjustment(_)
+                | LayerKind::Shape(_) => {
                     let (record, data) =
                         self.build_record(layer, self.blocks_for_record(layer)?, *index == 0)?;
                     progress(ProgressEvent::Layer {
@@ -1341,6 +1703,12 @@ impl<T: BitDepth> LayeredFile<T> {
         &'a self,
         layer: &'a Layer<T>,
     ) -> Result<Option<Cow<'a, AdditionalLayerInfo>>> {
+        if matches!(layer.kind, LayerKind::Shape(_)) && !layer.has_shape_markers() {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "a shape layer needs both a vector mask and a fill block",
+            });
+        }
         let mut owned: Option<AdditionalLayerInfo> = None;
 
         // Read tolerantly: an unpadded block (some writers leave them so;
@@ -1502,6 +1870,8 @@ impl<T: BitDepth> LayeredFile<T> {
         let mut keys: Vec<ChannelKey> = match &layer.kind {
             LayerKind::Image(image) => image.channels.keys().collect(),
             LayerKind::Text(text) => text.channels.keys().collect(),
+            LayerKind::Adjustment(adjustment) => adjustment.channels.keys().collect(),
+            LayerKind::Shape(shape) => shape.channels.keys().collect(),
             // Groups and section dividers carry empty stub channels on disk;
             // groups add their mask channels.
             LayerKind::Group(_) | LayerKind::SectionDivider(_) => {
@@ -1528,7 +1898,19 @@ impl<T: BitDepth> LayeredFile<T> {
         }
         keys.sort_by_key(|key| channel_sort_key(*key));
         let opaque_alpha = if synthesize_alpha {
-            let samples = (bounds.width().max(0) as usize) * (bounds.height().max(0) as usize);
+            let (width, height) = read_rect_extents(bounds, "layer", self.version)?;
+            let samples = width
+                .checked_mul(height)
+                .filter(|&samples| {
+                    samples
+                        .checked_mul(std::mem::size_of::<T>())
+                        .is_some_and(|bytes| bytes <= isize::MAX as usize)
+                })
+                .ok_or(PsdError::InvalidImageBounds {
+                    kind: "layer",
+                    width: i64::from(bounds.right) - i64::from(bounds.left),
+                    height: i64::from(bounds.bottom) - i64::from(bounds.top),
+                })?;
             vec![T::from_f32(1.0); samples]
         } else {
             Vec::new()
@@ -1548,8 +1930,8 @@ impl<T: BitDepth> LayeredFile<T> {
             };
             let (compression, payload) =
                 if let Some(raw) = layer.channels().and_then(|channels| channels.raw(key)) {
-                    // Like ag-psd-rs's `use_raw_data` writer path, preserve the
-                    // encoded payload until a caller decodes or replaces it.
+                    // Preserve the encoded payload until a caller decodes or
+                    // replaces it.
                     let (width, height) = if key.is_mask() {
                         let kind = if key == ChannelKey::REAL_USER_MASK {
                             "real mask"
@@ -1667,6 +2049,21 @@ impl<T: BitDepth> LayeredFile<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthesized_alpha_rejects_extreme_coordinates_before_allocation() {
+        for bounds in [
+            Rect::new(i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+            Rect::new(0, 0, -1, -1),
+        ] {
+            let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 1, 1).unwrap();
+            document.add_layer(Layer::new_image("Invalid", bounds));
+            assert!(matches!(
+                document.to_bytes(),
+                Err(PsdError::InvalidImageBounds { .. })
+            ));
+        }
+    }
 
     fn layer_with_pixel(value: u8) -> Layer<u8> {
         let mut layer = Layer::new_image("Layer", Rect::new(0, 0, 4, 4));

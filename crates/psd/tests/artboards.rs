@@ -3,8 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
-use psd::core::{ArtboardBackground, TaggedBlockKey};
-use psd::{ChannelKey, Layer, LayerId, LayeredFile, Rect};
+use psd::core::{Artboard, ArtboardBackground, ArtboardRect, Color, TaggedBlockKey, Version};
+use psd::{ChannelKey, Layer, LayerId, LayerTree, LayeredFile, Rect};
 
 fn fixture(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -119,6 +119,20 @@ fn artboard_blocks_round_trip_byte_for_byte() {
         .and_then(|blocks| blocks.get(TaggedBlockKey::new(*b"artd")))
         .unwrap();
     assert_eq!(&settings.signature, b"8B64");
+
+    // PSB readers also accept `8BIM` for this key; a no-op must keep it.
+    let mut alternate = psb;
+    alternate
+        .document_blocks
+        .as_mut()
+        .unwrap()
+        .get_mut(TaggedBlockKey::new(*b"artd"))
+        .unwrap()
+        .signature = *b"8BIM";
+    let settings = alternate.artboard_settings().unwrap().unwrap();
+    let before = alternate.document_blocks.clone();
+    alternate.set_artboard_settings(&settings).unwrap();
+    assert_eq!(alternate.document_blocks, before);
 }
 
 #[test]
@@ -186,4 +200,144 @@ fn photoshop_groups_are_not_artboards() {
         assert!(file.artboards().is_empty(), "{name}");
         assert!(file.artboard_settings().unwrap().is_none(), "{name}");
     }
+}
+
+#[test]
+fn typed_artboard_authoring_round_trips_and_tracks_document_count() {
+    let model = Artboard::new(
+        ArtboardRect {
+            top: 0.0,
+            left: 0.0,
+            bottom: 40.0,
+            right: 50.0,
+        },
+        Some("Icon"),
+        ArtboardBackground::Custom,
+        Some(Color::Rgb {
+            red: 18.0,
+            green: 108.0,
+            blue: 200.0,
+        }),
+        &[0],
+    )
+    .unwrap();
+
+    for version in [Version::Psd, Version::Psb] {
+        let mut file = LayeredFile::<u8>::new(psd::core::ColorMode::Rgb, 64, 64).unwrap();
+        file.version = version;
+        let id = file.add_artboard("Board", &model).unwrap();
+        let mut child = Layer::<u8>::new_image("Pixels", Rect::new(2, 2, 8, 8));
+        child
+            .image_mut()
+            .unwrap()
+            .set_channel(ChannelKey::color(0), vec![42; 36]);
+        file.add_layer_to_group(id, child).unwrap();
+
+        assert_eq!(file.artboard_settings().unwrap().unwrap().count(), Some(1));
+        let bytes = file.to_bytes().unwrap();
+        let back = LayeredFile::<u8>::from_bytes(&bytes).unwrap();
+        let board_id = id_of(&back, "Board");
+        let board_layer = back.layer(board_id).unwrap();
+        let parsed = board_layer.artboard().unwrap().unwrap();
+        assert_eq!(parsed.key, TaggedBlockKey::new(*b"artb"));
+        assert_eq!(parsed.preset_name(), Some("Icon"));
+        assert_eq!(parsed.guide_indices(), Some(vec![0]));
+        assert_eq!(child_names(&back, board_id), ["Pixels"]);
+        let settings = back
+            .document_blocks
+            .as_ref()
+            .and_then(|blocks| blocks.get(TaggedBlockKey::new(*b"artd")))
+            .unwrap();
+        assert_eq!(
+            settings.signature,
+            if version == Version::Psb {
+                *b"8B64"
+            } else {
+                *b"8BIM"
+            }
+        );
+
+        let removed = file.remove_layer(id).unwrap();
+        assert!(removed.layer.is_artboard());
+        assert_eq!(file.artboard_settings().unwrap().unwrap().count(), Some(0));
+        assert!(file.artboards().is_empty());
+    }
+}
+
+#[test]
+fn artboards_cannot_be_nested_in_other_artboards() {
+    let board = Artboard::new(
+        ArtboardRect {
+            top: 0.0,
+            left: 0.0,
+            bottom: 10.0,
+            right: 10.0,
+        },
+        None,
+        ArtboardBackground::Transparent,
+        None,
+        &[],
+    )
+    .unwrap();
+    let mut file = LayeredFile::<u8>::new(psd::core::ColorMode::Rgb, 16, 16).unwrap();
+    let parent = file.add_artboard("Parent", &board).unwrap();
+    let mut child = Layer::<u8>::new_group("Child");
+    child.set_artboard(&board).unwrap();
+    assert!(file.add_layer_to_group(parent, child).is_err());
+
+    let inner = file
+        .add_layer_to_group(parent, Layer::new_group("Inner"))
+        .unwrap();
+    let child = file.add_artboard("Child", &board).unwrap();
+    assert!(file.move_layer(child, Some(inner), None).is_err());
+}
+
+#[test]
+fn artboard_tree_insertions_keep_the_document_count_in_sync() {
+    let board = Artboard::new(
+        ArtboardRect {
+            top: 0.0,
+            left: 0.0,
+            bottom: 10.0,
+            right: 10.0,
+        },
+        None,
+        ArtboardBackground::Transparent,
+        None,
+        &[],
+    )
+    .unwrap();
+    let mut file = LayeredFile::<u8>::new(psd::core::ColorMode::Rgb, 16, 16).unwrap();
+    let group = file.add_layer(Layer::new_group("Group"));
+    let mut detached = Layer::new_group("Board");
+    detached.set_artboard(&board).unwrap();
+    let id = file.add_layer_to_group(group, detached).unwrap();
+    assert_eq!(file.artboard_settings().unwrap().unwrap().count(), Some(1));
+
+    let detached_tree = file.remove_layer(id).unwrap();
+    assert_eq!(file.artboard_settings().unwrap().unwrap().count(), Some(0));
+    file.insert_layer_tree(None, None, detached_tree).unwrap();
+    assert_eq!(file.artboard_settings().unwrap().unwrap().count(), Some(1));
+
+    let mut outer = LayerTree::new(Layer::new_group("Container"));
+    for name in ["Board A", "Board B"] {
+        let mut layer = Layer::new_group(name);
+        layer.set_artboard(&board).unwrap();
+        outer.push_child(LayerTree::new(layer)).unwrap();
+    }
+    let container = file.insert_layer_tree(None, None, outer).unwrap();
+    assert_eq!(file.artboards().len(), 3);
+    assert_eq!(file.artboard_settings().unwrap().unwrap().count(), Some(3));
+    let before = file.to_bytes().unwrap();
+    assert!(file.set_artboard(container, &board).is_err());
+    assert_eq!(file.to_bytes().unwrap(), before);
+    assert!(!file.layer(container).unwrap().is_artboard());
+
+    let mut nested = LayerTree::new(Layer::new_group("Outer Board"));
+    nested.layer.set_artboard(&board).unwrap();
+    let mut child = Layer::new_group("Nested Board");
+    child.set_artboard(&board).unwrap();
+    nested.push_child(LayerTree::new(child)).unwrap();
+    assert!(file.insert_layer_tree(None, None, nested).is_err());
+    assert_eq!(file.artboard_settings().unwrap().unwrap().count(), Some(3));
 }

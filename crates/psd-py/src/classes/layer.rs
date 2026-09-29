@@ -245,8 +245,8 @@ macro_rules! layer_class {
                 })
             }
 
-            /// `"image"`, `"group"`, `"text"`, `"smart_object"`, or
-            /// `"section_divider"`.
+            /// `"image"`, `"group"`, `"artboard"`, `"text"`, `"adjustment"`, `"shape"`,
+            /// `"smart_object"`, or `"section_divider"`.
             #[getter]
             fn kind(&self) -> PyResult<&'static str> {
                 self.handle.with_layer(|layer| {
@@ -254,10 +254,117 @@ macro_rules! layer_class {
                         layer_ops::Kind::Image => "image",
                         layer_ops::Kind::Group => "group",
                         layer_ops::Kind::Text => "text",
+                        layer_ops::Kind::Adjustment => "adjustment",
+                        layer_ops::Kind::Shape => "shape",
+                        layer_ops::Kind::Artboard => "artboard",
                         layer_ops::Kind::SmartObject => "smart_object",
                         layer_ops::Kind::Divider => "section_divider",
                     })
                 })
+            }
+
+            /// Whether this layer carries adjustment or fill settings.
+            fn is_adjustment_layer(&self) -> PyResult<bool> {
+                self.handle
+                    .with_layer(|layer| Ok(layer.is_adjustment_layer()))
+            }
+
+            /// Whether this layer carries a fill and a vector mask.
+            fn is_shape_layer(&self) -> PyResult<bool> {
+                self.handle.with_layer(|layer| Ok(layer.is_shape_layer()))
+            }
+
+            /// Whether this group carries artboard data.
+            fn is_artboard(&self) -> PyResult<bool> {
+                self.handle.with_layer(|layer| Ok(layer.is_artboard()))
+            }
+
+            /// The artboard tagged block as `(four_byte_key, payload_bytes)`.
+            fn artboard_block(&self) -> PyResult<Option<(String, Vec<u8>)>> {
+                layer_ops::artboard_block(&self.handle)
+            }
+
+            /// Artboard fields as a small dictionary, or `None` on a regular group.
+            fn artboard_info<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+                let artboard = self
+                    .handle
+                    .with_layer(|layer| layer.artboard().map_err(psd_error))?;
+                let Some(artboard) = artboard else {
+                    return Ok(None);
+                };
+                let info = PyDict::new(py);
+                if let Some(rect) = artboard.rect() {
+                    info.set_item("bounds", (rect.top, rect.left, rect.bottom, rect.right))?;
+                }
+                info.set_item("preset_name", artboard.preset_name())?;
+                info.set_item(
+                    "background_type",
+                    artboard.background().map(ArtboardBackground::as_raw),
+                )?;
+                info.set_item("guide_indices", artboard.guide_indices())?;
+                let color = artboard.background_color().and_then(Color::from_descriptor);
+                let rgb = match color {
+                    Some(Color::Rgb { red, green, blue }) => Some((red, green, blue)),
+                    _ => None,
+                };
+                info.set_item("background_color", rgb)?;
+                Ok(Some(info))
+            }
+
+            /// Set or replace the artboard block from a validated payload.
+            fn set_artboard_block(&self, key: &str, payload: Vec<u8>) -> PyResult<()> {
+                layer_ops::set_artboard_block(&self.handle, key, payload)
+            }
+
+            /// Remove artboard tagging from the group.
+            fn clear_artboard(&self) -> PyResult<bool> {
+                layer_ops::clear_artboard(&self.handle)
+            }
+
+            /// Adjustment/fill payloads as `(four_byte_key, payload_bytes)` pairs.
+            fn adjustment_blocks(&self) -> PyResult<Vec<(String, Vec<u8>)>> {
+                layer_ops::adjustment_blocks(&self.handle)
+            }
+
+            /// Add or replace a settings payload, such as `b"levl"` or `b"SoCo"`.
+            fn set_adjustment_block(&self, key: &str, payload: Vec<u8>) -> PyResult<()> {
+                layer_ops::set_adjustment(&self.handle, key, payload)
+            }
+
+            /// Remove one settings payload by its four-byte key.
+            fn clear_adjustment_block(&self, key: &str) -> PyResult<bool> {
+                layer_ops::clear_adjustment(&self.handle, key)
+            }
+
+            /// Vector payloads as `(four_byte_key, payload_bytes)` pairs.
+            fn vector_blocks(&self) -> PyResult<Vec<(String, Vec<u8>)>> {
+                layer_ops::vector_blocks(&self.handle)
+            }
+
+            /// Add or replace a vector payload, such as `b"vsms"` or `b"vscg"`.
+            fn set_vector_block(&self, key: &str, payload: Vec<u8>) -> PyResult<()> {
+                layer_ops::set_vector_block(&self.handle, key, payload)
+            }
+
+            /// Remove one vector payload by its four-byte key.
+            fn clear_vector_block(&self, key: &str) -> PyResult<bool> {
+                layer_ops::clear_vector_block(&self.handle, key)
+            }
+
+            /// Effects blocks as `(four_byte_key, payload_bytes)` pairs.
+            fn layer_effects_blocks(&self) -> PyResult<Vec<(String, Vec<u8>)>> {
+                layer_ops::layer_effects_blocks(&self.handle)
+            }
+
+            /// Replace the full modern effects descriptor, preserving unknown
+            /// fields and trailing bytes. The legacy `lrFX` mirror is regenerated.
+            fn set_layer_effects_block(&self, key: &str, payload: Vec<u8>) -> PyResult<()> {
+                layer_ops::set_layer_effects_block(&self.handle, key, payload)
+            }
+
+            /// Remove the descriptor and legacy effects blocks.
+            fn clear_layer_effects(&self) -> PyResult<()> {
+                layer_ops::clear_layer_effects(&self.handle)
             }
 
             fn __eq__(&self, other: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -298,7 +405,12 @@ macro_rules! layer_class {
                 layer_ops::Kind::SmartObject => {
                     Py::new(py, base.add_subclass(PySmartObjectLayer))?.into_any()
                 }
-                layer_ops::Kind::Divider => Py::new(py, base)?.into_any(),
+                layer_ops::Kind::Adjustment | layer_ops::Kind::Shape | layer_ops::Kind::Divider => {
+                    Py::new(py, base)?.into_any()
+                }
+                layer_ops::Kind::Artboard => {
+                    Py::new(py, base.add_subclass(PyGroupLayer))?.into_any()
+                }
             })
         }
 

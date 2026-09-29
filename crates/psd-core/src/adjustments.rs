@@ -1,4 +1,4 @@
-//! Read-only views of adjustment- and fill-layer settings blocks.
+//! Typed views and payload writers for adjustment- and fill-layer settings blocks.
 //!
 //! An adjustment layer stores its settings in one tagged block whose key names
 //! the adjustment (`levl`, `curv`, `hue2`, ...); a fill layer uses `SoCo`,
@@ -11,20 +11,17 @@
 //! chapter; the block payload is the matching preset file. The specification
 //! does not describe the `curv` map flag and `Crv ` extension, the `blnc`
 //! layout, or the 20-byte gradient-map color stop. Those layouts follow the
-//! public `psd-tools` (<https://github.com/psd-tools/psd-tools>) and `ag-psd-rs`
-//! (<https://github.com/Vasyanator/ag-psd-rs>) readers. Payload sizes match
-//! Photoshop-saved documents such as ag-psd's public
-//! `test/read/adjustment-layers/src.psd`.
+//! independent public readers. Payload sizes match Photoshop-saved documents.
 //!
 //! Upstream (`LayeredFile/LayerTypes/AdjustmentLayer.h`) only detects these
-//! keys and round-trips the layer as opaque data. These views add typed read
-//! access, but the original tagged block is still what gets written, so reading
-//! a view changes no bytes. Bytes after a known layout, such as alignment
-//! padding or newer data, remain in `trailing_bytes`.
+//! keys and round-trips the layer as opaque data. These views add typed access;
+//! raw tagged blocks remain the normal document write source. Explicitly
+//! serialized views preserve bytes after a known layout, such as alignment
+//! padding or newer data, in `trailing_bytes`.
 
 use crate::descriptor::{Descriptor, DescriptorKey, DescriptorValue};
-use crate::error::Result;
-use crate::io::BeReader;
+use crate::error::{PsdError, Result};
+use crate::io::{BeReader, BeWriter};
 use crate::strings::UnicodeString;
 use crate::tagged_blocks::{TaggedBlock, TaggedBlockKey};
 use crate::types::RawColor;
@@ -147,6 +144,19 @@ pub struct AdjustmentBlock {
 }
 
 impl AdjustmentBlock {
+    /// Create a typed settings block for an adjustment or fill kind.
+    pub fn new(kind: AdjustmentKind, data: AdjustmentData) -> Result<Self> {
+        if !data.matches_kind(kind) {
+            return Err(invalid_adjustment("adjustment kind and data do not match"));
+        }
+        data.to_payload()?;
+        Ok(Self {
+            key: kind.key(),
+            kind,
+            data,
+        })
+    }
+
     /// Parse a recognized adjustment block. Other tagged blocks return `None`.
     /// A malformed or unsupported payload is an error only when this view is
     /// requested; the raw block is never modified.
@@ -160,6 +170,19 @@ impl AdjustmentBlock {
             kind,
             data,
         }))
+    }
+
+    /// Serialize this typed settings block under its adjustment key.
+    ///
+    /// The block is built from the typed values, including their preserved
+    /// trailing bytes. Unknown data inside a descriptor is preserved by the
+    /// descriptor model; fields the typed model cannot represent are written
+    /// using their format defaults.
+    pub fn to_tagged_block(&self) -> Result<TaggedBlock> {
+        if self.key != self.kind.key() || !self.data.matches_kind(self.kind) {
+            return Err(invalid_adjustment("adjustment kind and data do not match"));
+        }
+        Ok(TaggedBlock::new(self.key, self.data.to_payload()?))
     }
 }
 
@@ -265,6 +288,401 @@ impl AdjustmentData {
             }
         })
     }
+
+    /// Serialize these typed settings into the payload stored by the matching
+    /// adjustment or fill tagged block.
+    pub fn to_payload(&self) -> Result<Vec<u8>> {
+        let mut writer = BeWriter::new();
+        match self {
+            Self::Fill(fill) => {
+                write_versioned_descriptor(&mut writer, &fill.descriptor, &fill.trailing_bytes)?
+            }
+            Self::BrightnessContrast(value) => {
+                writer.i16(value.brightness);
+                writer.i16(value.contrast);
+                writer.i16(value.mean_value);
+                writer.u8(u8::from(value.lab_only));
+                writer.bytes(&value.trailing_bytes);
+            }
+            Self::Levels(value) => write_levels(&mut writer, value)?,
+            Self::Curves(value) => write_curves(&mut writer, value)?,
+            Self::Exposure(value) => {
+                require_version(value.version, 1, "unsupported exposure version")?;
+                writer.u16(value.version);
+                writer.f32(value.exposure);
+                writer.f32(value.offset);
+                writer.f32(value.gamma);
+                writer.bytes(&value.trailing_bytes);
+            }
+            Self::Vibrance(value) => {
+                write_versioned_descriptor(&mut writer, &value.descriptor, &value.trailing_bytes)?
+            }
+            Self::HueSaturation(value) => write_hue_saturation(&mut writer, value)?,
+            Self::ColorBalance(value) => {
+                write_color_balance_values(&mut writer, value.shadows);
+                write_color_balance_values(&mut writer, value.midtones);
+                write_color_balance_values(&mut writer, value.highlights);
+                writer.u8(u8::from(value.preserve_luminosity));
+                writer.bytes(&value.trailing_bytes);
+            }
+            Self::BlackAndWhite(value) => {
+                write_versioned_descriptor(&mut writer, &value.descriptor, &value.trailing_bytes)?
+            }
+            Self::PhotoFilter(value) => write_photo_filter(&mut writer, value)?,
+            Self::ChannelMixer(value) => write_channel_mixer(&mut writer, value)?,
+            Self::ColorLookup(value) => {
+                require_version(value.version, 1, "unsupported color-lookup version")?;
+                writer.u16(value.version);
+                write_versioned_descriptor(&mut writer, &value.descriptor, &value.trailing_bytes)?;
+            }
+            Self::Invert { trailing_bytes } => writer.bytes(trailing_bytes),
+            Self::Posterize(value) => {
+                writer.u16(value.levels);
+                writer.bytes(&value.trailing_bytes);
+            }
+            Self::Threshold(value) => {
+                writer.u16(value.level);
+                writer.bytes(&value.trailing_bytes);
+            }
+            Self::GradientMap(value) => write_gradient_map(&mut writer, value)?,
+            Self::SelectiveColor(value) => write_selective_color(&mut writer, value)?,
+            Self::ContentGenerator(value) => {
+                write_versioned_descriptor(&mut writer, &value.descriptor, &value.trailing_bytes)?
+            }
+        }
+        Ok(writer.into_inner())
+    }
+
+    fn matches_kind(&self, kind: AdjustmentKind) -> bool {
+        matches!(
+            (kind, self),
+            (
+                AdjustmentKind::SolidColor
+                    | AdjustmentKind::GradientFill
+                    | AdjustmentKind::PatternFill,
+                Self::Fill(_)
+            ) | (
+                AdjustmentKind::BrightnessContrast,
+                Self::BrightnessContrast(_)
+            ) | (AdjustmentKind::Levels, Self::Levels(_))
+                | (AdjustmentKind::Curves, Self::Curves(_))
+                | (AdjustmentKind::Exposure, Self::Exposure(_))
+                | (AdjustmentKind::Vibrance, Self::Vibrance(_))
+                | (
+                    AdjustmentKind::HueSaturation | AdjustmentKind::LegacyHueSaturation,
+                    Self::HueSaturation(_)
+                )
+                | (AdjustmentKind::ColorBalance, Self::ColorBalance(_))
+                | (AdjustmentKind::BlackAndWhite, Self::BlackAndWhite(_))
+                | (AdjustmentKind::PhotoFilter, Self::PhotoFilter(_))
+                | (AdjustmentKind::ChannelMixer, Self::ChannelMixer(_))
+                | (AdjustmentKind::ColorLookup, Self::ColorLookup(_))
+                | (AdjustmentKind::Invert, Self::Invert { .. })
+                | (AdjustmentKind::Posterize, Self::Posterize(_))
+                | (AdjustmentKind::Threshold, Self::Threshold(_))
+                | (AdjustmentKind::GradientMap, Self::GradientMap(_))
+                | (AdjustmentKind::SelectiveColor, Self::SelectiveColor(_))
+                | (AdjustmentKind::ContentGenerator, Self::ContentGenerator(_))
+        )
+    }
+}
+
+fn invalid_adjustment(message: &'static str) -> PsdError {
+    PsdError::InvalidData { offset: 0, message }
+}
+
+fn require_version(actual: u16, expected: u16, message: &'static str) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(invalid_adjustment(message))
+    }
+}
+
+fn checked_u16_len(len: usize) -> Result<u16> {
+    u16::try_from(len).map_err(|_| PsdError::LengthOverflow {
+        actual: len as u64,
+        width: 2,
+    })
+}
+
+fn checked_u32_len(len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| PsdError::LengthOverflow {
+        actual: len as u64,
+        width: 4,
+    })
+}
+
+fn write_versioned_descriptor(
+    writer: &mut BeWriter,
+    descriptor: &Descriptor,
+    trailing_bytes: &[u8],
+) -> Result<()> {
+    writer.u32(16);
+    descriptor.write(writer)?;
+    writer.bytes(trailing_bytes);
+    Ok(())
+}
+
+fn write_levels(writer: &mut BeWriter, levels: &Levels) -> Result<()> {
+    require_version(levels.version, 2, "unsupported levels version")?;
+    if levels.records.len() < LEGACY_LEVELS_RECORDS {
+        return Err(invalid_adjustment(
+            "levels payload has fewer than 29 records",
+        ));
+    }
+    match levels.extension_version {
+        None if levels.records.len() != LEGACY_LEVELS_RECORDS => {
+            return Err(invalid_adjustment(
+                "levels records beyond the first 29 need a Lvls extension",
+            ));
+        }
+        Some(3) => {
+            checked_u16_len(levels.records.len())?;
+        }
+        Some(_) => return Err(invalid_adjustment("unsupported Lvls extension version")),
+        None => {}
+    }
+    writer.u16(levels.version);
+    for record in &levels.records[..LEGACY_LEVELS_RECORDS] {
+        write_levels_record(writer, record);
+    }
+    if let Some(extension_version) = levels.extension_version {
+        writer.bytes(b"Lvls");
+        writer.u16(extension_version);
+        writer.u16(checked_u16_len(levels.records.len())?);
+        for record in &levels.records[LEGACY_LEVELS_RECORDS..] {
+            write_levels_record(writer, record);
+        }
+    }
+    writer.bytes(&levels.trailing_bytes);
+    Ok(())
+}
+
+fn write_levels_record(writer: &mut BeWriter, record: &LevelsRecord) {
+    writer.u16(record.input_floor);
+    writer.u16(record.input_ceiling);
+    writer.u16(record.output_floor);
+    writer.u16(record.output_ceiling);
+    writer.u16(record.gamma);
+}
+
+fn write_curve_data(writer: &mut BeWriter, data: &CurveData, is_map: bool) -> Result<()> {
+    if matches!(data, CurveData::Map(_)) != is_map {
+        return Err(invalid_adjustment(
+            "curve data does not match the payload's map flag",
+        ));
+    }
+    match data {
+        CurveData::Points(points) => {
+            writer.u16(checked_u16_len(points.len())?);
+            for point in points {
+                writer.u16(point.output);
+                writer.u16(point.input);
+            }
+        }
+        CurveData::Map(values) => {
+            if values.len() != 256 {
+                return Err(invalid_adjustment("a curve map must contain 256 values"));
+            }
+            writer.bytes(values);
+        }
+    }
+    Ok(())
+}
+
+fn write_curves(writer: &mut BeWriter, curves: &Curves) -> Result<()> {
+    if !matches!(curves.version, 1 | 4) {
+        return Err(invalid_adjustment("unsupported curves version"));
+    }
+    let selector = if curves.version == 1 {
+        let mut selector = 0u32;
+        let mut previous = None;
+        for curve in &curves.curves {
+            if curve.channel >= 32 || previous.is_some_and(|channel| channel >= curve.channel) {
+                return Err(invalid_adjustment(
+                    "version-1 curves need unique, ascending channel ids below 32",
+                ));
+            }
+            selector |= 1u32 << curve.channel;
+            previous = Some(curve.channel);
+        }
+        selector
+    } else {
+        for (index, curve) in curves.curves.iter().enumerate() {
+            if usize::from(curve.channel) != index {
+                return Err(invalid_adjustment(
+                    "version-4 curve channels must match their stored indices",
+                ));
+            }
+        }
+        checked_u32_len(curves.curves.len())?
+    };
+
+    writer.u8(u8::from(curves.is_map));
+    writer.u16(curves.version);
+    writer.u32(selector);
+    for curve in &curves.curves {
+        write_curve_data(writer, &curve.data, curves.is_map)?;
+    }
+    if let Some(extension) = &curves.extension {
+        writer.bytes(b"Crv ");
+        writer.u16(extension.version);
+        writer.u32(checked_u32_len(extension.curves.len())?);
+        for curve in &extension.curves {
+            writer.u16(curve.channel);
+            write_curve_data(writer, &curve.data, curves.is_map)?;
+        }
+    }
+    writer.bytes(&curves.trailing_bytes);
+    Ok(())
+}
+
+fn write_hue_saturation(writer: &mut BeWriter, hue: &HueSaturation) -> Result<()> {
+    require_version(hue.version, 2, "unsupported hue/saturation version")?;
+    writer.u16(hue.version);
+    writer.u8(u8::from(hue.colorize));
+    writer.u8(0);
+    write_hue_values(writer, hue.colorization);
+    write_hue_values(writer, hue.master);
+    for range in &hue.ranges {
+        for value in range.range {
+            writer.i16(value);
+        }
+        write_hue_values(writer, range.values);
+    }
+    writer.bytes(&hue.trailing_bytes);
+    Ok(())
+}
+
+fn write_hue_values(writer: &mut BeWriter, values: HueSaturationValues) {
+    writer.i16(values.hue);
+    writer.i16(values.saturation);
+    writer.i16(values.lightness);
+}
+
+fn write_color_balance_values(writer: &mut BeWriter, values: ColorBalanceValues) {
+    writer.i16(values.cyan_red);
+    writer.i16(values.magenta_green);
+    writer.i16(values.yellow_blue);
+}
+
+fn write_photo_filter(writer: &mut BeWriter, filter: &PhotoFilter) -> Result<()> {
+    match (filter.version, filter.color) {
+        (2, PhotoFilterColor::Color(color)) => {
+            writer.u16(filter.version);
+            write_raw_color(writer, color);
+        }
+        (3, PhotoFilterColor::Xyz(components)) => {
+            writer.u16(filter.version);
+            for component in components {
+                writer.i32(component);
+            }
+        }
+        _ => {
+            return Err(invalid_adjustment(
+                "photo-filter version and color do not match",
+            ))
+        }
+    }
+    writer.u32(filter.density);
+    writer.u8(u8::from(filter.preserve_luminosity));
+    writer.bytes(&filter.trailing_bytes);
+    Ok(())
+}
+
+fn write_channel_mixer(writer: &mut BeWriter, mixer: &ChannelMixer) -> Result<()> {
+    require_version(mixer.version, 1, "unsupported channel-mixer version")?;
+    writer.u16(mixer.version);
+    writer.u16(u16::from(mixer.monochrome));
+    for mix in &mixer.mixes {
+        for value in mix.sources {
+            writer.i16(value);
+        }
+        writer.i16(mix.constant);
+    }
+    writer.bytes(&mixer.trailing_bytes);
+    Ok(())
+}
+
+fn write_gradient_map(writer: &mut BeWriter, map: &GradientMap) -> Result<()> {
+    match (map.version, map.method) {
+        (1, None) | (3, Some(_)) => {}
+        _ => {
+            return Err(invalid_adjustment(
+                "gradient-map version and method do not match",
+            ))
+        }
+    }
+    writer.u16(map.version);
+    writer.u8(u8::from(map.reversed));
+    writer.u8(u8::from(map.dithered));
+    if let Some(method) = map.method {
+        writer.bytes(&method);
+    }
+    UnicodeString::new(map.name.as_str(), 1)?.write(writer)?;
+    writer.u16(checked_u16_len(map.color_stops.len())?);
+    for stop in &map.color_stops {
+        writer.u32(stop.location);
+        writer.u32(stop.midpoint);
+        write_raw_color(writer, stop.color);
+        writer.u16(0);
+    }
+    writer.u16(checked_u16_len(map.transparency_stops.len())?);
+    for stop in &map.transparency_stops {
+        writer.u32(stop.location);
+        writer.u32(stop.midpoint);
+        writer.u16(stop.opacity);
+    }
+    writer.u16(2);
+    writer.u16(map.interpolation);
+    writer.u16(32);
+    writer.u16(map.mode);
+    writer.u32(map.random_seed);
+    writer.u16(u16::from(map.show_transparency));
+    writer.u16(u16::from(map.use_vector_color));
+    writer.u32(map.roughness);
+    writer.u16(map.color_model);
+    for component in map.minimum_color {
+        writer.u16(component);
+    }
+    for component in map.maximum_color {
+        writer.u16(component);
+    }
+    writer.bytes(&map.trailing_bytes);
+    Ok(())
+}
+
+fn write_raw_color(writer: &mut BeWriter, color: RawColor) {
+    writer.u16(color.color_space);
+    for component in color.components {
+        writer.u16(component);
+    }
+}
+
+fn write_selective_color(writer: &mut BeWriter, value: &SelectiveColor) -> Result<()> {
+    require_version(value.version, 1, "unsupported selective-color version")?;
+    writer.u16(value.version);
+    writer.u16(u16::from(value.absolute));
+    for correction in [
+        value.reserved,
+        value.reds,
+        value.yellows,
+        value.greens,
+        value.cyans,
+        value.blues,
+        value.magentas,
+        value.whites,
+        value.neutrals,
+        value.blacks,
+    ] {
+        writer.i16(correction.cyan);
+        writer.i16(correction.magenta);
+        writer.i16(correction.yellow);
+        writer.i16(correction.black);
+    }
+    writer.bytes(&value.trailing_bytes);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +768,7 @@ impl Levels {
             records.push(LevelsRecord::read(reader)?);
         }
         // Anything other than a `Lvls` marker stays in `trailing_bytes`.
-        // psd-tools notes that Clip Studio Paint writes a damaged marker here.
+        // A third-party parser reports that Clip Studio Paint writes a damaged marker here.
         let mut extension_version = None;
         if next_is(reader, b"Lvls") && reader.remaining() >= 8 {
             reader.skip(4)?;
@@ -698,7 +1116,7 @@ pub struct ChannelMixer {
     pub version: u16,
     pub monochrome: bool,
     /// Every complete 10-byte mix in stored order. RGB documents store four
-    /// (red, green, blue, gray). In monochrome mode, ag-psd-rs reads the gray
+    /// (red, green, blue, gray). In monochrome mode, a third-party parser reads the gray
     /// mix from the first record.
     pub mixes: Vec<ChannelMix>,
     pub trailing_bytes: Vec<u8>,
@@ -1705,6 +2123,55 @@ mod tests {
         let red = settings.color().unwrap().get("Rd  ").unwrap();
         assert_eq!(red.as_double(), Some(255.0));
         assert_eq!(settings.gradient(), None);
+    }
+
+    #[test]
+    fn curves_writers_reject_map_flags_that_disagree_with_legacy_or_extension_data() {
+        for is_map in [false, true] {
+            let points = CurveData::Points(vec![
+                CurvePoint {
+                    output: 0,
+                    input: 0,
+                },
+                CurvePoint {
+                    output: 255,
+                    input: 255,
+                },
+            ]);
+            let map = CurveData::Map((0..=255).collect());
+            let (data, wrong_data) = if is_map { (map, points) } else { (points, map) };
+            let mut curves = Curves {
+                is_map,
+                version: 1,
+                curves: vec![Curve {
+                    channel: 0,
+                    data: data.clone(),
+                }],
+                extension: Some(CurvesExtension {
+                    version: 4,
+                    curves: vec![Curve { channel: 0, data }],
+                }),
+                trailing_bytes: vec![],
+            };
+            let valid = AdjustmentBlock::new(
+                AdjustmentKind::Curves,
+                AdjustmentData::Curves(curves.clone()),
+            )
+            .unwrap();
+            assert_eq!(
+                AdjustmentBlock::read(&valid.to_tagged_block().unwrap()).unwrap(),
+                Some(valid)
+            );
+
+            curves.is_map = !is_map;
+            assert!(AdjustmentData::Curves(curves.clone()).to_payload().is_err());
+            curves.is_map = is_map;
+            curves.extension.as_mut().unwrap().curves[0].data = wrong_data;
+            assert!(
+                AdjustmentBlock::new(AdjustmentKind::Curves, AdjustmentData::Curves(curves),)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

@@ -11,10 +11,9 @@
 //! the same parser the port's adjustment and effect views use.
 //!
 //! All three readers are read-only and take a byte slice, returning owned data.
-//! The reference for the on-disk layouts is the ag-psd port in this workspace
-//! (`ag-psd-rs`, itself a port of the battle-tested TypeScript ag-psd); none of
-//! the three formats has an official Adobe specification, so where sources
-//! disagree the reference's reading of real Photoshop files wins.
+//! A separate public Rust parser is the main reference for the on-disk layouts;
+//! none of the three formats has an official Adobe specification, so where
+//! sources disagree, real Photoshop-saved files decide the result.
 //!
 //! Deliberately unsupported, each with a named error rather than a guess:
 //! `.abr` major versions 1 and 2 (the pre-CS entry-stream layout, for which no

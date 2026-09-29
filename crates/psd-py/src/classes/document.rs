@@ -332,6 +332,141 @@ macro_rules! document_class {
                 tree_ops::add_child(None, Some(&self.inner), &handle)
             }
 
+            /// Create an adjustment/fill layer from a recognized four-byte key
+            /// and its PSD payload. Pass a group or group path to `parent` to
+            /// nest it.
+            #[pyo3(signature = (name, key, payload, parent=None))]
+            fn add_adjustment_layer(
+                &self,
+                name: String,
+                key: &str,
+                payload: Vec<u8>,
+                parent: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<()> {
+                check_name(&name)?;
+                let settings = layer_ops::adjustment_block(key, payload)?;
+                let parent = match parent {
+                    None => None,
+                    Some(parent) if parent.is_none() => None,
+                    Some(parent) => Some(self.resolve(parent)?),
+                };
+                write_document(&self.inner, |file| {
+                    let added = match parent {
+                        Some(group) => file.add_adjustment_layer_to_group(group, &name, &settings),
+                        None => file.add_adjustment_layer(&name, &settings),
+                    };
+                    added.map(|_| ()).map_err(psd_error)
+                })
+            }
+
+            /// Create a shape from typed layer-block payloads. `bounds` is
+            /// `(top, left, bottom, right)` and `blocks` is a list of
+            /// `(four_byte_key, payload_bytes)` pairs. Pass `parent` to nest it.
+            #[pyo3(signature = (name, bounds, blocks, parent=None))]
+            fn add_shape_layer(
+                &self,
+                name: String,
+                bounds: (i32, i32, i32, i32),
+                blocks: Vec<(String, Vec<u8>)>,
+                parent: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<()> {
+                check_name(&name)?;
+                let blocks = layer_ops::shape_blocks(blocks)?;
+                let bounds = Rect::new(bounds.0, bounds.1, bounds.2, bounds.3);
+                let parent = match parent {
+                    None => None,
+                    Some(parent) if parent.is_none() => None,
+                    Some(parent) => Some(self.resolve(parent)?),
+                };
+                write_document(&self.inner, |file| {
+                    let added = match parent {
+                        Some(group) => {
+                            file.add_shape_layer_from_blocks_to_group(group, &name, bounds, &blocks)
+                        }
+                        None => file.add_shape_layer_from_blocks(&name, bounds, &blocks),
+                    };
+                    added.map(|_| ()).map_err(psd_error)
+                })
+            }
+
+            /// Add a root artboard with a rectangle and optional background
+            /// settings. `bounds` is `(top, left, bottom, right)`; background
+            /// type values follow Photoshop's artboard descriptor.
+            #[pyo3(signature = (name, bounds, preset_name=None, background_type=3, background_color=None, guide_indices=None))]
+            fn add_artboard(
+                &self,
+                name: String,
+                bounds: (f64, f64, f64, f64),
+                preset_name: Option<String>,
+                background_type: i32,
+                background_color: Option<(f64, f64, f64)>,
+                guide_indices: Option<Vec<i32>>,
+            ) -> PyResult<()> {
+                check_name(&name)?;
+                let background_color = background_color.map(|(red, green, blue)| {
+                    Color::Rgb { red, green, blue }
+                });
+                let artboard = psd::core::Artboard::new(
+                    ArtboardRect {
+                        top: bounds.0,
+                        left: bounds.1,
+                        bottom: bounds.2,
+                        right: bounds.3,
+                    },
+                    preset_name.as_deref(),
+                    ArtboardBackground::from_raw(background_type),
+                    background_color,
+                    guide_indices.as_deref().unwrap_or_default(),
+                )
+                .map_err(psd_error)?;
+                write_document(&self.inner, |file| {
+                    file.add_artboard(&name, &artboard)
+                        .map(|_| ())
+                        .map_err(psd_error)
+                })
+            }
+
+            /// The document's artboard groups, top to bottom.
+            #[getter]
+            fn artboards(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+                let ids = read_document(&self.inner, |file| {
+                    Ok(tree_ops::flat_ids(file)
+                        .into_iter()
+                        .filter(|&id| file.layer(id).is_some_and(|layer| layer.is_artboard()))
+                        .collect())
+                })?;
+                self.wrap_ids(py, ids)
+            }
+
+            /// The document-level artboard settings payload, when present.
+            #[getter]
+            fn artboard_settings<'py>(
+                &self,
+                py: Python<'py>,
+            ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+                let data = read_document(&self.inner, |file| {
+                    Ok(file
+                        .document_blocks
+                        .as_ref()
+                        .and_then(|blocks| blocks.get(TaggedBlockKey::new(*b"artd")))
+                        .map(|block| block.data.clone()))
+                })?;
+                Ok(data.map(|data| PyBytes::new(py, &data)))
+            }
+
+            /// Replace document-level artboard settings from an `artd` payload.
+            #[setter]
+            fn set_artboard_settings(&self, payload: Vec<u8>) -> PyResult<()> {
+                let settings = ArtboardSettings::read(&payload).map_err(psd_error)?;
+                write_document(&self.inner, |file| {
+                    file.set_artboard_settings(&settings).map_err(psd_error)
+                })
+            }
+
+            fn clear_artboard_settings(&self) -> PyResult<bool> {
+                write_document(&self.inner, |file| Ok(file.clear_artboard_settings()))
+            }
+
             /// Move `child` (layer or path) under `parent` (group layer or
             /// path; the root when omitted), at the bottom like upstream.
             #[pyo3(signature = (child, parent=None))]

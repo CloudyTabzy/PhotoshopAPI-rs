@@ -10,8 +10,9 @@
 use std::path::{Path, PathBuf};
 
 use psd::core::{
-    Bevel, ColorMode, ColorOverlay, Glow, GlowKind, GradientOverlay, LayerEffects, Satin, Shadow,
-    ShadowKind, Stroke, TaggedBlock, TaggedBlockKey,
+    effects_block_data, Bevel, ColorMode, ColorOverlay, DescriptorValue, Glow, GlowKind,
+    GradientOverlay, LayerEffects, LayerEffectsBlock, LayerEffectsData, Satin, Shadow, ShadowKind,
+    Stroke, TaggedBlock, TaggedBlockKey, Version,
 };
 use psd::{BitDepth, Layer, LayeredFile, Rect};
 
@@ -157,6 +158,66 @@ fn an_edit_changes_what_it_names_and_keeps_everything_else() {
     assert!(effects.bevel.is_none());
     assert!(effects.satin.is_some() && effects.outer_glow.is_some());
     assert_eq!(effects.modifying_count(), 8);
+}
+
+#[test]
+fn full_effects_payloads_keep_unknown_data_through_replacement_and_typed_edits() {
+    let mut file = document();
+    file.version = Version::Psb;
+    let mut root = full_set().to_descriptor();
+    root.set("futureEffectData", DescriptorValue::long(7));
+    let mut payload = effects_block_data(&root).unwrap();
+    payload.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+    let mut raw = TaggedBlock::new(TaggedBlockKey::new(*b"lmfx"), payload);
+    raw.signature = *b"8B64";
+    edit(&mut file, |layer| {
+        layer.set_layer_effects_block(&raw).unwrap()
+    });
+    assert_eq!(styled_layer(&file).blocks.blocks[0], raw);
+    let LayerEffectsData::Modern(original) = LayerEffectsBlock::read(&raw).unwrap().unwrap().data
+    else {
+        panic!("modern effects expected")
+    };
+    assert_eq!(original.to_payload().unwrap(), raw.data);
+    let before = styled_layer(&file).blocks.clone();
+    edit(&mut file, |layer| {
+        layer.set_layer_effects_block(&raw).unwrap()
+    });
+    assert_eq!(styled_layer(&file).blocks, before);
+
+    edit(&mut file, |layer| {
+        let mut effects = layer.layer_effects().unwrap().unwrap();
+        effects.drop_shadows[0].distance = Some(40.0);
+        layer.set_layer_effects(&effects).unwrap();
+    });
+    let back = reread(&file);
+    let block = &styled_layer(&back).blocks.blocks[0];
+    assert_eq!(block.key, raw.key);
+    assert_eq!(block.signature, raw.signature);
+    let LayerEffectsData::Modern(edited) = LayerEffectsBlock::read(block).unwrap().unwrap().data
+    else {
+        panic!("modern effects expected")
+    };
+    assert_eq!(
+        edited
+            .descriptor
+            .get("futureEffectData")
+            .unwrap()
+            .as_integer(),
+        Some(7)
+    );
+    assert_eq!(edited.trailing_bytes, original.trailing_bytes);
+    assert_eq!(
+        record_u32(&mirror(styled_layer(&back)), b"dsdw", 16),
+        40 << 16
+    );
+
+    edit(&mut file, |layer| {
+        let before = layer.blocks.clone();
+        let malformed = TaggedBlock::new(raw.key, vec![0; 8]);
+        assert!(layer.set_layer_effects_block(&malformed).is_err());
+        assert_eq!(layer.blocks, before);
+    });
 }
 
 #[test]

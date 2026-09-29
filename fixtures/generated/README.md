@@ -12,11 +12,10 @@ generator is deterministic: running it again with unchanged code reproduces
 every file byte for byte.
 
 Payload layouts follow what Photoshop writes. The sources are the Adobe PSD/PSB
-specification and Photoshop-saved samples. The documents were also checked with
-[psd-tools](https://github.com/psd-tools/psd-tools) 1.19, a reader that shares
-no code with this port. It reads every settings block with the values the tests
-assert. Photoshop has not opened these files, so use them to test the format,
-not as rendering references.
+specification and Photoshop-saved samples. An independent third-party reader
+also reads every settings block with the values the tests assert. Photoshop has
+not opened these files, so use them to test the format, not as rendering
+references.
 
 ## Adjustments/
 

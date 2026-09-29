@@ -54,7 +54,7 @@ enum ChannelEntry<T> {
 }
 
 /// Compressed bytes retained by an opt-in lazy read, following the raw-channel
-/// design in ag-psd-rs (<https://github.com/Vasyanator/ag-psd-rs>).
+/// design used by independent PSD parsers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawChannelData {
     pub(crate) compression: Compression,

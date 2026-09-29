@@ -9,7 +9,7 @@
 //! Module map (upstream reference in parentheses):
 //! - [`layered_file`]: `LayeredFile<T>` read/write orchestration (`LayeredFile.h`, `Impl/LayeredFileImpl.h`)
 //! - [`smart_object`]: linked-source lookup, decoding, and transactional replacement (`SmartObjectLayer.h`, `LinkedLayerData.h`)
-//! - [`layer`]: `Layer { common, kind }` + `LayerKind` enum — Image/Text/Group/SectionDivider (`LayerTypes/`)
+//! - [`layer`]: `Layer { common, kind }` + `LayerKind` enum — Image/Text/Adjustment/Shape/Group/SectionDivider (`LayerTypes/`)
 //! - [`tree`]: removing, moving, and inserting layers; detached [`LayerTree`]s (`LayeredFile::move_layer`/`remove_layer`)
 //! - [`channels`]: planar channel store keyed by `ChannelKey` (alpha = -1, user mask = -2) (`ImageDataMixins.h`, `Core/Struct/ImageChannel.h`)
 //! - `bitdepth`: the [`BitDepth`] sample-type trait (`bpp8_t`/`bpp16_t`/`bpp32_t`)
@@ -40,7 +40,9 @@ pub use psd_core as core;
 pub use bitdepth::BitDepth;
 pub use channels::{ChannelKey, ChannelStore};
 pub use geometry::{BezierSurface, BoundingBox, Homography, MeshVertex, Point2, QuadMesh};
-pub use layer::{GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Rect, TextLayer};
+pub use layer::{
+    AdjustmentLayer, GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Rect, ShapeLayer, TextLayer,
+};
 pub use layered_file::{color_channel_count, LayeredFile, ReadOptions, DEFAULT_TOTAL_MEMORY_LIMIT};
 pub use progress::ProgressEvent;
 pub use render::{composite_rgb, render_warped, Interpolation, Raster, WarpRenderOptions};

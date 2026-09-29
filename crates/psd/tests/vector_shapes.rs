@@ -5,8 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use psd::core::vector::{BezierKnot, DocumentPath, Subpath, VectorContent, VectorStroke};
-use psd::core::{AdjustmentKind, TaggedBlock, TaggedBlockKey, VectorData};
-use psd::{Layer, LayeredFile};
+use psd::core::{AdjustmentKind, ColorMode, TaggedBlock, TaggedBlockKey, VectorData};
+use psd::{Layer, LayerKind, LayeredFile, Rect};
 
 fn fixture(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -79,6 +79,7 @@ fn origination(layer: &Layer<u8>) -> Vec<(Option<i32>, Option<i32>)> {
 fn check_generated(file: &LayeredFile<u8>) {
     for name in ["Legacy Rectangle", "Ellipse", "Frame", "Open Line"] {
         assert!(layer(file, name).is_shape_layer(), "{name}");
+        assert!(matches!(&layer(file, name).kind, LayerKind::Shape(_)));
     }
     for name in ["Background", "Masked Pixels"] {
         assert!(!layer(file, name).is_shape_layer(), "{name}");
@@ -273,6 +274,81 @@ fn vector_data_round_trips_byte_for_byte() {
         .and_then(|blocks| blocks.get(TaggedBlockKey::new(*b"pths")))
         .unwrap();
     assert_eq!(&pths.signature, b"8B64");
+}
+
+#[test]
+fn shape_layer_builders_round_trip_modern_and_legacy_blocks() {
+    let mut incomplete = LayeredFile::<u8>::new(ColorMode::Rgb, 64, 64).unwrap();
+    incomplete.add_layer(Layer::<u8>::new_shape("Incomplete", Rect::default()));
+    assert!(incomplete.to_bytes().is_err());
+
+    let source = LayeredFile::<u8>::read(fixture(GENERATED[0])).unwrap();
+    let ellipse = layer(&source, "Ellipse");
+    let ellipse_blocks = ellipse.vector_blocks().unwrap();
+    let mut edited = ellipse.clone();
+    edited
+        .blocks
+        .get_mut(ellipse_blocks[0].key)
+        .unwrap()
+        .signature = *b"8B64";
+    let before = edited.blocks.clone();
+    edited.set_vector_block(&ellipse_blocks[0]).unwrap();
+    assert_eq!(edited.blocks, before);
+    assert!(!edited.clear_vector_block(TaggedBlockKey::new(*b"luni")));
+    assert_eq!(edited.blocks, before);
+    let legacy = layer(&source, "Legacy Rectangle");
+    let mut legacy_blocks = vec![legacy
+        .adjustments()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .to_tagged_block()
+        .unwrap()];
+    legacy_blocks.extend(
+        legacy
+            .vector_blocks()
+            .unwrap()
+            .iter()
+            .map(|block| block.to_tagged_block().unwrap()),
+    );
+
+    let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 64, 64).unwrap();
+    let group = document.add_layer(Layer::new_group("Shapes"));
+    for bounds in [
+        Rect::new(0, 0, -1, 4),
+        Rect::new(i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+    ] {
+        assert!(document
+            .add_shape_layer("Invalid", bounds, &ellipse_blocks)
+            .is_err());
+        assert!(document
+            .add_shape_layer_from_blocks("Invalid", bounds, &legacy_blocks)
+            .is_err());
+        assert_eq!(document.layer_count(), 1);
+    }
+    document
+        .add_shape_layer_to_group(group, "Modern", ellipse.bounds, &ellipse_blocks)
+        .unwrap();
+    document
+        .add_shape_layer_from_blocks("Legacy", legacy.bounds, &legacy_blocks)
+        .unwrap();
+
+    let bytes = document.to_bytes().unwrap();
+    let back = LayeredFile::<u8>::from_bytes(&bytes).unwrap();
+    let modern = layer(&back, "Modern");
+    let old = layer(&back, "Legacy");
+    assert!(matches!(&modern.kind, LayerKind::Shape(_)));
+    assert!(matches!(&old.kind, LayerKind::Shape(_)));
+    assert_eq!(modern.vector_blocks().unwrap(), ellipse_blocks);
+    assert!(old
+        .adjustment(AdjustmentKind::SolidColor)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        old.vector_blocks().unwrap(),
+        legacy.vector_blocks().unwrap()
+    );
 }
 
 #[test]

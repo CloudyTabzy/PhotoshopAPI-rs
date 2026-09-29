@@ -414,9 +414,7 @@ impl BlendMode {
 }
 
 /// Descriptor blend modes as `(historical ID, Photoshop 2026 ID, record key)`.
-/// The historical IDs follow the public ag-psd-rs table
-/// (<https://github.com/Vasyanator/ag-psd-rs>); the 2026 IDs are the ones a
-/// Photoshop 2026 document writes for every layer-record blend mode.
+/// Historical IDs and the long IDs written by recent Photoshop versions.
 const DESCRIPTOR_BLEND_MODES: [(&[u8], &[u8], BlendMode); 28] = [
     (b"Nrml", b"normal", BlendMode::NORMAL),
     (b"Dslv", b"dissolve", BlendMode::DISSOLVE),

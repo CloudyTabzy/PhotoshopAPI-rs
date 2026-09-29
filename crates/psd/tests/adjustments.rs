@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use psd::core::{
     adjustments::{CurveData, CurvePoint, PhotoFilterColor},
-    AdjustmentData, AdjustmentKind, AdjustmentPreset, TaggedBlock,
+    AdjustmentBlock, AdjustmentData, AdjustmentKind, AdjustmentPreset, TaggedBlock, TaggedBlockKey,
 };
-use psd::{BitDepth, Layer, LayeredFile};
+use psd::{BitDepth, Layer, LayerKind, LayeredFile, Rect, TextLayerBuilder};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -73,6 +73,7 @@ fn check<T: BitDepth>(file: &LayeredFile<T>) {
     for (name, kind) in expected_kinds {
         let layer = layer(file, name);
         assert!(layer.is_adjustment_layer(), "{name}");
+        assert!(matches!(&layer.kind, LayerKind::Adjustment(_)), "{name}");
         let blocks = layer.adjustments().unwrap();
         assert_eq!(blocks[0].kind, kind, "{name}");
         assert_eq!(blocks[0].key, kind.key(), "{name}");
@@ -303,6 +304,157 @@ fn adjustment_blocks_round_trip_at_16_bit() {
     let file = LayeredFile::<u16>::read(fixture("adjustment_layers_16bit.psd")).unwrap();
     let back = LayeredFile::<u16>::from_bytes(&file.to_bytes().unwrap()).unwrap();
     assert_eq!(adjustment_blocks(&back), adjustment_blocks(&file));
+}
+
+#[test]
+fn typed_adjustment_payloads_rebuild_generated_blocks_byte_for_byte() {
+    let eight_bit = LayeredFile::<u8>::read(fixture("adjustment_layers_8bit.psd")).unwrap();
+    assert_typed_payloads_round_trip(&eight_bit);
+    let eight_bit_large = LayeredFile::<u8>::read(fixture("adjustment_layers_8bit.psb")).unwrap();
+    assert_typed_payloads_round_trip(&eight_bit_large);
+    let sixteen_bit = LayeredFile::<u16>::read(fixture("adjustment_layers_16bit.psd")).unwrap();
+    assert_typed_payloads_round_trip(&sixteen_bit);
+}
+
+fn assert_typed_payloads_round_trip<T: BitDepth>(file: &LayeredFile<T>) {
+    for layer in file.layers() {
+        for block in &layer.blocks.blocks {
+            if AdjustmentKind::from_key(block.key).is_none() {
+                continue;
+            }
+            let parsed = AdjustmentBlock::read(block)
+                .unwrap()
+                .expect("recognized adjustment block");
+            assert_eq!(
+                parsed.to_tagged_block().unwrap(),
+                *block,
+                "{} / {:?}",
+                layer.name,
+                block.key
+            );
+        }
+    }
+}
+
+#[test]
+fn new_adjustment_and_fill_layers_write_with_their_format_bounds() {
+    let source = LayeredFile::<u8>::read(fixture("adjustment_layers_8bit.psd")).unwrap();
+    let exposure = layer(&source, "Exposure").adjustments().unwrap()[0].clone();
+    let fill = layer(&source, "Color Fill").adjustments().unwrap()[0].clone();
+
+    let mut document = LayeredFile::<u8>::new(psd::core::ColorMode::Rgb, 64, 64).unwrap();
+    let group_id = document.add_layer(Layer::new_group("Adjustments"));
+    let exposure_id = document
+        .add_adjustment_layer_to_group(group_id, "New Exposure", &exposure)
+        .unwrap();
+    let fill_id = document.add_adjustment_layer("New Fill", &fill).unwrap();
+    let invert = AdjustmentBlock::new(
+        AdjustmentKind::Invert,
+        AdjustmentData::Invert {
+            trailing_bytes: Vec::new(),
+        },
+    )
+    .unwrap();
+    let invert_id = document
+        .add_adjustment_layer("New Invert", &invert)
+        .unwrap();
+    assert_eq!(document.layer(exposure_id).unwrap().bounds, Rect::default());
+    assert_eq!(
+        document.layer(fill_id).unwrap().bounds,
+        Rect::new(0, 0, 64, 64)
+    );
+    assert!(matches!(
+        &document.layer(exposure_id).unwrap().kind,
+        LayerKind::Adjustment(_)
+    ));
+    assert!(document
+        .layer(exposure_id)
+        .unwrap()
+        .flags
+        .pixel_data_irrelevant());
+    assert_eq!(document.layer(invert_id).unwrap().bounds, Rect::default());
+
+    let bytes = document.to_bytes().unwrap();
+    let reread = LayeredFile::<u8>::from_bytes(&bytes).unwrap();
+    let exposure_back = layer(&reread, "New Exposure");
+    let fill_back = layer(&reread, "New Fill");
+    let invert_back = layer(&reread, "New Invert");
+    assert!(matches!(&exposure_back.kind, LayerKind::Adjustment(_)));
+    assert_eq!(exposure_back.bounds, Rect::default());
+    assert_eq!(fill_back.bounds, Rect::new(0, 0, 64, 64));
+    assert_eq!(
+        invert_back.adjustment(AdjustmentKind::Invert).unwrap(),
+        Some(invert)
+    );
+    assert_eq!(
+        exposure_back.adjustment(AdjustmentKind::Exposure).unwrap(),
+        Some(exposure)
+    );
+    assert_eq!(
+        fill_back.adjustment(AdjustmentKind::SolidColor).unwrap(),
+        Some(fill)
+    );
+}
+
+#[test]
+fn adjustment_edits_replace_in_place_and_preserve_companion_order() {
+    let source = LayeredFile::<u8>::read(fixture("adjustment_layers_8bit.psd")).unwrap();
+    let blocks = layer(&source, "Brightness/Contrast").adjustments().unwrap();
+    let mut target = Layer::<u8>::new_adjustment("Editable", Rect::default());
+    target.set_adjustment(&blocks[0]).unwrap();
+    target.blocks.push(TaggedBlock::new(
+        TaggedBlockKey::new(*b"zzzz"),
+        vec![1, 2, 3],
+    ));
+    target.set_adjustment(&blocks[1]).unwrap();
+    target.blocks.get_mut(blocks[0].key).unwrap().signature = *b"8B64";
+    let before = target.blocks.clone();
+    target.set_adjustment(&blocks[0]).unwrap();
+    assert_eq!(target.blocks, before);
+
+    assert_eq!(
+        target
+            .blocks
+            .blocks
+            .iter()
+            .map(|block| block.key.as_bytes())
+            .collect::<Vec<_>>(),
+        [*b"brit", *b"CgEd", *b"zzzz"]
+    );
+    assert_eq!(
+        target
+            .adjustment(AdjustmentKind::BrightnessContrast)
+            .unwrap(),
+        Some(blocks[0].clone())
+    );
+    assert!(target.clear_adjustment(AdjustmentKind::ContentGenerator));
+    assert_eq!(
+        target
+            .blocks
+            .blocks
+            .iter()
+            .map(|block| block.key.as_bytes())
+            .collect::<Vec<_>>(),
+        [*b"brit", *b"zzzz"]
+    );
+}
+
+#[test]
+fn rejected_adjustment_edits_leave_inconsistent_text_layers_unchanged() {
+    let source = LayeredFile::<u8>::read(fixture("adjustment_layers_8bit.psd")).unwrap();
+    let fill = layer(&source, "Color Fill").adjustments().unwrap()[0].clone();
+    let exposure = layer(&source, "Exposure").adjustments().unwrap()[0].clone();
+    let mut text = TextLayerBuilder::new("Text", "Example")
+        .build::<u8>()
+        .unwrap();
+    // Imported raw blocks can be inconsistent with the layer's declared kind.
+    text.blocks.push(fill.to_tagged_block().unwrap());
+    text.blocks
+        .push(TaggedBlock::new(TaggedBlockKey::new(*b"vmsk"), vec![0; 8]));
+    let before = text.blocks.clone();
+    assert!(text.set_adjustment(&exposure).is_err());
+    assert_eq!(text.blocks, before);
+    assert!(matches!(text.kind, LayerKind::Text(_)));
 }
 
 #[test]

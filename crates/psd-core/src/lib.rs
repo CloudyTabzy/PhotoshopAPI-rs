@@ -18,7 +18,7 @@
 //! - [`descriptor`], [`engine_data`]: Photoshop's action-descriptor and text-engine formats (`Core/Struct/`)
 //! - [`effects`], [`effect_enums`]: typed models of the effects in `lfx2`/`lmfx`/`lfxs` descriptors (read, patch in place, build fresh)
 //! - [`color`], [`gradient`], [`style_values`]: typed values (colours, gradients, contours, points, pattern references) that read from, patch and build descriptors, shared by effects and fills
-//! - [`text_tool`], [`placed_layer`], [`linked_layer`], [`layer_effects`], [`adjustments`], [`vector`], [`artboard`]: typed views over text, placed/linked data, effect blocks, adjustment/fill settings, vector paths/shapes, and artboards
+//! - [`text_tool`], [`placed_layer`], [`linked_layer`], [`layer_effects`], [`adjustments`], [`vector`], [`artboard`]: typed views over text, placed/linked data, effect blocks, adjustment/fill settings, vector paths/shapes with payload writers, and artboards
 //! - `serialize` (feature `serde`): `Serialize` views of descriptors and EngineData (upstream `to_json`)
 //!
 //! Codec math lives in `psd-codecs`; the document API lives in `psd`. This crate

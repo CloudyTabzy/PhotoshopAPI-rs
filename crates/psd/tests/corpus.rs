@@ -82,12 +82,53 @@ fn views<T: BitDepth>(file: &LayeredFile<T>) -> Result<(), String> {
         let name = &layer.name;
         let fail = |view: &str, error: psd::core::PsdError| format!("{name}: {view}: {error}");
         layer.effects().map_err(|error| fail("effects", error))?;
-        layer
+        if let Ok(Some(effects)) = layer.layer_effects() {
+            let mut no_op = layer.clone();
+            no_op
+                .set_layer_effects(&effects)
+                .map_err(|error| fail("effects no-op", error))?;
+            if no_op.blocks != layer.blocks {
+                return Err(format!(
+                    "{name}: a no-op effects edit changed tagged blocks"
+                ));
+            }
+        }
+        for adjustment in layer
             .adjustments()
-            .map_err(|error| fail("adjustments", error))?;
-        layer
+            .map_err(|error| fail("adjustments", error))?
+        {
+            let rebuilt = adjustment
+                .to_tagged_block()
+                .map_err(|error| fail("adjustment writer", error))?;
+            let source = layer
+                .blocks
+                .get(adjustment.key)
+                .expect("a typed adjustment came from this layer's blocks");
+            if rebuilt.data != source.data {
+                return Err(format!(
+                    "{name}: adjustment payload {:?} did not serialize byte for byte",
+                    adjustment.key
+                ));
+            }
+        }
+        for vector in layer
             .vector_blocks()
-            .map_err(|error| fail("vector", error))?;
+            .map_err(|error| fail("vector", error))?
+        {
+            let rebuilt = vector
+                .to_tagged_block()
+                .map_err(|error| fail("vector writer", error))?;
+            let source = layer
+                .blocks
+                .get(vector.key)
+                .expect("a typed vector block came from this layer's blocks");
+            if rebuilt.data != source.data {
+                return Err(format!(
+                    "{name}: vector payload {:?} did not serialize byte for byte",
+                    vector.key
+                ));
+            }
+        }
         if let Some(mask) = layer
             .vector_mask()
             .map_err(|error| fail("vector mask", error))?
@@ -97,6 +138,31 @@ fn views<T: BitDepth>(file: &LayeredFile<T>) -> Result<(), String> {
                 .map_err(|error| fail("subpaths", error))?;
         }
         layer.artboard().map_err(|error| fail("artboard", error))?;
+        if layer.is_artboard() {
+            if let Some(artboard) = layer.artboard().map_err(|error| fail("artboard", error))? {
+                let rebuilt = artboard
+                    .to_tagged_block()
+                    .map_err(|error| fail("artboard writer", error))?;
+                let source = layer
+                    .blocks
+                    .get(artboard.key)
+                    .expect("a typed artboard came from this layer's blocks");
+                if rebuilt.data != source.data {
+                    return Err(format!(
+                        "{name}: artboard payload did not serialize byte for byte"
+                    ));
+                }
+                let mut no_op = layer.clone();
+                no_op
+                    .set_artboard(&artboard)
+                    .map_err(|error| fail("artboard no-op", error))?;
+                if no_op.blocks != layer.blocks {
+                    return Err(format!(
+                        "{name}: a no-op artboard edit changed tagged blocks"
+                    ));
+                }
+            }
+        }
         layer
             .smart_object_data()
             .map_err(|error| fail("smart object", error))?;
@@ -111,9 +177,59 @@ fn views<T: BitDepth>(file: &LayeredFile<T>) -> Result<(), String> {
         path.path
             .subpaths()
             .map_err(|error| format!("document path {}: {error}", path.resource_id))?;
+        let original = file
+            .image_resources
+            .blocks()
+            .iter()
+            .find_map(|block| match block {
+                psd::core::ResourceBlock::Raw(raw) if raw.id == path.resource_id => Some(&raw.data),
+                _ => None,
+            });
+        if original.is_some_and(|bytes| path.path.to_payload().as_slice() != bytes.as_slice()) {
+            return Err(format!(
+                "document path {} did not serialize byte for byte",
+                path.resource_id
+            ));
+        }
     }
-    file.artboard_settings()
-        .map_err(|error| format!("artboard settings: {error}"))?;
+    if let Some(block) = file
+        .document_blocks
+        .as_ref()
+        .and_then(|blocks| blocks.get(psd::core::TaggedBlockKey::new(*b"pths")))
+    {
+        let names = psd::core::VectorBlock::read(block)
+            .map_err(|error| format!("path-name block: {error}"))?
+            .expect("pths is a recognized vector block");
+        let rebuilt = names
+            .to_tagged_block()
+            .map_err(|error| format!("path-name writer: {error}"))?;
+        if rebuilt.data != block.data {
+            return Err("path-name payload did not serialize byte for byte".to_owned());
+        }
+    }
+    if let Some(settings) = file
+        .artboard_settings()
+        .map_err(|error| format!("artboard settings: {error}"))?
+    {
+        let source = file
+            .document_blocks
+            .as_ref()
+            .and_then(|blocks| blocks.get(psd::core::TaggedBlockKey::new(*b"artd")))
+            .expect("parsed artboard settings came from artd");
+        let rebuilt = settings
+            .to_tagged_block(file.version)
+            .map_err(|error| format!("artboard settings writer: {error}"))?;
+        if rebuilt.data != source.data || rebuilt.signature != source.signature {
+            return Err("artboard settings did not serialize byte for byte".to_owned());
+        }
+        let mut no_op = file.clone();
+        no_op
+            .set_artboard_settings(&settings)
+            .map_err(|error| format!("artboard settings no-op: {error}"))?;
+        if no_op.document_blocks != file.document_blocks {
+            return Err("a no-op artboard-settings edit changed document blocks".to_owned());
+        }
+    }
     file.linked_layer_views()
         .map_err(|error| format!("linked layers: {error}"))?;
     Ok(())
@@ -212,6 +328,12 @@ fn compare<T: BitDepth>(before: &LayeredFile<T>, after: &LayeredFile<T>) -> Resu
                 compare_channels(name, &x.channels, &y.channels)?;
             }
             (LayerKind::Text(x), LayerKind::Text(y)) => {
+                compare_channels(name, &x.channels, &y.channels)?;
+            }
+            (LayerKind::Adjustment(x), LayerKind::Adjustment(y)) => {
+                compare_channels(name, &x.channels, &y.channels)?;
+            }
+            (LayerKind::Shape(x), LayerKind::Shape(y)) => {
                 compare_channels(name, &x.channels, &y.channels)?;
             }
             (LayerKind::Group(x), LayerKind::Group(y)) => {

@@ -2,7 +2,10 @@
 //! data accessors. The per-depth classes in `classes/` forward here.
 
 use numpy::{Element, PyArray2};
-use psd::core::{ColorMode, LayerMask};
+use psd::core::{
+    AdjustmentBlock, AdjustmentKind, Artboard, ColorMode, LayerMask, TaggedBlock, TaggedBlockKey,
+    VectorBlock,
+};
 use psd::geometry::Point2;
 use psd::{BitDepth, ChannelKey, Layer, LayerKind, Rect};
 use pyo3::exceptions::PyValueError;
@@ -17,7 +20,7 @@ use crate::numpy_io::{
     channel_array, channel_dimensions, channel_key_from_py, channel_plane, empty_array,
     image_channels, image_channels_mut, mask_array, parse_image,
 };
-use crate::state::{psd_error, LayerHandle};
+use crate::state::{psd_error, write_document, LayerHandle, Location};
 
 /// What a Python wrapper class a layer gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,12 +28,17 @@ pub enum Kind {
     Image,
     Group,
     Text,
+    Adjustment,
+    Shape,
+    Artboard,
     SmartObject,
     Divider,
 }
 
 pub fn kind_of<T: BitDepth>(layer: &Layer<T>) -> Kind {
-    if layer.is_smart_object() {
+    if layer.is_artboard() {
+        Kind::Artboard
+    } else if layer.is_smart_object() {
         Kind::SmartObject
     } else if layer.is_text_layer() {
         Kind::Text
@@ -38,10 +46,196 @@ pub fn kind_of<T: BitDepth>(layer: &Layer<T>) -> Kind {
         match layer.kind {
             LayerKind::Image(_) => Kind::Image,
             LayerKind::Text(_) => Kind::Text,
+            LayerKind::Adjustment(_) => Kind::Adjustment,
+            LayerKind::Shape(_) => Kind::Shape,
             LayerKind::Group(_) => Kind::Group,
             LayerKind::SectionDivider(_) => Kind::Divider,
         }
     }
+}
+
+pub fn artboard_block<T: BitDepth>(handle: &LayerHandle<T>) -> PyResult<Option<(String, Vec<u8>)>> {
+    handle.with_layer(|layer| {
+        Ok(layer
+            .blocks
+            .blocks
+            .iter()
+            .find(|block| psd::core::artboard::is_artboard_key(block.key))
+            .map(|block| (block.key.to_string(), block.data.clone())))
+    })
+}
+
+pub fn set_artboard_block<T: BitDepth>(
+    handle: &LayerHandle<T>,
+    key: &str,
+    payload: Vec<u8>,
+) -> PyResult<()> {
+    let raw = TaggedBlock::new(tagged_key(key)?, payload);
+    let artboard = Artboard::read(&raw)
+        .map_err(psd_error)?
+        .ok_or_else(|| PyValueError::new_err("tagged-block key is not artboard data"))?;
+    match handle.place()? {
+        Location::Attached(document, id) => write_document(&document, |file| {
+            file.set_artboard(id, &artboard).map_err(psd_error)
+        }),
+        Location::Detached | Location::Nested => {
+            handle.with_layer_mut(|layer| layer.set_artboard(&artboard).map_err(psd_error))
+        }
+    }
+}
+
+pub fn clear_artboard<T: BitDepth>(handle: &LayerHandle<T>) -> PyResult<bool> {
+    match handle.place()? {
+        Location::Attached(document, id) => {
+            write_document(&document, |file| file.clear_artboard(id).map_err(psd_error))
+        }
+        Location::Detached | Location::Nested => {
+            handle.with_layer_mut(|layer| Ok(layer.clear_artboard()))
+        }
+    }
+}
+
+fn tagged_key(key: &str) -> PyResult<TaggedBlockKey> {
+    let bytes: [u8; 4] = key
+        .as_bytes()
+        .try_into()
+        .map_err(|_| PyValueError::new_err("tagged-block keys must contain exactly four bytes"))?;
+    Ok(TaggedBlockKey::new(bytes))
+}
+
+/// Parse and validate a Python-supplied adjustment payload.
+pub(crate) fn adjustment_block(key: &str, payload: Vec<u8>) -> PyResult<AdjustmentBlock> {
+    let key = tagged_key(key)?;
+    let raw = TaggedBlock::new(key, payload);
+    AdjustmentBlock::read(&raw)
+        .map_err(psd_error)?
+        .ok_or_else(|| PyValueError::new_err("tagged-block key is not an adjustment kind"))
+}
+
+/// Parse and validate a Python-supplied vector payload.
+pub(crate) fn vector_block(key: &str, payload: Vec<u8>) -> PyResult<VectorBlock> {
+    let key = tagged_key(key)?;
+    let raw = TaggedBlock::new(key, payload);
+    VectorBlock::read(&raw)
+        .map_err(psd_error)?
+        .filter(|block| block.key.as_bytes() != *b"pths")
+        .ok_or_else(|| PyValueError::new_err("tagged-block key is not layer vector data"))
+}
+
+pub(crate) fn shape_blocks(blocks: Vec<(String, Vec<u8>)>) -> PyResult<Vec<TaggedBlock>> {
+    blocks
+        .into_iter()
+        .map(|(key, payload)| {
+            let key = tagged_key(&key)?;
+            let raw = TaggedBlock::new(key, payload);
+            if AdjustmentKind::from_key(key).is_some() {
+                AdjustmentBlock::read(&raw)
+                    .map_err(psd_error)?
+                    .ok_or_else(|| PyValueError::new_err("invalid adjustment payload"))?
+                    .to_tagged_block()
+                    .map_err(psd_error)
+            } else {
+                vector_block(&key.to_string(), raw.data)?
+                    .to_tagged_block()
+                    .map_err(psd_error)
+            }
+        })
+        .collect()
+}
+
+pub fn adjustment_blocks<T: BitDepth>(handle: &LayerHandle<T>) -> PyResult<Vec<(String, Vec<u8>)>> {
+    handle.with_layer(|layer| {
+        layer
+            .adjustments()
+            .map_err(psd_error)?
+            .into_iter()
+            .map(|adjustment| {
+                let block = adjustment.to_tagged_block().map_err(psd_error)?;
+                Ok((block.key.to_string(), block.data))
+            })
+            .collect()
+    })
+}
+
+pub fn set_adjustment<T: BitDepth>(
+    handle: &LayerHandle<T>,
+    key: &str,
+    payload: Vec<u8>,
+) -> PyResult<()> {
+    let adjustment = adjustment_block(key, payload)?;
+    handle.with_layer_mut(|layer| layer.set_adjustment(&adjustment).map_err(psd_error))
+}
+
+pub fn clear_adjustment<T: BitDepth>(handle: &LayerHandle<T>, key: &str) -> PyResult<bool> {
+    let kind = AdjustmentKind::from_key(tagged_key(key)?)
+        .ok_or_else(|| PyValueError::new_err("tagged-block key is not an adjustment kind"))?;
+    handle.with_layer_mut(|layer| Ok(layer.clear_adjustment(kind)))
+}
+
+pub fn vector_blocks<T: BitDepth>(handle: &LayerHandle<T>) -> PyResult<Vec<(String, Vec<u8>)>> {
+    handle.with_layer(|layer| {
+        layer
+            .vector_blocks()
+            .map_err(psd_error)?
+            .into_iter()
+            .map(|vector| {
+                let block = vector.to_tagged_block().map_err(psd_error)?;
+                Ok((block.key.to_string(), block.data))
+            })
+            .collect()
+    })
+}
+
+pub fn set_vector_block<T: BitDepth>(
+    handle: &LayerHandle<T>,
+    key: &str,
+    payload: Vec<u8>,
+) -> PyResult<()> {
+    let vector = vector_block(key, payload)?;
+    handle.with_layer_mut(|layer| layer.set_vector_block(&vector).map_err(psd_error))
+}
+
+pub fn clear_vector_block<T: BitDepth>(handle: &LayerHandle<T>, key: &str) -> PyResult<bool> {
+    let key = tagged_key(key)?;
+    if !matches!(
+        &key.as_bytes(),
+        b"vmsk" | b"vsms" | b"vstk" | b"vscg" | b"vogk"
+    ) {
+        return Err(PyValueError::new_err(
+            "tagged-block key is not layer vector data",
+        ));
+    }
+    handle.with_layer_mut(|layer| Ok(layer.clear_vector_block(key)))
+}
+
+pub fn layer_effects_blocks<T: BitDepth>(
+    handle: &LayerHandle<T>,
+) -> PyResult<Vec<(String, Vec<u8>)>> {
+    handle.with_layer(|layer| {
+        Ok(layer
+            .blocks
+            .blocks
+            .iter()
+            .filter(|block| matches!(&block.key.as_bytes(), b"lfx2" | b"lmfx" | b"lfxs" | b"lrFX"))
+            .map(|block| (block.key.to_string(), block.data.clone()))
+            .collect())
+    })
+}
+
+pub fn set_layer_effects_block<T: BitDepth>(
+    handle: &LayerHandle<T>,
+    key: &str,
+    payload: Vec<u8>,
+) -> PyResult<()> {
+    let raw = TaggedBlock::new(tagged_key(key)?, payload);
+    handle.with_layer_mut(|layer| layer.set_layer_effects_block(&raw).map_err(psd_error))
+}
+
+pub fn clear_layer_effects<T: BitDepth>(handle: &LayerHandle<T>) -> PyResult<()> {
+    handle.with_layer_mut(|layer| {
+        layer.clear_layer_effects();
+        Ok(())
+    })
 }
 
 /// Photoshop layer names are limited to 255 characters (upstream checks

@@ -12,6 +12,145 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-09-30
+
+### Fixed
+
+- Updated the vendored PNG decoder to 0.5.1, correcting a documentation link left behind
+  when its encoder API was removed. The workspace documentation now builds with warnings denied.
+
+## [0.8.2] - 2026-09-30
+
+### Added
+
+- `Layer::set_layer_effects_block` replaces a validated modern effects payload while preserving
+  its complete descriptor and trailing bytes and refreshing the legacy mirror.
+  `ModernLayerEffects::to_payload` serializes that complete descriptor view.
+
+### Fixed
+
+- Python effects payload replacement now retains incoming fields outside the typed effects
+  model. Typed effects edits also retain existing trailing bytes and block signatures.
+- Corrected an effects API documentation link rejected by strict rustdoc checks.
+- Curve writers reject control-point and freehand-map layouts that disagree with the payload's
+  map flag, including curves in the extension section.
+- Artboard conversion rejects groups containing existing artboards. Python's artboard list
+  follows the current stacking order, and no-op document-settings edits retain the source signature.
+- Detached trees with children attached to nongroup layers are rejected before insertion,
+  preventing unreachable arena entries. Rejected adjustment edits leave inconsistent text
+  records unchanged.
+- Adjustment and vector block replacement retain source signatures. Vector-block removal
+  ignores unrelated metadata keys.
+- Shape builders reject invalid bounds before adding a layer, and synthesized transparency
+  validates rectangle extents and bitmap sizes before allocating, avoiding coordinate-overflow panics.
+
+### Changed
+
+- Promoting image or adjustment layers to shapes moves their existing channel buffers instead
+  of copying them.
+
+## [0.8.1] - 2026-09-29
+
+Artboards can now be created and edited through Rust and Python while keeping their document
+settings in step.
+
+### Added
+
+- `Artboard::new`, `set_rect`, `set_preset_name`, `set_background`, `set_guide_indices`, and
+  `to_tagged_block` author the version-16 layer descriptor while preserving unknown fields on
+  edits. `ArtboardSettings::new`, typed setters, and `to_tagged_block` write the document-level
+  `artd` settings with the correct PSD/PSB signature.
+- `LayeredFile::add_artboard`, `set_artboard`, `clear_artboard`, `add_layer_to_group`,
+  `insert_layer_tree`, and `remove_layer` keep the document-level artboard count in sync.
+  Artboards cannot be nested inside other artboards; direct `Layer::set_artboard` and
+  `clear_artboard` edits are intended for detached layers.
+- `set_artboard_settings` and `clear_artboard_settings` let callers manage the document-level
+  artboard-tool settings directly.
+- Python layers expose artboard block inspection and editing; Python documents expose their
+  artboards, document settings, and an artboard builder with bounds, preset, background, and guide
+  indices.
+
+### Verified
+
+- Typed artboard and document-settings writers round-trip the generated PSD/PSB fixtures byte for
+  byte, including PSB's `8B64` document block signature. Corpus checks also verify no-op artboard
+  edits preserve layer and document blocks.
+- Rust and Python tests cover new artboards, child groups, background/preset data, document counts,
+  nested-artboard rejection, and write/read behavior.
+
+## [0.8.0] - 2026-09-29
+
+Shape layers can now be authored from typed vector blocks, and Python can inspect and edit
+adjustment and shape data.
+
+### Added
+
+- `VectorPath::to_payload`, `VectorMask::to_payload`, and `VectorBlock::to_tagged_block` write
+  the vector path, mask, fill, stroke, origination, and path-name payloads while retaining
+  unknown records and trailing bytes.
+- `LayerKind::Shape` and `ShapeLayer` preserve shape preview and mask channels. Layers can add,
+  replace, and clear typed vector blocks; `LayeredFile` can create modern shapes from vector
+  blocks and legacy or modern shapes from tagged blocks, at the root or inside a group.
+- Python layers expose `is_adjustment_layer`, `is_shape_layer`, adjustment/vector block payloads,
+  and block replacement/removal. Python documents can create adjustment/fill and shape layers
+  from validated block payloads.
+- Python layers expose effects block payloads and a validated modern-effects setter that also
+  refreshes the legacy `lrFX` mirror.
+
+### Changed
+
+- Reading a fill paired with a vector mask now classifies it as `LayerKind::Shape`; a pixel layer
+  with a vector mask alone remains an image layer. Preview channels are preserved, and new shape
+  records mark their pixel data as derived.
+- Adding `LayerKind::Shape` is a breaking change for exhaustive matches on the public enum, so
+  this release advances the pre-1.0 compatibility line to 0.8.0.
+
+### Verified
+
+- The corpus harness now checks byte-exact no-op effect edits and adjustment/vector payload
+  serialization. Shape creation round-trips both legacy fill-plus-mask and modern vector-content
+  blocks; the additional local corpora pass the same checks.
+- The Python suite exercises adjustment creation/editing and legacy/modern shape creation.
+
+## [0.7.0] - 2026-09-29
+
+Adjustment and fill layers can now be built from typed settings and edited through the layer API.
+
+### Added
+
+- `AdjustmentBlock::new`, `AdjustmentData::to_payload`, and
+  `AdjustmentBlock::to_tagged_block` serialize all recognized adjustment and fill payloads,
+  including descriptor-backed settings, levels and curves extensions, and preserved trailing
+  bytes. The block builder rejects mismatched kind/data pairs and layouts the typed model cannot
+  encode.
+- `LayerKind::Adjustment` and `AdjustmentLayer` give adjustment and fill layers their own layer
+  kind while preserving preview and mask channels. `Layer::new_adjustment`,
+  `Layer::adjustment`, `Layer::set_adjustment`, and `Layer::clear_adjustment` build and edit their
+  settings blocks.
+- `LayeredFile::add_adjustment_layer` and `add_adjustment_layer_to_group` create adjustment
+  layers with empty bounds and fill layers spanning the canvas. CgEd companion blocks can be
+  added through `Layer::set_adjustment`.
+- The Python `Layer.kind` property reports `"adjustment"` for these records.
+
+### Changed
+
+- Reading a layer with a recognized adjustment or fill settings block now uses
+  `LayerKind::Adjustment`. Its existing channels remain available and round-trip as before.
+  New adjustment layers set Photoshop's pixel-data-irrelevant flag; their preview channels are
+  not synthesized when absent.
+- Adding `LayerKind::Adjustment` is a breaking change for exhaustive matches on the public
+  `LayerKind` enum, so this release advances the pre-1.0 compatibility line to 0.7.0.
+
+### Verified
+
+- Typed payloads rebuild every block in the generated adjustment PSD/PSB documents byte for
+  byte. The corpus checks now also enforce byte-exact serialization for each parsed adjustment
+  block.
+- New adjustment and fill layers survive write/read with their settings and bounds; adjustment
+  edit tests verify replacement, companion ordering, and clearing.
+- The legacy effects edit suite passes, including descriptor updates, mirror generation, and
+  no-op preservation.
+
 ## [0.6.30] - 2026-09-29
 
 Editing a layer's effects now keeps its legacy `lrFX` block in step.
@@ -122,7 +261,7 @@ in an effects block, and a later release connects them to layers.
   uses the modern order, and those two layouts are pinned by name in the test so that any other
   difference fails it. Getting there fixed two things the first run showed: an effect's
   descriptor carries its own key as its class ID (`DrSh`, `ebbl`, `patternFill`), and item
-  order differs from the one the public `ag-psd-rs` reference writes.
+  order differs from that emitted by an independent PSD parser.
 
 ## [0.6.27] - 2026-09-29
 

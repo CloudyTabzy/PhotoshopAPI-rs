@@ -1,4 +1,4 @@
-//! Read-only views of vector paths, masks, and shape data.
+//! Typed views and writers for vector paths, masks, and shape data.
 //!
 //! Photoshop stores Bézier paths as 26-byte path records (the Adobe PSD/PSB
 //! specification's "Path resource format"). The same records appear in
@@ -11,20 +11,19 @@
 //! saved paths.
 //!
 //! The specification leaves most of a subpath length record undocumented.
-//! [`SubpathRecord`] keeps every byte and names the fields that the public
-//! `psd-tools` (<https://github.com/psd-tools/psd-tools>) and `ag-psd-rs`
-//! (<https://github.com/Vasyanator/ag-psd-rs>) readers interpret. ag-psd-rs
-//! skips `pths` and the `vogk` key list; these views read both.
+//! [`SubpathRecord`] keeps every byte and names fields interpreted by
+//! independent readers. One such reader skips `pths` and the `vogk` key list;
+//! these views read both.
 //!
 //! Upstream (`LayeredFile/LayerTypes/ShapeLayer.h`) only detects shape layers
-//! and round-trips them as opaque data. As with the other views, the original
-//! tagged block is still what gets written.
+//! and round-trips them as opaque data. These types add explicit serializers;
+//! ordinary document saves still preserve the original tagged blocks.
 
 use crate::adjustments::{AdjustmentKind, FillSettings};
 use crate::descriptor::{Descriptor, DescriptorKey, DescriptorValue};
 use crate::enums::BlendMode;
 use crate::error::{PsdError, Result};
-use crate::io::BeReader;
+use crate::io::{BeReader, BeWriter};
 use crate::tagged_blocks::{TaggedBlock, TaggedBlockKey};
 use crate::views::{enumerator, four_cc, number, read_versioned_descriptor, trailing, unsupported};
 
@@ -76,9 +75,9 @@ pub struct SubpathRecord {
     /// Number of knot records that follow.
     pub knot_count: u16,
     /// Shape operation: −1 none, 0 exclude, 1 combine, 2 subtract,
-    /// 3 intersect (as ag-psd-rs and psd-tools read it).
+    /// 3 intersect (as independent parsers read it).
     pub operation: i16,
-    /// ag-psd-rs reads 2 as the non-zero winding fill rule and any other value
+    /// Another parser reads 2 as the non-zero winding fill rule and any other value
     /// as even-odd.
     pub flags: u16,
     /// The remaining 18 bytes, zero in most files.
@@ -86,8 +85,8 @@ pub struct SubpathRecord {
 }
 
 impl SubpathRecord {
-    /// The index of the matching entry in the layer's `vogk` key list, which
-    /// psd-tools reads from bytes 4–7 of [`reserved`](Self::reserved).
+    /// The index of the matching entry in the layer's `vogk` key list, stored
+    /// in bytes 4–7 of [`reserved`](Self::reserved).
     pub fn origination_index(&self) -> u32 {
         u32::from_be_bytes([
             self.reserved[4],
@@ -180,6 +179,60 @@ impl PathRecord {
             },
         })
     }
+
+    fn write(&self, writer: &mut BeWriter) {
+        match self {
+            Self::Subpath(record) => {
+                writer.u16(if record.closed { 0 } else { 3 });
+                writer.u16(record.knot_count);
+                writer.i16(record.operation);
+                writer.u16(record.flags);
+                writer.bytes(&record.reserved);
+            }
+            Self::Knot(knot) => {
+                let selector = match (knot.closed, knot.linked) {
+                    (true, true) => 1,
+                    (true, false) => 2,
+                    (false, true) => 4,
+                    (false, false) => 5,
+                };
+                writer.u16(selector);
+                for point in [knot.preceding, knot.anchor, knot.leaving] {
+                    writer.i32(point.vertical);
+                    writer.i32(point.horizontal);
+                }
+            }
+            Self::PathFillRule { reserved } => {
+                writer.u16(6);
+                writer.bytes(reserved);
+            }
+            Self::Clipboard {
+                top,
+                left,
+                bottom,
+                right,
+                resolution,
+                reserved,
+            } => {
+                writer.u16(7);
+                writer.i32(*top);
+                writer.i32(*left);
+                writer.i32(*bottom);
+                writer.i32(*right);
+                writer.i32(*resolution);
+                writer.bytes(reserved);
+            }
+            Self::InitialFillRule { value, reserved } => {
+                writer.u16(8);
+                writer.u16(*value);
+                writer.bytes(reserved);
+            }
+            Self::Unknown { selector, data } => {
+                writer.u16(*selector);
+                writer.bytes(data);
+            }
+        }
+    }
 }
 
 /// A sequence of path records, as stored in a vector mask or a path resource.
@@ -202,6 +255,18 @@ impl VectorPath {
     pub fn read(data: &[u8]) -> Result<Self> {
         let mut reader = BeReader::new(data);
         Self::read_from(&mut reader)
+    }
+
+    /// Serialize the path records and preserved tail bytes.
+    pub fn to_payload(&self) -> Vec<u8> {
+        let mut writer = BeWriter::with_capacity(
+            self.records.len() * PATH_RECORD_SIZE + self.trailing_bytes.len(),
+        );
+        for record in &self.records {
+            record.write(&mut writer);
+        }
+        writer.bytes(&self.trailing_bytes);
+        writer.into_inner()
     }
 
     fn read_from(reader: &mut BeReader) -> Result<Self> {
@@ -274,6 +339,18 @@ impl VectorMask {
             flags,
             path,
         })
+    }
+
+    /// Serialize a version-3 vector mask.
+    pub fn to_payload(&self) -> Result<Vec<u8>> {
+        if self.version != 3 {
+            return Err(invalid_vector("unsupported vector-mask version"));
+        }
+        let mut writer = BeWriter::new();
+        writer.u32(self.version);
+        writer.u32(self.flags);
+        writer.bytes(&self.path.to_payload());
+        Ok(writer.into_inner())
     }
 
     pub fn inverted(&self) -> bool {
@@ -510,6 +587,11 @@ impl PathNames {
         })
     }
 
+    /// Serialize the version-16 path-name descriptor.
+    pub fn to_payload(&self) -> Result<Vec<u8>> {
+        write_versioned_descriptor(&self.descriptor, &self.trailing_bytes)
+    }
+
     /// Each `pathInfoClass` entry's `pathUnicodeName`, in stored order.
     pub fn names(&self) -> Vec<Option<&str>> {
         self.descriptor
@@ -544,6 +626,13 @@ pub enum VectorData {
 }
 
 impl VectorBlock {
+    /// Create a typed vector block with a matching on-disk key.
+    pub fn new(key: TaggedBlockKey, data: VectorData) -> Result<Self> {
+        let block = Self { key, data };
+        block.to_tagged_block()?;
+        Ok(block)
+    }
+
     /// Parse a recognized vector block. Other tagged blocks return `None`.
     /// A malformed or unsupported payload is an error only when this view is
     /// requested; the raw block is never modified.
@@ -591,6 +680,54 @@ impl VectorBlock {
             data,
         }))
     }
+
+    /// Serialize this vector block while preserving unmodeled trailing bytes.
+    pub fn to_tagged_block(&self) -> Result<TaggedBlock> {
+        let data = match (&self.key.as_bytes(), &self.data) {
+            (b"vmsk" | b"vsms", VectorData::Mask(mask)) => mask.to_payload()?,
+            (b"vstk", VectorData::Stroke(stroke)) => {
+                write_versioned_descriptor(&stroke.descriptor, &stroke.trailing_bytes)?
+            }
+            (b"vscg", VectorData::Content(content)) => {
+                if content.kind().is_none() {
+                    return Err(invalid_vector("vscg content needs a recognized fill key"));
+                }
+                let mut writer = BeWriter::new();
+                writer.bytes(&content.key);
+                writer.u32(16);
+                content.fill.descriptor.write(&mut writer)?;
+                writer.bytes(&content.fill.trailing_bytes);
+                writer.into_inner()
+            }
+            (b"vogk", VectorData::Origination(origination)) => {
+                if origination.version != 1 {
+                    return Err(invalid_vector("unsupported vector-origination version"));
+                }
+                let mut writer = BeWriter::new();
+                writer.u32(origination.version);
+                writer.bytes(&write_versioned_descriptor(
+                    &origination.descriptor,
+                    &origination.trailing_bytes,
+                )?);
+                writer.into_inner()
+            }
+            (b"pths", VectorData::PathNames(names)) => names.to_payload()?,
+            _ => return Err(invalid_vector("vector block key and data do not match")),
+        };
+        Ok(TaggedBlock::new(self.key, data))
+    }
+}
+
+fn write_versioned_descriptor(descriptor: &Descriptor, trailing_bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut writer = BeWriter::new();
+    writer.u32(16);
+    descriptor.write(&mut writer)?;
+    writer.bytes(trailing_bytes);
+    Ok(writer.into_inner())
+}
+
+fn invalid_vector(message: &'static str) -> PsdError {
+    PsdError::InvalidData { offset: 0, message }
 }
 
 /// Image-resource ID of the work path.

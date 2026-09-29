@@ -71,6 +71,42 @@ impl<T: BitDepth> LayerTree<T> {
     }
 }
 
+fn validate_detached_tree<T: BitDepth>(
+    tree: &LayerTree<T>,
+    parent_is_artboard: bool,
+) -> Result<usize> {
+    let mut pending = vec![(tree, parent_is_artboard)];
+    let mut artboards = 0usize;
+    while let Some((tree, parent_is_artboard)) = pending.pop() {
+        if tree.layer.group().is_none() && !tree.children.is_empty() {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "only group layers can contain children",
+            });
+        }
+        let is_artboard = tree.layer.is_artboard();
+        if parent_is_artboard && is_artboard {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "artboards cannot be nested inside other artboards",
+            });
+        }
+        artboards =
+            artboards
+                .checked_add(usize::from(is_artboard))
+                .ok_or(PsdError::InvalidData {
+                    offset: 0,
+                    message: "artboard count exceeds the descriptor integer range",
+                })?;
+        pending.extend(
+            tree.children
+                .iter()
+                .map(|child| (child, parent_is_artboard || is_artboard)),
+        );
+    }
+    Ok(artboards)
+}
+
 impl<T: BitDepth> From<Layer<T>> for LayerTree<T> {
     fn from(layer: Layer<T>) -> Self {
         Self::new(layer)
@@ -133,6 +169,14 @@ impl<T: BitDepth> LayeredFile<T> {
         false
     }
 
+    pub(crate) fn parent_is_within_artboard(&self, parent: Option<LayerId>) -> bool {
+        parent.is_some_and(|parent| {
+            self.artboards()
+                .into_iter()
+                .any(|artboard| parent == artboard || self.is_descendant(parent, artboard))
+        })
+    }
+
     /// Remove a layer (a group with everything below it) and return it as a
     /// detached tree. The removed ids are never reused; other ids stay valid.
     /// A group's `</Layer group>` divider is dropped with it.
@@ -146,6 +190,26 @@ impl<T: BitDepth> LayeredFile<T> {
                 message: "section dividers are removed together with their group",
             });
         }
+        let removed_artboards = self
+            .artboards()
+            .into_iter()
+            .filter(|&artboard| artboard == id || self.is_descendant(artboard, id))
+            .count();
+        let settings_update = if removed_artboards > 0 {
+            self.artboard_settings()?
+                .map(|mut settings| {
+                    let remaining = self.artboards().len().saturating_sub(removed_artboards);
+                    let count = i32::try_from(remaining).map_err(|_| PsdError::InvalidData {
+                        offset: 0,
+                        message: "artboard count exceeds the descriptor integer range",
+                    })?;
+                    settings.set_count(count);
+                    settings.to_tagged_block(self.version)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let parent = self.parent(id);
         let list = self.children_mut(parent).ok_or_else(unknown_layer)?;
         let position = list
@@ -161,7 +225,19 @@ impl<T: BitDepth> LayeredFile<T> {
         for divider in removed.iter().copied().filter(|&other| other != id) {
             self.slots_mut()[divider] = None;
         }
-        Ok(self.take_tree(id))
+        let removed = self.take_tree(id);
+        if let Some(block) = settings_update {
+            if let Some(document_blocks) = &mut self.document_blocks {
+                if let Some(existing) = document_blocks
+                    .blocks
+                    .iter_mut()
+                    .find(|existing| existing.key == block.key)
+                {
+                    *existing = block;
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// Insert a detached tree under `parent` (the root when `None`) and return
@@ -175,11 +251,30 @@ impl<T: BitDepth> LayeredFile<T> {
         tree: LayerTree<T>,
     ) -> Result<LayerId> {
         self.children(parent).ok_or_else(not_a_group)?;
+        let added = validate_detached_tree(&tree, self.parent_is_within_artboard(parent))?;
+        let settings_update = {
+            if added == 0 {
+                None
+            } else {
+                let count =
+                    self.artboards()
+                        .len()
+                        .checked_add(added)
+                        .ok_or(PsdError::InvalidData {
+                            offset: 0,
+                            message: "artboard count exceeds the descriptor integer range",
+                        })?;
+                Some(self.artboard_settings_block_with_count(count)?)
+            }
+        };
         let id = self.allocate_tree(tree);
         let position = self.physical_index(parent, index);
         self.children_mut(parent)
             .expect("checked above")
             .insert(position, id);
+        if let Some(block) = settings_update {
+            self.upsert_document_block(block);
+        }
         Ok(id)
     }
 
@@ -210,6 +305,17 @@ impl<T: BitDepth> LayeredFile<T> {
             return Err(unknown_layer());
         }
         self.children(parent).ok_or_else(not_a_group)?;
+        if self.parent_is_within_artboard(parent)
+            && self
+                .artboards()
+                .into_iter()
+                .any(|artboard| artboard == id || self.is_descendant(artboard, id))
+        {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "artboards cannot be nested inside other artboards",
+            });
+        }
         if parent.is_some_and(|target| self.is_descendant(target, id)) {
             return Err(PsdError::InvalidData {
                 offset: 0,
@@ -451,6 +557,20 @@ mod tests {
         let reread = LayeredFile::<u8>::from_bytes(&document.to_bytes().unwrap()).unwrap();
         assert_eq!(reread.layer_count(), document.layer_count());
         assert!(reread.find_layer("Inserted").is_some());
+    }
+
+    #[test]
+    fn malformed_detached_trees_are_rejected_before_allocating_layers() {
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 1, 1).unwrap();
+        document.add_layer(image("Existing"));
+        let before = document.to_bytes().unwrap();
+        let tree = LayerTree {
+            layer: image("Invalid parent"),
+            children: vec![LayerTree::new(Layer::new_group("Child"))],
+        };
+        assert!(document.insert_layer_tree(None, None, tree).is_err());
+        assert_eq!(document.layer_count(), 1);
+        assert_eq!(document.to_bytes().unwrap(), before);
     }
 
     #[test]

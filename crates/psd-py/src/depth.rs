@@ -8,7 +8,10 @@
 use std::sync::Arc;
 
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
-use psd::core::{BitDepth as CoreBitDepth, ColorMode, FileHeader, Version};
+use psd::core::{
+    ArtboardBackground, ArtboardRect, ArtboardSettings, BitDepth as CoreBitDepth, Color, ColorMode,
+    FileHeader, TaggedBlockKey, Version,
+};
 use psd::{
     color_channel_count, AntiAliasMethod, BitDepth, ChannelKey, FontScript, FontType, Layer,
     LayerId, LayeredFile, LinkedStorage, Rect, TextBoxBounds, TextLayerBuilder, TextWarpRotation,

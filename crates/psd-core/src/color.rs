@@ -2,10 +2,9 @@
 //!
 //! Effects, gradient stops and fill layers all store a colour as a small descriptor whose
 //! class names the colour model. Photoshop-authored files use `RGBC` and `CMYC`; the class
-//! IDs for the other three are Photoshop's action-manager terminology. The public
-//! `ag-psd-rs` reference (<https://github.com/Vasyanator/ag-psd-rs>) names the gray and Lab
-//! classes `GRYC` and `LABC` instead; no file in the corpora used either, so this reads both
-//! spellings and writes Photoshop's own.
+//! IDs for the other three are Photoshop's action-manager terminology. Some independent
+//! parsers use `GRYC` and `LABC` for gray and Lab; no file in the corpora used either, so this
+//! reads both spellings and writes Photoshop's own.
 
 use crate::descriptor::{Descriptor, DescriptorValue};
 

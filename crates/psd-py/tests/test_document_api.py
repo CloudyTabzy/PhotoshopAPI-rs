@@ -8,6 +8,7 @@ proxies, stream I/O, ``PhotoshopFile``, and group masks.
 import inspect
 import io
 import os
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -186,6 +187,143 @@ class SettingsTest(unittest.TestCase):
         self.assertTrue(back.has_mask())
         np.testing.assert_array_equal(back.mask, mask)
         self.assertEqual((back.width, back.height), (6, 4))
+
+
+class AdjustmentAndShapeApiTest(unittest.TestCase):
+    def test_artboard_creation_settings_and_layer_blocks(self):
+        document = psapi.LayeredFile_8bit(psapi.enum.ColorMode.rgb, 64, 64)
+        document.add_artboard(
+            "Board",
+            (0.0, 0.0, 40.0, 50.0),
+            preset_name="Icon",
+            background_type=1,
+            guide_indices=[0, 2],
+        )
+        document.add_artboard(
+            "Custom",
+            (0.0, 40.0, 40.0, 64.0),
+            background_type=4,
+            background_color=(18.0, 108.0, 200.0),
+        )
+        self.assertEqual(len(document.artboards), 2)
+        self.assertEqual(names(document.artboards), ["Custom", "Board"])
+        document.move_layer("Custom")
+        self.assertEqual(names(document.artboards), ["Board", "Custom"])
+        board = document["Board"]
+        self.assertEqual(board.kind, "artboard")
+        self.assertTrue(board.is_artboard())
+        self.assertEqual(
+            board.artboard_info(),
+            {
+                "bounds": (0.0, 0.0, 40.0, 50.0),
+                "preset_name": "Icon",
+                "background_type": 1,
+                "guide_indices": [0, 2],
+                "background_color": None,
+            },
+        )
+        custom = document["Custom"]
+        self.assertEqual(custom.artboard_info()["background_color"], (18.0, 108.0, 200.0))
+        block = board.artboard_block()
+        self.assertEqual(block[0], "artb")
+        board.set_artboard_block(*block)
+
+        back = roundtrip(document)
+        self.assertEqual(back["Board"].artboard_block(), block)
+        self.assertEqual(back["Custom"].artboard_info()["background_type"], 4)
+        settings = back.artboard_settings
+        self.assertIsInstance(settings, bytes)
+        self.assertTrue(back["Board"].clear_artboard())
+        self.assertEqual([layer.name for layer in back.artboards], ["Custom"])
+        self.assertNotEqual(back.artboard_settings, settings)
+        back.clear_artboard_settings()
+        self.assertIsNone(back.artboard_settings)
+
+    def test_effect_block_setter_preserves_a_no_op_and_clears_mirrors(self):
+        source = psapi.LayeredFile_8bit.read(
+            FIXTURES / "documents" / "SmartObjects" / "smart_object_file_no_warp.psd"
+        )
+        layer = next(
+            layer
+            for layer in source.flat_layers
+            if any(key in ("lfx2", "lmfx", "lfxs") for key, _ in layer.layer_effects_blocks())
+        )
+        blocks = layer.layer_effects_blocks()
+        modern = next((key, payload) for key, payload in blocks if key in ("lfx2", "lmfx", "lfxs"))
+
+        layer.set_layer_effects_block(*modern)
+        self.assertEqual(layer.layer_effects_blocks(), blocks)
+        self.assertEqual(
+            roundtrip(source)[layer.name].layer_effects_blocks(),
+            blocks,
+        )
+        layer.clear_layer_effects()
+        self.assertEqual(layer.layer_effects_blocks(), [])
+
+    def test_effect_payload_setter_keeps_unknown_fields_and_rejects_bad_payloads(self):
+        document = psapi.LayeredFile_8bit(psapi.enum.ColorMode.rgb, 8, 8)
+        document.add_layer(image("Effects"))
+        layer = document["Effects"]
+
+        def payload(value):
+            # Version-16 descriptor with a future integer field and opaque tail.
+            return (
+                struct.pack(">III", 0, 16, 0)
+                + struct.pack(">I4sI", 0, b"Lefx", 1)
+                + struct.pack(">I4s4si", 4, b"Futr", b"long", value)
+                + b"\xde\xad"
+            )
+
+        for value in (7, 8):
+            expected = payload(value)
+            layer.set_layer_effects_block("lmfx", expected)
+            blocks = dict(layer.layer_effects_blocks())
+            self.assertEqual(blocks["lmfx"], expected)
+            self.assertIn("lrFX", blocks)
+            self.assertEqual(dict(roundtrip(document)["Effects"].layer_effects_blocks()), blocks)
+
+        before = layer.layer_effects_blocks()
+        with self.assertRaises(ValueError):
+            layer.set_layer_effects_block("lmfx", b"\x00" * 8)
+        self.assertEqual(layer.layer_effects_blocks(), before)
+
+    def test_adjustment_payloads_create_edit_and_round_trip(self):
+        source = psapi.LayeredFile_8bit.read(
+            FIXTURES / "generated" / "Adjustments" / "adjustment_layers_8bit.psd"
+        )
+        payload = source["Exposure"].adjustment_blocks()[0]
+        document = psapi.LayeredFile_8bit(psapi.enum.ColorMode.rgb, 64, 64)
+        document.add_adjustment_layer("Exposure", *payload)
+
+        layer = document["Exposure"]
+        self.assertEqual(layer.kind, "adjustment")
+        self.assertTrue(layer.is_adjustment_layer())
+        self.assertEqual(layer.adjustment_blocks(), [payload])
+        layer.set_adjustment_block(*payload)
+        self.assertEqual(roundtrip(document)["Exposure"].adjustment_blocks(), [payload])
+
+        self.assertTrue(layer.clear_adjustment_block(payload[0]))
+        self.assertFalse(layer.clear_adjustment_block(payload[0]))
+
+    def test_legacy_and_modern_shapes_round_trip_from_typed_blocks(self):
+        source = psapi.LayeredFile_8bit.read(
+            FIXTURES / "generated" / "Vectors" / "vector_shapes_8bit.psd"
+        )
+        document = psapi.LayeredFile_8bit(psapi.enum.ColorMode.rgb, 64, 64)
+        expected = {}
+        for source_name, name in [("Legacy Rectangle", "Legacy"), ("Ellipse", "Modern")]:
+            source_layer = source[source_name]
+            blocks = source_layer.adjustment_blocks() + source_layer.vector_blocks()
+            document.add_shape_layer(name, (0, 0, 64, 64), blocks)
+            expected[name] = (source_layer.adjustment_blocks(), source_layer.vector_blocks())
+
+        reread = roundtrip(document)
+        for name, (adjustment_blocks, vector_blocks) in expected.items():
+            layer = reread[name]
+            self.assertEqual(layer.kind, "shape")
+            self.assertTrue(layer.is_shape_layer())
+            self.assertEqual(layer.adjustment_blocks(), adjustment_blocks)
+            self.assertEqual(layer.vector_blocks(), vector_blocks)
 
 
 class TextRangeTest(unittest.TestCase):

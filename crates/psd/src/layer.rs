@@ -11,7 +11,7 @@
 //! bits round-trip.
 
 use psd_core::artboard::is_artboard_key;
-use psd_core::layer_effects::LayerEffectsData;
+use psd_core::layer_effects::{LayerEffectsData, ModernLayerEffects};
 use psd_core::vector::is_vector_mask_key;
 use psd_core::Artboard;
 use psd_core::{
@@ -135,6 +135,48 @@ fn is_effects_key(key: TaggedBlockKey) -> bool {
     matches!(&key.as_bytes(), b"lfx2" | b"lmfx" | b"lfxs" | b"lrFX")
 }
 
+fn vector_block_rank(key: TaggedBlockKey) -> Option<u8> {
+    match &key.as_bytes() {
+        b"vscg" => Some(0),
+        b"vmsk" | b"vsms" => Some(1),
+        b"vstk" => Some(2),
+        b"vogk" => Some(3),
+        _ => None,
+    }
+}
+
+fn is_layer_metadata_key(key: TaggedBlockKey) -> bool {
+    matches!(
+        &key.as_bytes(),
+        b"luni"
+            | b"lnsr"
+            | b"lyid"
+            | b"clbl"
+            | b"infx"
+            | b"knko"
+            | b"lspf"
+            | b"lclr"
+            | b"shmd"
+            | b"sn2P"
+            | b"fxrp"
+            | b"lyvr"
+    )
+}
+
+fn has_vector_mask_block(blocks: &AdditionalLayerInfo) -> bool {
+    blocks
+        .blocks
+        .iter()
+        .any(|block| is_vector_mask_key(block.key))
+}
+
+fn has_shape_fill_block(blocks: &AdditionalLayerInfo) -> bool {
+    blocks.blocks.iter().any(|block| {
+        block.key.as_bytes() == *b"vscg"
+            || AdjustmentKind::from_key(block.key).is_some_and(AdjustmentKind::is_fill)
+    })
+}
+
 /// A single layer: metadata plus its kind-specific payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layer<T: BitDepth> {
@@ -208,6 +250,32 @@ impl<T: BitDepth> Layer<T> {
         }
     }
 
+    /// Build an adjustment or fill layer with no settings yet.
+    ///
+    /// Use empty bounds for adjustment layers and canvas-sized bounds for fill
+    /// layers. [`LayeredFile::add_adjustment_layer`](crate::LayeredFile::add_adjustment_layer)
+    /// chooses those bounds automatically when it receives a typed settings
+    /// block.
+    pub fn new_adjustment(name: impl Into<String>, bounds: Rect) -> Self {
+        let mut layer = Self::new_image(name, bounds);
+        layer.flags =
+            LayerFlags::from_bits(LayerFlags::BIT4_USEFUL | LayerFlags::PIXEL_DATA_IRRELEVANT);
+        layer.kind = LayerKind::Adjustment(AdjustmentLayer::new());
+        layer
+    }
+
+    /// Build an empty shape layer with the supplied canvas bounds.
+    ///
+    /// Add its fill and vector data with [`set_adjustment`](Self::set_adjustment)
+    /// and [`set_vector_block`](Self::set_vector_block).
+    pub fn new_shape(name: impl Into<String>, bounds: Rect) -> Self {
+        let mut layer = Self::new_image(name, bounds);
+        layer.flags =
+            LayerFlags::from_bits(LayerFlags::BIT4_USEFUL | LayerFlags::PIXEL_DATA_IRRELEVANT);
+        layer.kind = LayerKind::Shape(ShapeLayer::new());
+        layer
+    }
+
     pub fn is_visible(&self) -> bool {
         !self.flags.hidden()
     }
@@ -258,12 +326,14 @@ impl<T: BitDepth> Layer<T> {
         }
     }
 
-    /// The layer's channel store: pixels for image and text layers, mask
-    /// channels only for groups, `None` for section dividers.
+    /// The layer's channel store: pixels for image, text, adjustment, and
+    /// shape layers, mask channels for groups, and `None` for section dividers.
     pub fn channels(&self) -> Option<&ChannelStore<T>> {
         match &self.kind {
             LayerKind::Image(image) => Some(&image.channels),
             LayerKind::Text(text) => Some(&text.channels),
+            LayerKind::Adjustment(adjustment) => Some(&adjustment.channels),
+            LayerKind::Shape(shape) => Some(&shape.channels),
             LayerKind::Group(group) => Some(&group.channels),
             LayerKind::SectionDivider(_) => None,
         }
@@ -274,6 +344,8 @@ impl<T: BitDepth> Layer<T> {
         match &mut self.kind {
             LayerKind::Image(image) => Some(&mut image.channels),
             LayerKind::Text(text) => Some(&mut text.channels),
+            LayerKind::Adjustment(adjustment) => Some(&mut adjustment.channels),
+            LayerKind::Shape(shape) => Some(&mut shape.channels),
             LayerKind::Group(group) => Some(&mut group.channels),
             LayerKind::SectionDivider(_) => None,
         }
@@ -376,14 +448,15 @@ impl<T: BitDepth> Layer<T> {
     /// descriptor block and regenerates the `lrFX` mirror right after it, so a reader that
     /// only knows the legacy block sees the edit too. The mirror can hold one shadow, glow,
     /// bevel and colour overlay (the first of each); see
-    /// [`legacy_effects_block_data`](psd_core::legacy_effects_block_data). Photoshop ignores
+    /// [`legacy_effects_block_data`]. Photoshop ignores
     /// `lrFX` whenever a descriptor block is present.
     ///
     /// An existing block that cannot be read is replaced by a fresh one.
     pub fn set_layer_effects(&mut self, effects: &LayerEffects) -> Result<()> {
         let existing = self.effects_block_index();
-        let old_root = existing.and_then(|i| Self::effects_descriptor(&self.blocks.blocks[i]).ok());
-        let root = match &old_root {
+        let old_modern = existing.and_then(|i| Self::modern_effects(&self.blocks.blocks[i]).ok());
+        let old_root = old_modern.as_ref().map(|modern| &modern.descriptor);
+        let root = match old_root {
             Some(old) => {
                 let mut root = old.clone();
                 effects.apply_to(&mut root);
@@ -406,15 +479,71 @@ impl<T: BitDepth> Layer<T> {
         // Nothing changed when the same descriptor would be stored under the same key. That is
         // decided on the descriptors and not on the block's bytes: the padding a file put after
         // its descriptor is not ours to normalise.
-        if old_root.as_ref() == Some(&root) && existing_key == Some(key) {
+        if old_root == Some(&root) && existing_key == Some(key) {
             return Ok(());
         }
-        let data = effects_block_data(&root)?;
         // The legacy mirror is derived from what the descriptor now says, not from `effects`:
         // a field the set leaves `None` keeps the value the descriptor has.
         let mirror = legacy_effects_block_data(&LayerEffects::from_descriptor(&root));
+        let data = match old_modern {
+            Some(mut modern) => {
+                modern.descriptor = root;
+                modern.to_payload()?
+            }
+            None => effects_block_data(&root)?,
+        };
+        let mut replacement = TaggedBlock::new(TaggedBlockKey::new(key), data);
+        if let Some(index) = existing {
+            replacement.signature = self.blocks.blocks[index].signature;
+        }
 
         let position = existing.unwrap_or_else(|| self.new_effects_block_position());
+        self.replace_effects_block(position, replacement, mirror);
+        Ok(())
+    }
+
+    /// Replace the full modern effects payload (`lfx2`, `lmfx`, or `lfxs`).
+    ///
+    /// Unknown descriptor fields and trailing bytes are retained, and the
+    /// legacy `lrFX` mirror is regenerated from the supplied descriptor. A
+    /// byte-identical replacement of the authoritative block leaves all
+    /// existing blocks unchanged. Replacing a block under the same key keeps
+    /// its original signature. Malformed or legacy payloads are rejected
+    /// before any layer data changes.
+    pub fn set_layer_effects_block(&mut self, block: &TaggedBlock) -> Result<()> {
+        if !matches!(&block.signature, b"8BIM" | b"8B64") {
+            return Err(PsdError::InvalidSignature {
+                expected: "8BIM or 8B64",
+                found: block.signature,
+                offset: 0,
+            });
+        }
+        let modern = Self::modern_effects(block)?;
+        let existing = self.effects_block_index();
+        if existing.is_some_and(|index| {
+            let existing = &self.blocks.blocks[index];
+            existing.key == block.key && existing.data == block.data
+        }) {
+            return Ok(());
+        }
+        let mirror = legacy_effects_block_data(&LayerEffects::from_descriptor(&modern.descriptor));
+        let mut replacement = block.clone();
+        if let Some(index) = existing {
+            if self.blocks.blocks[index].key == block.key {
+                replacement.signature = self.blocks.blocks[index].signature;
+            }
+        }
+        let position = existing.unwrap_or_else(|| self.new_effects_block_position());
+        self.replace_effects_block(position, replacement, mirror);
+        Ok(())
+    }
+
+    fn replace_effects_block(
+        &mut self,
+        position: usize,
+        replacement: TaggedBlock,
+        mirror: Vec<u8>,
+    ) {
         let blocks = &mut self.blocks.blocks;
         let dropped_before = blocks[..position]
             .iter()
@@ -426,11 +555,7 @@ impl<T: BitDepth> Layer<T> {
             position - dropped_before,
             TaggedBlock::new(TaggedBlockKey::new(*b"lrFX"), mirror),
         );
-        blocks.insert(
-            position - dropped_before,
-            TaggedBlock::new(TaggedBlockKey::new(key), data),
-        );
-        Ok(())
+        blocks.insert(position - dropped_before, replacement);
     }
 
     /// Remove every effects block from the layer, descriptor and legacy alike.
@@ -451,11 +576,15 @@ impl<T: BitDepth> Layer<T> {
     }
 
     fn effects_descriptor(block: &TaggedBlock) -> Result<Descriptor> {
+        Ok(Self::modern_effects(block)?.descriptor)
+    }
+
+    fn modern_effects(block: &TaggedBlock) -> Result<ModernLayerEffects> {
         match LayerEffectsBlock::read(block)? {
             Some(LayerEffectsBlock {
                 data: LayerEffectsData::Modern(modern),
                 ..
-            }) => Ok(modern.descriptor),
+            }) => Ok(modern),
             _ => Err(PsdError::InvalidData {
                 offset: 0,
                 message: "not a descriptor-based layer effects block",
@@ -478,15 +607,15 @@ impl<T: BitDepth> Layer<T> {
             .unwrap_or(blocks.len())
     }
 
-    /// Whether the layer carries an adjustment or fill-layer settings block
-    /// (`levl`, `curv`, `SoCo`, ...; see [`AdjustmentKind`]). Upstream detects
-    /// the same keys to build its opaque `AdjustmentLayer`. Photoshop also
-    /// stores a shape layer's fill in `SoCo`/`GdFl`/`PtFl`, so shape layers
-    /// report `true` as well.
+    /// Whether this is an adjustment or fill layer, or it carries a recognized
+    /// adjustment settings block (`levl`, `curv`, `SoCo`, ...; see
+    /// [`AdjustmentKind`]). Photoshop also stores shape fills in `SoCo`,
+    /// `GdFl`, or `PtFl`, so shape layers with those blocks report `true` too.
     pub fn is_adjustment_layer(&self) -> bool {
-        self.blocks.blocks.iter().any(|block| {
-            AdjustmentKind::from_key(block.key).is_some_and(AdjustmentKind::marks_layer)
-        })
+        matches!(self.kind, LayerKind::Adjustment(_))
+            || self.blocks.blocks.iter().any(|block| {
+                AdjustmentKind::from_key(block.key).is_some_and(AdjustmentKind::marks_layer)
+            })
     }
 
     /// Every adjustment and fill block in source order, including a `CgEd`
@@ -501,6 +630,110 @@ impl<T: BitDepth> Layer<T> {
             .collect()
     }
 
+    /// Read one adjustment or fill settings block by kind.
+    pub fn adjustment(&self, kind: AdjustmentKind) -> Result<Option<AdjustmentBlock>> {
+        self.blocks
+            .blocks
+            .iter()
+            .find(|block| block.key == kind.key())
+            .map(AdjustmentBlock::read)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Add or replace one typed adjustment, fill, or CgEd companion block.
+    ///
+    /// Existing blocks keep their position. A new settings block is placed
+    /// beside other adjustment settings at the start of the layer's tagged
+    /// blocks; CgEd follows the adjustment it accompanies. Unknown blocks are
+    /// left in their original order. An image layer is promoted to the
+    /// adjustment kind and marked as derived pixel data. A CgEd block requires
+    /// an existing adjustment; groups and section dividers cannot carry these
+    /// settings.
+    pub fn set_adjustment(&mut self, adjustment: &AdjustmentBlock) -> Result<()> {
+        let mut block = adjustment.to_tagged_block()?;
+        if matches!(
+            self.kind,
+            LayerKind::Group(_) | LayerKind::SectionDivider(_)
+        ) {
+            return Err(invalid("adjustment settings need a non-group layer"));
+        }
+        if adjustment.kind == AdjustmentKind::ContentGenerator && !self.is_adjustment_layer() {
+            return Err(invalid("CgEd needs an adjustment or fill layer"));
+        }
+        if (adjustment.kind.is_fill() || has_shape_fill_block(&self.blocks))
+            && has_vector_mask_block(&self.blocks)
+            && matches!(self.kind, LayerKind::Text(_))
+        {
+            return Err(invalid("text layers cannot be promoted to shapes"));
+        }
+        if (adjustment.kind.marks_layer() || self.is_adjustment_layer())
+            && matches!(self.kind, LayerKind::Image(_))
+        {
+            let old = std::mem::replace(
+                &mut self.kind,
+                LayerKind::Adjustment(AdjustmentLayer::new()),
+            );
+            let LayerKind::Image(image) = old else {
+                unreachable!("the image kind was checked before replacement")
+            };
+            self.kind = LayerKind::Adjustment(AdjustmentLayer {
+                channels: image.channels,
+            });
+            self.flags.set_pixel_data_irrelevant(true);
+        }
+        if let Some(existing) = self
+            .blocks
+            .blocks
+            .iter_mut()
+            .find(|existing| existing.key == block.key)
+        {
+            block.signature = existing.signature;
+            *existing = block;
+            self.promote_to_shape_if_marked()?;
+            return Ok(());
+        }
+        let position = if adjustment.kind == AdjustmentKind::ContentGenerator {
+            self.blocks
+                .blocks
+                .iter()
+                .rposition(|existing| {
+                    AdjustmentKind::from_key(existing.key).is_some_and(AdjustmentKind::marks_layer)
+                })
+                .map_or(0, |index| index + 1)
+        } else {
+            self.blocks
+                .blocks
+                .iter()
+                .rposition(|existing| {
+                    AdjustmentKind::from_key(existing.key).is_some_and(AdjustmentKind::marks_layer)
+                })
+                .map_or_else(
+                    || {
+                        self.blocks
+                            .blocks
+                            .iter()
+                            .position(|existing| {
+                                AdjustmentKind::from_key(existing.key)
+                                    == Some(AdjustmentKind::ContentGenerator)
+                            })
+                            .unwrap_or(0)
+                    },
+                    |index| index + 1,
+                )
+        };
+        self.blocks.blocks.insert(position, block);
+        self.promote_to_shape_if_marked()?;
+        Ok(())
+    }
+
+    /// Remove the block for one adjustment or fill kind.
+    pub fn clear_adjustment(&mut self, kind: AdjustmentKind) -> bool {
+        let before = self.blocks.blocks.len();
+        self.blocks.blocks.retain(|block| block.key != kind.key());
+        before != self.blocks.blocks.len()
+    }
+
     /// Every vector block (`vmsk`/`vsms` masks, `vstk` strokes, `vscg`
     /// content, `vogk` origination) in source order, parsed on demand. The
     /// raw blocks remain the write source. A malformed or unsupported payload
@@ -511,6 +744,81 @@ impl<T: BitDepth> Layer<T> {
             .iter()
             .filter_map(|block| VectorBlock::read(block).transpose())
             .collect()
+    }
+
+    /// Add or replace one typed vector-mask, fill, stroke, or live-shape block.
+    ///
+    /// Existing blocks keep their position. New vector blocks follow Photoshop's
+    /// fill, mask, stroke, origination order and are placed before layer metadata.
+    /// A pixel or fill layer is promoted to `LayerKind::Shape` once its blocks
+    /// describe both a vector mask and a fill.
+    pub fn set_vector_block(&mut self, vector: &VectorBlock) -> Result<()> {
+        let mut block = vector.to_tagged_block()?;
+        if block.key.as_bytes() == *b"pths" {
+            return Err(invalid("path names are a document-level block"));
+        }
+        if matches!(
+            self.kind,
+            LayerKind::Group(_) | LayerKind::SectionDivider(_)
+        ) {
+            return Err(invalid("vector shape data needs a non-group layer"));
+        }
+        let would_be_shape = (is_vector_mask_key(block.key) || has_vector_mask_block(&self.blocks))
+            && (block.key.as_bytes() == *b"vscg" || has_shape_fill_block(&self.blocks));
+        if would_be_shape && matches!(self.kind, LayerKind::Text(_)) {
+            return Err(invalid("text layers cannot be promoted to shapes"));
+        }
+        if let Some(existing) = self
+            .blocks
+            .blocks
+            .iter_mut()
+            .find(|existing| existing.key == block.key)
+        {
+            block.signature = existing.signature;
+            *existing = block;
+        } else {
+            let rank = vector_block_rank(block.key).unwrap_or(u8::MAX);
+            let position = self
+                .blocks
+                .blocks
+                .iter()
+                .position(|existing| {
+                    vector_block_rank(existing.key)
+                        .is_some_and(|existing_rank| existing_rank > rank)
+                        || is_layer_metadata_key(existing.key)
+                })
+                .unwrap_or(self.blocks.blocks.len());
+            self.blocks.blocks.insert(position, block);
+        }
+        self.promote_to_shape_if_marked()
+    }
+
+    /// Remove one layer-level vector block. Other keys return `false`.
+    pub fn clear_vector_block(&mut self, key: TaggedBlockKey) -> bool {
+        if vector_block_rank(key).is_none() {
+            return false;
+        }
+        let before = self.blocks.blocks.len();
+        self.blocks.blocks.retain(|block| block.key != key);
+        before != self.blocks.blocks.len()
+    }
+
+    fn promote_to_shape_if_marked(&mut self) -> Result<()> {
+        if !self.is_shape_layer() || matches!(self.kind, LayerKind::Shape(_)) {
+            return Ok(());
+        }
+        let channels = match &mut self.kind {
+            LayerKind::Image(image) => std::mem::take(&mut image.channels),
+            LayerKind::Adjustment(adjustment) => std::mem::take(&mut adjustment.channels),
+            LayerKind::Text(_) => return Err(invalid("text layers cannot be promoted to shapes")),
+            LayerKind::Group(_) | LayerKind::SectionDivider(_) => {
+                return Err(invalid("vector shape data needs a non-group layer"))
+            }
+            LayerKind::Shape(_) => unreachable!("checked above"),
+        };
+        self.kind = LayerKind::Shape(ShapeLayer { channels });
+        self.flags.set_pixel_data_irrelevant(true);
+        Ok(())
     }
 
     /// The layer's vector mask (`vmsk`, or `vsms` from Photoshop CS6 on),
@@ -530,14 +838,11 @@ impl<T: BitDepth> Layer<T> {
     /// with `vogk`, `vmsk`, `vstk`, or `vscg` as a shape, but only after its
     /// adjustment check, which already claims every `SoCo` layer.
     pub fn is_shape_layer(&self) -> bool {
-        let mut mask = false;
-        let mut fill = false;
-        for block in &self.blocks.blocks {
-            mask |= is_vector_mask_key(block.key);
-            fill |= block.key.as_bytes() == *b"vscg"
-                || AdjustmentKind::from_key(block.key).is_some_and(AdjustmentKind::is_fill);
-        }
-        mask && fill
+        matches!(self.kind, LayerKind::Shape(_)) || self.has_shape_markers()
+    }
+
+    pub(crate) fn has_shape_markers(&self) -> bool {
+        has_vector_mask_block(&self.blocks) && has_shape_fill_block(&self.blocks)
     }
 
     /// Whether the layer is an artboard: a group whose record carries an
@@ -567,6 +872,66 @@ impl<T: BitDepth> Layer<T> {
             Some(block) => Artboard::read(block),
             None => Ok(None),
         }
+    }
+
+    /// Add or replace this group's typed artboard block.
+    ///
+    /// Use this on a detached layer. For a layer already in a document, use
+    /// [`LayeredFile::set_artboard`](crate::LayeredFile::set_artboard) so the
+    /// document-level artboard count stays in sync. To append a new root
+    /// artboard, use [`LayeredFile::add_artboard`](crate::LayeredFile::add_artboard).
+    pub fn set_artboard(&mut self, artboard: &Artboard) -> Result<()> {
+        if self.group().is_none() {
+            return Err(invalid("only a group layer can be an artboard"));
+        }
+        let existing = self
+            .blocks
+            .blocks
+            .iter()
+            .position(|block| is_artboard_key(block.key));
+        let mut artboard = artboard.clone();
+        if let Some(index) = existing {
+            artboard.key = self.blocks.blocks[index].key;
+        }
+        let mut replacement = artboard.to_tagged_block()?;
+        if let Some(index) = existing {
+            replacement.signature = self.blocks.blocks[index].signature;
+        }
+        if existing.is_some_and(|index| self.blocks.blocks[index] == replacement) {
+            return Ok(());
+        }
+        let position = existing.unwrap_or_else(|| {
+            self.blocks
+                .blocks
+                .iter()
+                .position(|block| {
+                    is_layer_metadata_key(block.key)
+                        || block.key.as_bytes() == *b"lsct"
+                        || block.key.as_bytes() == *b"lsdk"
+                })
+                .unwrap_or(0)
+        });
+        let blocks = &mut self.blocks.blocks;
+        let removed_before = blocks[..position]
+            .iter()
+            .filter(|block| is_artboard_key(block.key))
+            .count();
+        blocks.retain(|block| !is_artboard_key(block.key));
+        blocks.insert(position - removed_before, replacement);
+        Ok(())
+    }
+
+    /// Remove every artboard tagged block carried by this layer.
+    ///
+    /// Use this on a detached layer. For a layer already in a document, use
+    /// [`LayeredFile::clear_artboard`](crate::LayeredFile::clear_artboard) so
+    /// the document-level artboard count stays in sync.
+    pub fn clear_artboard(&mut self) -> bool {
+        let before = self.blocks.blocks.len();
+        self.blocks
+            .blocks
+            .retain(|block| !is_artboard_key(block.key));
+        before != self.blocks.blocks.len()
     }
 
     // ------------------------------------------------------------------
@@ -913,10 +1278,59 @@ pub enum LayerKind<T: BitDepth> {
     /// Text layer and its ordinary raster preview channels. The text model is
     /// kept in the losslessly preserved `TySh`/`Txt2` blocks on [`Layer`].
     Text(TextLayer<T>),
+    /// Adjustment or fill layer. Its pixels are derived from its settings;
+    /// the channel store carries any preserved preview or mask channels.
+    Adjustment(AdjustmentLayer<T>),
+    /// Vector shape with its fill, path, and optional stroke in tagged blocks.
+    Shape(ShapeLayer<T>),
     /// Group layer: child layers, the open/closed state, and mask channels.
     Group(GroupLayer<T>),
     /// Section divider marker (the `</Layer group>` records Photoshop writes).
     SectionDivider(SectionDivider),
+}
+
+/// Typed layer kind for adjustment and fill layers.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AdjustmentLayer<T: BitDepth> {
+    pub channels: ChannelStore<T>,
+}
+
+impl<T: BitDepth> AdjustmentLayer<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pixels of one channel, when the file carries a preview channel.
+    pub fn channel(&self, key: ChannelKey) -> Option<&[T]> {
+        self.channels.get(key)
+    }
+
+    /// Replace a preserved preview or mask channel.
+    pub fn set_channel(&mut self, key: ChannelKey, data: Vec<T>) {
+        self.channels.insert(key, data);
+    }
+}
+
+/// Typed layer kind for vector shapes.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ShapeLayer<T: BitDepth> {
+    pub channels: ChannelStore<T>,
+}
+
+impl<T: BitDepth> ShapeLayer<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pixels of one preserved preview or mask channel.
+    pub fn channel(&self, key: ChannelKey) -> Option<&[T]> {
+        self.channels.get(key)
+    }
+
+    /// Replace a preserved preview or mask channel.
+    pub fn set_channel(&mut self, key: ChannelKey, data: Vec<T>) {
+        self.channels.insert(key, data);
+    }
 }
 
 /// A pixel layer's channels.

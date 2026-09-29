@@ -3,11 +3,10 @@
 //! Every descriptor `enum` names a type (`BESl`) and a value (`InrB`). Photoshop writes the
 //! historical four-character values, and Photoshop 2026 writes long camelCase ones (`innerBevel`)
 //! for some; both read, and writing uses the historical value, which every Photoshop version
-//! reads. The names follow the public `ag-psd-rs` reference
-//! (<https://github.com/Vasyanator/ag-psd-rs>) checked against Photoshop-authored files.
+//! reads. The names are checked against Photoshop-authored files.
 
-/// Compare an ID against a long name ignoring case, spaces and hyphens, so `inner bevel`
-/// (the reference's spelling) and `innerBevel` (Photoshop 2026's) both match.
+/// Compare an ID against a long name ignoring case, spaces and hyphens, so `inner bevel` and
+/// `innerBevel` both match.
 fn same_name(id: &[u8], long: &str) -> bool {
     let fold = |bytes: &[u8]| -> Vec<u8> {
         bytes

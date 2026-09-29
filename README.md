@@ -17,10 +17,7 @@
 **PhotoshopAPI-rs** is a pure-Rust library for reading, writing and editing
 Photoshop documents (`.psd` / `.psb`), with Python bindings. It is a
 from-scratch port of the C++20 [EmilDohne/PhotoshopAPI](https://github.com/EmilDohne/PhotoshopAPI)
-v0.9.1, which is in turn based on
-[psd_sdk](https://github.com/MolecularMatters/psd_sdk),
-[pytoshop](https://github.com/mdboom/pytoshop) and
-[psd-tools](https://github.com/psd-tools/psd-tools), plus the official
+v0.9.1, which is in turn based on a C++ PSD SDK, a Python PSD writer, and the official
 [Photoshop File Format Specification](https://web.archive.org/web/20231122064257/https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/).
 
 Like upstream, the goal is layer editing as a first-class citizen across **all
@@ -135,6 +132,14 @@ composite, and replacement is transactional.
   bevel and emboss, colour, gradient and pattern overlays, satin and strokes (several
   instances of each repeatable effect included). An edit changes what it names and keeps
   every other byte, and refreshes the legacy `lrFX` block beside the descriptor
+- Adjustment and fill layers: typed settings for every recognized block kind, byte-exact
+  payload writing, layer creation with adjustment or canvas-sized fill bounds, and block edits
+- Shape layers: create legacy and modern fills from typed vector masks, strokes, and live-shape
+  blocks; vector records and unknown path bytes are preserved
+- Artboards: create artboard groups, edit their bounds and backgrounds, and maintain document
+  artboard settings through Rust and Python
+- Python access to effects, adjustment, vector, and artboard blocks, including adjustment/fill,
+  shape, and artboard creation
 - Pixel and group masks
 - Layer attributes: name, blend mode, opacity, fill, lock, clipping, display color
 - ICC profile and DPI
@@ -148,8 +153,6 @@ composite, and replacement is transactional.
 **Not supported**
 
 - Lab and Multichannel color modes
-- Adjustment and shape layers (round-tripped as opaque stubs, not authored)
-- Vector masks as authored geometry (read and preserved, not created)
 - A valid merged composite image. Saves write a zeroed RLE composite, matching
   upstream: it keeps files 20–50% smaller, but third-party readers that require
   a real flattened image (Lightroom, for example) will not have one.
@@ -346,7 +349,7 @@ The full list is in [CHANGELOG.md](CHANGELOG.md) under *Changed* and *Fixed*.
 
 ## Testing
 
-- **520 Rust tests** across 27 suites, plus **213 Python tests** — of which 184
+- **840 Rust tests** across 56 suites (2 ignored), plus **227 Python tests** — of which 184
   are ported one-for-one from upstream's `psapi-test` suite, keeping upstream's
   own assertions.
 - A vendored corpus of **71 PSD/PSB documents** covering bit depth × color mode ×
@@ -358,8 +361,6 @@ The full list is in [CHANGELOG.md](CHANGELOG.md) under *Changed* and *Fixed*.
 
 ## Roadmap
 
-- Adjustment and shape layers as authored, not stubs
-- Authored vector masks
 - Indexed and Duotone color modes
 - Performance benchmarks and documentation (images and benchmark data are not
   published yet, so no speed claims are made here)
