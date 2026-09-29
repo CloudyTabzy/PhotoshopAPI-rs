@@ -12,6 +12,43 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.30] - 2026-09-29
+
+Editing a layer's effects now keeps its legacy `lrFX` block in step.
+
+### Added
+
+- `legacy_effects_block_data`, which builds the legacy `lrFX` payload from a `LayerEffects`.
+  Photoshop writes each layer's effects twice, as the descriptor block current versions read
+  and as `lrFX`, the fixed 396-byte layout Photoshop 5 to CS5 read: seven records (common
+  state, drop shadow, inner shadow, outer glow, inner glow, bevel, solid fill), always all of
+  them. It holds one of each, so the first instance of each family is written, and an effect
+  the layer lacks is written as Photoshop's default switched off. Satin, gradient and pattern
+  overlays, strokes and further instances have no legacy record and are not mirrored.
+  Colours are written in their own colour space (RGB, HSB, CMYK with inverted ink, Lab,
+  gray), a gradient glow takes its first stop's colour, an emboss's size is halved and a
+  bevel's strength is the depth applied to it within 1 to 20.
+
+### Changed
+
+- `Layer::set_layer_effects` regenerates the `lrFX` mirror after a real change, immediately
+  after the descriptor block as in Photoshop-authored files, instead of dropping it. The
+  mirror is derived from what the descriptor now says, so a field the set leaves out keeps
+  the value the layer has. Setting a layer's own effects back still changes nothing and keeps
+  its existing mirror byte for byte.
+
+### Verified
+
+- The generated block against the `lrFX` Photoshop wrote beside the descriptor block, on all
+  300 layers that have both in about 420 Photoshop-authored documents. 166 match byte for
+  byte; the other 134 differ only in rounding Photoshop does on values this model cannot see
+  the low bits of (a colour component within two units of 65535, an opacity byte within one:
+  current Photoshop truncates an exact half percent to `0x7f`, older versions rounded it up
+  to `0x80`), except four records that three documents' Photoshop wrote unlike any other
+  (an absent drop shadow with distance 0, an absent inner glow not inverted, and a 100 px
+  bevel written as 50 px). A bevel's strength is truncated to 16.16, not rounded, and the
+  common state stays visible even when the layer's effects are switched off as a whole.
+
 ## [0.6.29] - 2026-09-29
 
 Layer effects can now be created and edited on a layer.

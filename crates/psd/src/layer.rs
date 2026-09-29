@@ -15,10 +15,11 @@ use psd_core::layer_effects::LayerEffectsData;
 use psd_core::vector::is_vector_mask_key;
 use psd_core::Artboard;
 use psd_core::{
-    effects_block_data, AdditionalLayerInfo, AdjustmentBlock, AdjustmentKind, BeReader, BlendMode,
-    Compression, Descriptor, LayerBlendingRanges, LayerColor, LayerEffects, LayerEffectsBlock,
-    LayerFlags, LayerMask, LayerMaskData, LayerMaskFlags, PlacedLayer, PlacedLayerData, PsdError,
-    Result, SectionDivider, TaggedBlock, TaggedBlockKey, VectorBlock, VectorMask,
+    effects_block_data, legacy_effects_block_data, AdditionalLayerInfo, AdjustmentBlock,
+    AdjustmentKind, BeReader, BlendMode, Compression, Descriptor, LayerBlendingRanges, LayerColor,
+    LayerEffects, LayerEffectsBlock, LayerFlags, LayerMask, LayerMaskData, LayerMaskFlags,
+    PlacedLayer, PlacedLayerData, PsdError, Result, SectionDivider, TaggedBlock, TaggedBlockKey,
+    VectorBlock, VectorMask,
 };
 
 use crate::bitdepth::BitDepth;
@@ -372,8 +373,11 @@ impl<T: BitDepth> Layer<T> {
     ///
     /// Setting a layer's own effects back to what it has changes nothing: the block, and the
     /// legacy `lrFX` mirror beside it, are left as they were. Any real change rewrites the
-    /// descriptor block and drops the `lrFX` mirror, which a later release regenerates from
-    /// the set; Photoshop ignores `lrFX` whenever a descriptor block is present.
+    /// descriptor block and regenerates the `lrFX` mirror right after it, so a reader that
+    /// only knows the legacy block sees the edit too. The mirror can hold one shadow, glow,
+    /// bevel and colour overlay (the first of each); see
+    /// [`legacy_effects_block_data`](psd_core::legacy_effects_block_data). Photoshop ignores
+    /// `lrFX` whenever a descriptor block is present.
     ///
     /// An existing block that cannot be read is replaced by a fresh one.
     pub fn set_layer_effects(&mut self, effects: &LayerEffects) -> Result<()> {
@@ -406,6 +410,9 @@ impl<T: BitDepth> Layer<T> {
             return Ok(());
         }
         let data = effects_block_data(&root)?;
+        // The legacy mirror is derived from what the descriptor now says, not from `effects`:
+        // a field the set leaves `None` keeps the value the descriptor has.
+        let mirror = legacy_effects_block_data(&LayerEffects::from_descriptor(&root));
 
         let position = existing.unwrap_or_else(|| self.new_effects_block_position());
         let blocks = &mut self.blocks.blocks;
@@ -414,6 +421,11 @@ impl<T: BitDepth> Layer<T> {
             .filter(|b| is_effects_key(b.key))
             .count();
         blocks.retain(|block| !is_effects_key(block.key));
+        // `lrFX` follows the descriptor block immediately, as in Photoshop-authored files.
+        blocks.insert(
+            position - dropped_before,
+            TaggedBlock::new(TaggedBlockKey::new(*b"lrFX"), mirror),
+        );
         blocks.insert(
             position - dropped_before,
             TaggedBlock::new(TaggedBlockKey::new(key), data),

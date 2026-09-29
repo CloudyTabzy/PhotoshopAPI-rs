@@ -134,7 +134,7 @@ composite, and replacement is transactional.
 - Layer effects: read as typed models, and create or edit drop and inner shadows, glows,
   bevel and emboss, colour, gradient and pattern overlays, satin and strokes (several
   instances of each repeatable effect included). An edit changes what it names and keeps
-  every other byte
+  every other byte, and refreshes the legacy `lrFX` block beside the descriptor
 - Pixel and group masks
 - Layer attributes: name, blend mode, opacity, fill, lock, clipping, display color
 - ICC profile and DPI

@@ -75,8 +75,8 @@ fn a_new_set_is_stored_before_the_name_block_and_survives_a_save() {
     let layer = styled_layer(&file);
     assert_eq!(
         keys(layer),
-        ["lfx2", "luni"],
-        "the effects block goes before `luni`"
+        ["lfx2", "lrFX", "luni"],
+        "the effects block and its legacy mirror go before `luni`"
     );
     assert_eq!(layer.blocks.blocks[0].data.len() % 4, 0);
 
@@ -95,7 +95,7 @@ fn a_new_set_with_several_instances_is_stored_as_lmfx() {
     edit(&mut file, |layer| {
         layer.set_layer_effects(&effects).unwrap()
     });
-    assert_eq!(keys(styled_layer(&file)), ["lmfx", "luni"]);
+    assert_eq!(keys(styled_layer(&file)), ["lmfx", "lrFX", "luni"]);
     assert_eq!(
         styled_layer(&reread(&file)).layer_effects().unwrap(),
         Some(effects)
@@ -115,7 +115,7 @@ fn an_existing_block_keeps_its_key_whatever_the_edit_does_to_the_instance_count(
         effects.strokes.push(Stroke::default());
         layer.set_layer_effects(&effects).unwrap();
     });
-    assert_eq!(keys(styled_layer(&file)), ["lfx2", "luni"]);
+    assert_eq!(keys(styled_layer(&file)), ["lfx2", "lrFX", "luni"]);
     let effects = styled_layer(&reread(&file))
         .layer_effects()
         .unwrap()
@@ -133,7 +133,7 @@ fn an_existing_block_keeps_its_key_whatever_the_edit_does_to_the_instance_count(
     edit(&mut file, |layer| {
         layer.set_layer_effects(&effects).unwrap()
     });
-    assert_eq!(keys(styled_layer(&file)), ["lmfx", "luni"]);
+    assert_eq!(keys(styled_layer(&file)), ["lmfx", "lrFX", "luni"]);
     assert_eq!(styled_layer(&file).layer_effects().unwrap(), Some(effects));
 }
 
@@ -177,37 +177,77 @@ fn setting_the_same_effects_changes_nothing_and_clearing_removes_the_blocks() {
     assert_eq!(styled_layer(&file).layer_effects().unwrap(), None);
 }
 
+/// The bytes of the layer's `lrFX` block.
+fn mirror(layer: &Layer<u8>) -> Vec<u8> {
+    let block = layer
+        .blocks
+        .blocks
+        .iter()
+        .find(|b| b.key.as_bytes() == *b"lrFX")
+        .expect("the layer has a legacy mirror");
+    block.data.clone()
+}
+
+/// The `u32` at `offset` of the record `key` in a legacy block's payload.
+fn record_u32(block: &[u8], key: &[u8; 4], offset: usize) -> u32 {
+    let mut at = 4;
+    while at + 12 <= block.len() {
+        let size = u32::from_be_bytes(block[at + 8..at + 12].try_into().unwrap()) as usize;
+        if &block[at + 4..at + 8] == key {
+            let start = at + 12 + offset;
+            return u32::from_be_bytes(block[start..start + 4].try_into().unwrap());
+        }
+        at += 12 + size;
+    }
+    panic!("no {key:?} record");
+}
+
 #[test]
-fn an_edit_drops_the_legacy_mirror_and_a_no_op_keeps_it() {
+fn an_edit_regenerates_the_legacy_mirror_and_a_no_op_keeps_it() {
     let mut file = document();
     edit(&mut file, |layer| {
-        layer.set_layer_effects(&full_set()).unwrap();
-        // Photoshop writes `lrFX` right after the descriptor block.
-        layer.blocks.blocks.insert(
-            1,
-            TaggedBlock::new(TaggedBlockKey::new(*b"lrFX"), vec![0; 4]),
-        );
+        layer.set_layer_effects(&full_set()).unwrap()
     });
+    let first = mirror(styled_layer(&file));
+    assert_eq!(first.len(), 396);
+    // Drop shadow: size 5 px, distance 5 px, as 16.16 fixed point.
+    assert_eq!(record_u32(&first, b"dsdw", 4), 5 << 16);
+    assert_eq!(record_u32(&first, b"dsdw", 16), 5 << 16);
+
     edit(&mut file, |layer| {
         let same = layer.layer_effects().unwrap().unwrap();
         layer.set_layer_effects(&same).unwrap();
     });
     assert_eq!(
-        keys(styled_layer(&file)),
-        ["lfx2", "lrFX", "luni"],
+        mirror(styled_layer(&file)),
+        first,
         "a no-op keeps the mirror"
     );
 
     edit(&mut file, |layer| {
         let mut effects = layer.layer_effects().unwrap().unwrap();
-        effects.satin = None;
+        effects.drop_shadows[0].distance = Some(40.0);
         layer.set_layer_effects(&effects).unwrap();
     });
+    let after = mirror(styled_layer(&file));
+    assert_eq!(record_u32(&after, b"dsdw", 16), 40 << 16);
     assert_eq!(
         keys(styled_layer(&file)),
-        ["lfx2", "luni"],
-        "a real edit drops it"
+        ["lfx2", "lrFX", "luni"],
+        "the mirror follows the descriptor block"
     );
+
+    // The mirror follows what the descriptor says, whatever the set leaves out: a set whose
+    // shadow says nothing about its size still leaves the descriptor's 5 px in the mirror.
+    edit(&mut file, |layer| {
+        let mut effects = layer.layer_effects().unwrap().unwrap();
+        effects.drop_shadows[0].size = None;
+        effects.drop_shadows[0].distance = Some(12.0);
+        layer.set_layer_effects(&effects).unwrap();
+    });
+    let last = mirror(styled_layer(&file));
+    assert_eq!(record_u32(&last, b"dsdw", 4), 5 << 16);
+    assert_eq!(record_u32(&last, b"dsdw", 16), 12 << 16);
 }
 
 #[test]
@@ -225,7 +265,7 @@ fn a_block_that_cannot_be_read_is_replaced() {
         styled_layer(&file).layer_effects().unwrap(),
         Some(full_set())
     );
-    assert_eq!(keys(styled_layer(&file)), ["lfx2", "luni"]);
+    assert_eq!(keys(styled_layer(&file)), ["lfx2", "lrFX", "luni"]);
 }
 
 // ---------------------------------------------------------------------------------------

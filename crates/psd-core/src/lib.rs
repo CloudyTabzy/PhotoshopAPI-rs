@@ -43,6 +43,7 @@ pub mod image_resources;
 pub mod io;
 pub mod layer_and_mask_info;
 pub mod layer_effects;
+mod legacy_effects;
 pub mod linked_layer;
 pub mod photoshop_file;
 pub mod placed_layer;
@@ -100,6 +101,7 @@ pub use layer_effects::{
     EffectDescriptor, EffectKind, LayerEffectsBlock, LayerEffectsData, LegacyEffectColor,
     LegacyEffectRecord, LegacyLayerEffects, ModernLayerEffects,
 };
+pub use legacy_effects::legacy_effects_block_data;
 pub use linked_layer::{
     Date, LinkedDataKind, LinkedLayer, LinkedLayerTaggedBlock, LinkedLayerView,
 };
