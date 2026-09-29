@@ -6,7 +6,13 @@ no `repository` URL, so no version headings carry compare links.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-30
+
 ### Fixed
+
+- Corrected the `InvalidChunkType` documentation after removal of the encoder API, so
+  documentation builds succeed with warnings denied. The error variant remains available
+  for compatibility.
 
 - **16-bit greyscale with a `tRNS` key, decoded to RGBA8, made the wrong pixels
   transparent.** The portable kernel for that shape gathered each pixel's alpha from the

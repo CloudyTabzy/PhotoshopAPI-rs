@@ -1,4 +1,4 @@
-//! Errors produced when reading or writing PNG data.
+//! Errors produced when decoding PNG data.
 
 use crate::inflate::InflateError;
 
@@ -29,9 +29,9 @@ pub enum Error {
         /// The length it carried.
         length: usize,
     },
-    /// A metadata chunk's type is not one the encoder is allowed to write.
+    /// An invalid metadata chunk type, retained for compatibility.
     ///
-    /// See [`Chunk::validate`](crate::common::Chunk::validate) for the rules.
+    /// Older encoder APIs used this error when validating metadata chunks.
     InvalidChunkType {
         /// The type that broke the rules.
         chunk: [u8; 4],
