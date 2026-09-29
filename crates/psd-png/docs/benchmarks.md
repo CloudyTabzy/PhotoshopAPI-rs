@@ -355,7 +355,9 @@ compressible ones. Whole-PNG decode of the 16 fixtures in `tmp/large` and `tmp/c
 `rgba16` -65%, `rgb16` -55%, `rgba8_noise` -54%, `gray16` -40%, `palette8` -22%, and no change
 on the well-compressed photographs and gradients. The Adler-32 only runs under
 `Checks::Full`. The inflate loop itself is safe apart from one block, at parity with the
-previous unsafe form (`TODO.md` section G records the variants that were not).
+previous unsafe form. The alternatives measured and not kept, checking each 16-byte pass, a
+window per match, and `copy_within`, cost 4-27% on the inflate stage of compressible streams
+(see the changelog).
 
 ## Where the remaining time is
 
