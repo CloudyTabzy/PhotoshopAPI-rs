@@ -132,6 +132,9 @@
 //! - [`decoder`] and [`common`] — the PNG layer itself
 
 #![warn(missing_docs, missing_debug_implementations)]
+// The crate has one `unsafe` block, allowed by name on the function that owns it
+// (`Inflater::copy_match`); any other fails the build.
+#![deny(unsafe_code)]
 
 pub mod adler32;
 pub mod common;

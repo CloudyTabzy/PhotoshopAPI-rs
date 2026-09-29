@@ -46,6 +46,8 @@ no `repository` URL, so no version headings carry compare links.
   the running-`a` term carried in a vector, every lane sized to stay under the same `NMAX`
   bound as the scalar recurrence; a test runs a full block of saturated bytes from the largest
   possible starting pair on every backend.
+- **The crate denies `unsafe_code`,** with an `allow` naming the one function (the inflate match
+  copy) that owns the crate's only `unsafe` block, so a second one anywhere fails the build.
 - **The CRC-32 is `crc32fast`'s, and the crate has a third dependency for it.** The chunk CRC
   runs over every compressed byte of a default decode, and the crate's own slice-by-16 ran at
   3.2 GB/s against 60-80 GB/s for a carry-less-multiply CRC (PCLMULQDQ on x86, PMULL on

@@ -200,7 +200,9 @@ without recomputing its checksum.
 Safe Rust apart from one `unsafe` block: the sixteen-byte pass loop of the inflate match copy.
 It sits inside a function that checks the whole range it can touch before the loop starts, so the
 function is sound for any arguments, and a bug in its caller is a panic and not an out-of-bounds
-write. The filter, conversion and Adler-32 kernels are written against `fearless_simd`'s portable
+write. The crate root denies `unsafe_code` and that one function allows it by name, so a second
+block anywhere fails the build. The filter, conversion and Adler-32 kernels are written against
+`fearless_simd`'s portable
 vectors and contain no `unsafe`; the CRC-32's carry-less multiply is `crc32fast`'s. Everything
 else — the literal stores of the inflate loop, chunk parsing, filtering, conversion — is
 bounds-checked. The decoder's buffers are allocated with a probe followed by `vec!`, which is not

@@ -1091,6 +1091,7 @@ impl Inflater {
     ///
     /// # Panics
     /// If `distance` is zero or exceeds `pos`, or the range does not fit in `output`.
+    #[allow(unsafe_code, reason = "the crate's one `unsafe` block, guarded by the check above")]
     #[inline(always)]
     fn copy_match(output: &mut [u8], pos: usize, distance: usize, length: usize) {
         let end = pos.checked_add(length).and_then(|end| end.checked_add(15));
