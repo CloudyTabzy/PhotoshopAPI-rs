@@ -1,6 +1,6 @@
 # psd-png
 
-A streaming PNG decoder with **zero dependencies**, built to decode smart-object rasters for
+A streaming PNG decoder whose only dependency is `fearless_simd`, built to decode smart-object rasters for
 PhotoshopAPI-rs, the Rust port of PhotoshopAPI.
 
 `decode_to` hands out one reconstructed scanline at a time while holding only DEFLATE's 32 KiB
@@ -68,7 +68,10 @@ The PhotoshopAPI-rs port team added:
 - **fused reconstruction** — the scanline filters are reversed as inflation writes, lagging the
   output cursor by the match window, instead of walking the whole image a second time afterwards;
 - **`decode_to`** — the resumable, budget-paused streaming decoder above;
-- **an SSE2 `Paeth` kernel** — one pixel per register, for 3- and 4-byte strides.
+- **portable SIMD kernels** — a `Paeth` filter kernel (one pixel per register, for 3- and
+  4-byte strides) and the row-conversion kernels, written once against `fearless_simd`'s
+  portable vectors and compiled for SSE2/SSE4.2/AVX2/AVX-512, NEON or wasm SIMD at run time,
+  with the scalar paths as the fallback.
 
 Both upstream licences (`MIT OR Apache-2.0`) and the original copyright
 (`Copyright (c) 2026 Stephen Berry`) are retained unchanged; see [Licence](#licence).
@@ -90,9 +93,12 @@ Not supported: APNG, and writing interlaced files.
 ## Platforms
 
 64-bit `x86_64` and `aarch64` are the supported targets, and the only ones CI builds and tests.
-The SSE2 Paeth kernel is `x86_64`-only by design: SSE2 is part of that baseline, so the kernel is
-selected at compile time rather than dispatched at run time, and every other target runs the
-scalar filters.
+The SIMD kernels are portable: one source compiled for whichever backend the CPU reports at run
+time — SSE2, SSE4.2, AVX2 or AVX-512 on x86-64, NEON on aarch64, wasm SIMD on the web — with the
+scalar paths as the fallback on anything else. Two backends deliberately stay scalar: the plain
+scalar fallback, where the generic kernel code runs a lane at a time, and — for the
+shuffle-built conversion kernels — the bare SSE2 level, where a dynamic byte shuffle is emulated
+per lane.
 
 32-bit x86 is not a target. The decoder is correct there and refuses an over-wide header earlier
 than it does on 64-bit — with `ImageTooLarge` instead of a size-limit refusal, having allocated
@@ -145,7 +151,7 @@ along a row is why `Paeth` is the filter that costs: on its own it reconstructs 
 800 MB/s, where `Up` manages 28 GB/s. Two schemes fill those idle slots, and this crate has
 both. The scalar one takes two rows offset by a pixel — row *r* pixel *x* and row *r+1* pixel
 *x-1* depend only on values settled before the step, so the two predictions issue together. The
-x86-64 one follows libpng's SSE2 filters and takes the four channels of a single pixel per
+register one follows libpng's SSE2 filters and takes the four channels of a single pixel per
 iteration, which is independent of the left neighbour by construction. SIMD was preferred for
 3- and 4-byte strides on measurement (8–22% where `Paeth` rows exist, nothing where they do
 not), and the scalar pair path keeps every other stride. The multi-row and anti-diagonal
@@ -155,10 +161,11 @@ the next step if the mixed-filter case ever justifies it, not this one. Two deta
 libpng, both forced by reconstructing in place: its rows live in padded buffers and may write a
 whole pixel at the last position, where here the bytes after a row are the next row's
 still-filtered data, so this kernel touches only bytes inside its own row; and its stride is a
-runtime value here, so the kernel is chosen per call. SSE2 is part of the x86-64 baseline, so
-nothing is detected at run time: x86-64 builds always carry the kernel, others never do. Built
-with the `scalar-override` feature, `PSD_PNG_FORCE_SCALAR=1` falls back to the scalar paths,
-which is how the two are measured against each other; without it the environment is not read.
+runtime value here, so the kernel is chosen per call. The kernel is written once against
+`fearless_simd`'s portable vectors and compiled for the CPU's backend, so the acceleration is
+no longer x86-64-only. Built with the `scalar-override` feature, `PSD_PNG_FORCE_SCALAR=1`
+falls back to the scalar paths, which is how the two are measured against each other; without
+it the environment is not read.
 
 **Inflation is pausable, not restartable.** A segment boundary can land mid-block, so resuming
 requires the bit position, the output cursor, and the start of the symbol being processed — a

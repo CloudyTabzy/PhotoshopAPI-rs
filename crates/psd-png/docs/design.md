@@ -159,12 +159,22 @@ Sample-width rules worth stating: a 16-bit source passes through untouched, 8-bi
 
 ## The SIMD filter kernel
 
-An SSE2 `Paeth` kernel for 3- and 4-byte strides, following libpng's filters: one row at a
-time, one pixel per 128-bit register, the four channels of the pixel as independent lanes.
-Measured **mean −12%** on `Paeth`-bearing images, up to −22%, and unchanged where the filter
-mix has none.
+A `Paeth` kernel for 3- and 4-byte strides, following libpng's filters: one row at a time, one
+pixel per 128-bit register, the four channels of the pixel as independent lanes. Measured
+**mean −12%** on `Paeth`-bearing images, up to −22%, and unchanged where the filter mix has
+none.
 
-Three decisions are worth recording:
+The kernel is written once against `fearless_simd`'s portable vectors, so one source compiles
+for SSE2, SSE4.2, AVX2, AVX-512, NEON or wasm SIMD and the acceleration is no longer
+x86-64-only. The backend is chosen once per call from the level `fearless_simd` detects, and
+two backends deliberately stay scalar: the scalar fallback, where the generic code runs a lane
+at a time, and — for the shuffle-built conversion kernels — the bare SSE2 level, where a
+dynamic byte shuffle is emulated per lane. Two rules from the F2b evaluation carry over: every
+kernel carries `#[simd]` (without it the identical source measured 2.4× *slower* than scalar),
+and any shape that would lean on a slow path for its backend declines instead, leaving the
+scalar path to run.
+
+Four decisions are worth recording:
 
 - **libpng's arrangement, not the multi-row one.** Wuffs issue #157 and Blend2D describe
   multi-row or anti-diagonal arrangements that extract more instruction-level parallelism.
@@ -175,15 +185,26 @@ Three decisions are worth recording:
 - **Reconstruction is in place, so the kernel writes only bytes inside its own row.** It never
   reads or writes a neighbouring row, which is what lets it be correct against a live frontier
   rather than a padded buffer.
-- **Selection is compile-time, not runtime.** SSE2 is part of the x86-64 baseline, so
-  detecting it at runtime bought nothing: every x86-64 machine has it and no other target has
-  the kernel. The dispatch is a `cfg` on `target_arch = "x86_64"` plus a compile-time assertion
-  that SSE2 is enabled; i686, AArch64 and everything else get the scalar wavefront. There is
-  no AVX2 tier, because the measurements give no reason to want one at this width.
+- **The load is one 32-bit read per operand.** A pixel is four bytes, so the register is built
+  from a word rather than a 16-byte load: it touches nothing past the row end, needs no branch
+  at the row tail, and keeps the loop's L1 traffic to a pixel per iteration. The RGB kernel
+  stores three bytes rather than four for the same reason — a store that reached into the next
+  pixel would make the next iteration's load forward from a partly-overlapping store, which
+  measured slower than the stores themselves.
+- **The kernel beats the hand-written SSE2 it replaced, on the same machine.** In the crate's
+  own harness, on the same real fixtures and the same synthetic corpora, the portable kernel
+  is 2–3% faster at 3-byte strides and 7–13% faster at 4-byte strides than the SSE2 kernel was,
+  and 11–37% faster than the scalar wavefront.
 
 The `scalar-override` feature exists so both implementations can be run in one build and held
 to the same bytes. It is off by default, and without it the process environment has no say in
 which code runs.
+
+One consequence worth stating: the old hand-written kernels were `core::arch` intrinsics,
+which compile to real instructions even in an unoptimised build, while the generic kernels do
+not inline until optimisation is on. Debug builds therefore run the kernels unoptimised and
+their tests take noticeably longer; release builds — what users get — are the faster ones, and
+are what every number above measures.
 
 ## Checksums
 
@@ -242,7 +263,8 @@ header alone decides how much memory a decode asks for. The defences, in order:
   check them — a known gap, since an out-of-range index reaches the caller rather than the
   table.
 
-`Platforms`, in the README, records the supported targets: 64-bit x86-64 and AArch64.
+`Platforms`, in the README, records the supported targets: 64-bit x86-64 and AArch64, both with
+the portable kernels.
 
 ## Trade-offs
 
@@ -253,13 +275,14 @@ What was considered and not taken, and what it would cost.
   implementation both already have one.
 - **A threaded pipeline** (inflate on one thread, reconstruction on another) could overlap the
   ~60% and ~35% stages for up to ~1.4× on two cores. Rejected: it adds threads and a
-  backpressured handoff buffer to a crate whose identity is zero dependencies and no threads,
-  and it duplicates memory. Worth revisiting if the profile ever stops being DEFLATE-bound.
+  backpressured handoff buffer to a single-threaded crate, and it duplicates memory. Worth
+  revisiting if the profile ever stops being DEFLATE-bound.
 - **Extending the scalar wavefront to `Sub`/`Average`.** 1–5% of rows. Not worth the code.
 - **x86 hardware CRC.** Real but small, and it only applies to a caller that asks for
   `Checks::Full`, since chunk CRCs are off the hot path by default.
-- **An AVX2 filter tier.** Not written; SSE2 already claims the win at these widths, and a
-  wider register does not help a predictor that is serial along the row.
+- **A wider-than-128-bit filter tier.** Not written; the predictor is serial along the row and
+  a pixel is four bytes, so a wider register does not help it, and the portable kernel already
+  compiles for every backend the CPU offers.
 - **Multi-row `Paeth`.** Deferred, not rejected. It needs the frontier and the stage sizing to
   grow, so it is a separate step with its own measurements.
 - **Faster inflate itself.** The remaining cost is the serial Huffman loop. Beating it is
@@ -270,7 +293,7 @@ What was considered and not taken, and what it would cost.
 The original proposal listed SIMD unfiltering among the alternatives **rejected**, on the
 grounds that "filters are not the bottleneck". The stage profile says unfilter is 25–40% of
 decode, `Paeth` dominates it, and it runs at 790 MB/s — which made it the single largest
-remaining cost. The SSE2 kernel then turned out to be worth more on the 4K fixture than fused
+remaining cost. The SIMD kernel then turned out to be worth more on the 4K fixture than fused
 reconstruction and fused conversion combined.
 
 The reasoning error was assuming that a percentage of total time bounds the prize: 25–40% of a

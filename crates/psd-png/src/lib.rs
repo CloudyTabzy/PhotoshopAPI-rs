@@ -1,4 +1,5 @@
-//! A streaming PNG decoder with no dependencies, built for the PhotoshopAPI-rs port.
+//! A streaming PNG decoder whose only dependency is `fearless_simd`, built for the
+//! PhotoshopAPI-rs port.
 //!
 //! `psd-png` reads the whole PNG format — every colour type, every bit depth, interlaced
 //! or not — through its own DEFLATE implementation, its own checksums, and its own filter
