@@ -11,6 +11,9 @@ publish = false
 psd-png = { path = "..", features = ["scalar-override"] }
 png = "0.18"
 fdeflate = "0.3"
+# The checksum crates the reference stack uses, for `checksum_micro`.
+crc32fast = "1"
+simd-adler32 = "0.3"
 
 [[bin]]
 name = "bench"

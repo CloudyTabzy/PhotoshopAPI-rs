@@ -21,6 +21,25 @@ no `repository` URL, so no version headings carry compare links.
 
 ### Changed
 
+- **The inflate loop is safe Rust apart from one block.** It carried thirteen `unsafe` sites: a
+  halfword literal store, a byte read, two sixteen-byte block helpers and their call sites,
+  each resting on the caller's `pos <= limit` reasoning. The literal stores are now ordinary
+  bounds-checked slice writes, which measured the same as the unchecked form on literal-heavy
+  streams (the `noise`, `photo` and `mixed` classes that dominate real decode time). The match
+  copy is one function that is sound for any arguments: it checks the whole range every pass
+  can touch, `pos - distance .. pos + length + 15`, once per match, and keeps a single
+  `unsafe` block for the sixteen-byte pass loop. So a bug in the caller's reasoning is now a
+  panic and not an out-of-bounds write. Checking per pass instead cost 4-20% on the inflate
+  stage of highly compressible streams, and `copy_within` 15-27%, which is why the one block
+  stays. Measured against the previous build with alternating runs: summed inflate time
+  -0.1%, every stream within about 2%; whole-PNG decode summed +0.0%, `rgba8_mixed` about
+  +2% (3.79 to 3.88 ms).
+- New `inflate_micro` benchmark: pure DEFLATE decode into a preallocated buffer, checksum
+  off, against `fdeflate` doing the same. The earlier `bench -- inflate` comparison timed a
+  whole-stream call with the Adler-32 on (this crate's runs at 3.4 GB/s) while the reference
+  grew its output from 1 KiB, which made the decoder look 15% slower than `fdeflate`; on the
+  like-for-like measurement it is 1.13-2.2x faster on every fixture. `checksum_micro`
+  compares the CRC-32 and Adler-32 against `crc32fast` and `simd-adler32`.
 - The parity tests run every kernel once per backend the machine supports, not only the
   one `dispatch!` reaches: on an AVX2 machine the SSE2 and SSE4.2 lowerings of the same
   source were never executed. A test cross-checks the backend list against the standard
