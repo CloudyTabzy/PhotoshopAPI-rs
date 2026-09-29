@@ -12,6 +12,43 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.27] - 2026-09-29
+
+The groundwork for writing layer effects and adjustment layers: typed values that read from,
+patch and build the descriptors those blocks are made of. Nothing that reads or writes a
+document changes.
+
+### Added
+
+- `Color`, `Gradient`, `Contour`, `Offset` and `PatternRef`, the values effects, gradient
+  strokes and fill layers share. Each reads from a descriptor (`from_descriptor`, `None` when
+  the shape is not one it models), builds a fresh one in the layout Photoshop writes
+  (`to_descriptor`), and patches an existing one in place (`apply_to`), so unknown items, their
+  positions and their key encodings survive an edit. `Color` covers `RGBC`, `CMYC`, `Grsc`,
+  `HSBC` and `LbCl` and reads the `GRYC`/`LABC` spellings other libraries use; `Gradient`
+  covers custom gradients (colour, foreground and background stops, transparency stops) and
+  noise gradients.
+- `DescriptorKey::id` spells a key the way Photoshop does (a four-byte ID as a zero-length
+  character ID, longer ones explicit, and `warp`, `time`, `hold` and `list` explicit), and
+  `Descriptor` gains `with_class`, `set`, `set_text`, `set_ordered`, `set_text_ordered` and
+  `remove`. `set` replaces a value in place; `set_ordered` places a new item where Photoshop's
+  order puts it, beside the items already there.
+- `DescriptorValue::percent`, `pixels`, `angle`, `unit`, `text`, `enumerated`, `boolean`,
+  `long` and `double` constructors, and the `UNIT_PERCENT`, `UNIT_PIXELS` and `UNIT_ANGLE`
+  constants.
+- `UnicodeString::terminated`, a string that ends in a null code unit on disk but not in its
+  text, the form `UnicodeString::read` makes of every descriptor name and `TEXT` value.
+
+### Verified
+
+- Against every colour, contour, gradient, offset and pattern-reference descriptor found in
+  the layer effects of about 420 Photoshop-authored documents (5,667 in all): all model, a
+  patch that changes nothing changes no bytes, and a value built fresh from what was read
+  reproduces Photoshop's bytes exactly. Two conventions the first run exposed are now built
+  in: every descriptor name and string ends in a null unit (an empty name is one null, not
+  none), and replacing a string with an equal one is a no-op. The sweep runs over `fixtures/`
+  and, with `PSD_EXTRA_CORPUS`, over more directories.
+
 ## [0.6.26] - 2026-09-29
 
 ### Fixed

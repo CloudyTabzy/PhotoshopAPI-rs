@@ -10,7 +10,7 @@ exclude = ["crates/psd-png/bench", "crates/psd-png/fuzz"]
 edition = "2021"
 license = "BSD-3-Clause"
 # The single project version; bump it with every CHANGELOG.md entry.
-version = "0.6.26"
+version = "0.6.27"
 
 # Dependency versions are centralized here; crates pull them in with
 # `workspace = true`.

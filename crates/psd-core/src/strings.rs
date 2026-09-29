@@ -240,6 +240,18 @@ impl UnicodeString {
         })
     }
 
+    /// Create from a UTF-8 value that ends, on disk, in a null code unit, the way Photoshop
+    /// writes descriptor names and `TEXT` values.
+    ///
+    /// The result equals what [`read`](Self::read) makes of such a string: the null is in the
+    /// UTF-16 units and counted in the marker, but not part of [`value`](Self::value).
+    pub fn terminated(value: impl Into<String>, padding: usize) -> Result<Self> {
+        let value: String = value.into().chars().filter(|&c| c != '\0').collect();
+        let mut string = Self::new(value, padding)?;
+        string.utf16.push(0);
+        Ok(string)
+    }
+
     /// The decoded UTF-8 value.
     pub fn value(&self) -> &str {
         &self.value
@@ -418,6 +430,30 @@ mod tests {
         s.write(&mut w).unwrap();
         // count=3 (A, b, null), UTF-16BE units, padded to 2 (no extra).
         assert_eq!(w.as_slice(), &[0, 0, 0, 3, 0, b'A', 0, b'b', 0, 0]);
+    }
+
+    #[test]
+    fn a_terminated_string_equals_what_reading_one_makes() {
+        for text in ["", "Gradient", "グラデーション"] {
+            let built = UnicodeString::terminated(text, 1).unwrap();
+            let mut writer = BeWriter::new();
+            built.write_verbatim(&mut writer).unwrap();
+            let bytes = writer.into_inner();
+            // The marker counts the null, and the value does not include it.
+            let units = text.encode_utf16().count() + 1;
+            assert_eq!(
+                u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize,
+                units
+            );
+            assert_eq!(built.value(), text);
+            let read = UnicodeString::read(&mut BeReader::new(&bytes), 1).unwrap();
+            assert_eq!(read, built);
+        }
+        // A null in the input is not doubled.
+        assert_eq!(
+            UnicodeString::terminated("a\0", 1).unwrap().utf16(),
+            [0x61, 0]
+        );
     }
 
     #[test]

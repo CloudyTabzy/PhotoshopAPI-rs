@@ -16,6 +16,7 @@
 //! - [`photoshop_file`]: the five sections read/written in order (`PhotoshopFile/PhotoshopFile.h`)
 //! - [`tagged_blocks`]: 4-char-keyed additional-layer-info registry with raw passthrough (`Core/TaggedBlocks/`)
 //! - [`descriptor`], [`engine_data`]: Photoshop's action-descriptor and text-engine formats (`Core/Struct/`)
+//! - [`color`], [`gradient`], [`style_values`]: typed values (colours, gradients, contours, points, pattern references) that read from, patch and build descriptors, shared by effects and fills
 //! - [`text_tool`], [`placed_layer`], [`linked_layer`], [`layer_effects`], [`adjustments`], [`vector`], [`artboard`]: typed views over text, placed/linked data, effect blocks, adjustment/fill settings, vector paths/shapes, and artboards
 //! - `serialize` (feature `serde`): `Serialize` views of descriptors and EngineData (upstream `to_json`)
 //!
@@ -24,11 +25,14 @@
 
 pub mod adjustments;
 pub mod artboard;
+pub mod color;
 mod color_mode_data;
 pub mod descriptor;
+mod descriptor_build;
 pub mod engine_data;
 mod enums;
 mod error;
+pub mod gradient;
 pub mod header;
 pub mod image_data;
 pub mod image_resources;
@@ -41,6 +45,7 @@ pub mod placed_layer;
 #[cfg(feature = "serde")]
 mod serialize;
 pub mod strings;
+pub mod style_values;
 pub mod tagged_blocks;
 pub mod text_tool;
 pub mod types;
@@ -49,17 +54,23 @@ mod views;
 
 pub use adjustments::{AdjustmentBlock, AdjustmentData, AdjustmentKind, AdjustmentPreset};
 pub use artboard::{Artboard, ArtboardBackground, ArtboardRect, ArtboardSettings};
+pub use color::Color;
 pub use color_mode_data::ColorModeData;
 pub use descriptor::{
     read_item, write_item, Descriptor, DescriptorIntegerSpan, DescriptorItem, DescriptorKey,
     DescriptorPayloadSpans, DescriptorValue, ObjectArray,
 };
+pub use descriptor_build::{UNIT_ANGLE, UNIT_PERCENT, UNIT_PIXELS};
 pub use engine_data::{EngineNumber, EngineValue, EngineValueKind, PayloadPatch};
 pub use enums::{
     BitDepth, BlendMode, ChannelId, ColorMode, Compression, DisplayUnit, LayerColor,
     ResolutionUnit, SectionDivider, Version,
 };
 pub use error::{PsdError, Result};
+pub use gradient::{
+    ColorStop, Gradient, GradientKind, NoiseColorModel, NoiseGradient, SolidGradient, StopSource,
+    TransparencyStop,
+};
 pub use header::FileHeader;
 pub use image_data::ImageData;
 pub use image_resources::{
@@ -85,6 +96,7 @@ pub use placed_layer::{
     PLACED_LAYER_SIGNATURE,
 };
 pub use strings::{PascalEncoding, PascalString, UnicodeString};
+pub use style_values::{Contour, ContourPoint, Offset, OffsetUnits, PatternRef};
 pub use tagged_blocks::{AdditionalLayerInfo, TaggedBlock, TaggedBlockKey};
 pub use text_tool::{
     parse_text_engine_data, TypeToolDescriptorSpans, TypeToolTaggedBlock, TypeToolTextPayloadSpans,
