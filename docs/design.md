@@ -190,7 +190,9 @@ Four decisions are worth recording:
   at the row tail, and keeps the loop's L1 traffic to a pixel per iteration. The RGB kernel
   stores three bytes rather than four for the same reason — a store that reached into the next
   pixel would make the next iteration's load forward from a partly-overlapping store, which
-  measured slower than the stores themselves.
+  measured slower than the stores themselves. Its three-byte pixel still needs a fourth byte
+  in reach to load, so the register loop stops one pixel short of the row end and scalar code
+  finishes the last pixel of every RGB row.
 - **The kernel beats the hand-written SSE2 it replaced, on the same machine.** In the crate's
   own harness, on the same real fixtures and the same synthetic corpora, the portable kernel
   is 2–3% faster at 3-byte strides and 7–13% faster at 4-byte strides than the SSE2 kernel was,

@@ -6,6 +6,37 @@ no `repository` URL, so no version headings carry compare links.
 
 ## [Unreleased]
 
+### Fixed
+
+- **16-bit greyscale with a `tRNS` key, decoded to RGBA8, made the wrong pixels
+  transparent.** The portable kernel for that shape gathered each pixel's alpha from the
+  compare mask one byte per pixel, but the 16-bit compare leaves two bytes per pixel, so
+  output pixel *n* of every eight took the mask of pixel *n* / 2: a keyed pixel in the first
+  half of a block turned pixels 2*j* and 2*j* + 1 transparent instead of itself, and one in
+  the second half turned none. Only rows that contain the key were affected, and only where
+  the kernel runs (not under `PSD_PNG_FORCE_SCALAR=1`, on bare SSE2, or on the scalar
+  backend). The 0.5.0 port introduced it; the SSE2 kernel it replaced was correct. The
+  parity tests missed it because random rows almost never contain a given 16-bit key; they
+  now plant the key, and fail on the old code on every backend.
+
+### Changed
+
+- The parity tests run every kernel once per backend the machine supports, not only the
+  one `dispatch!` reaches: on an AVX2 machine the SSE2 and SSE4.2 lowerings of the same
+  source were never executed. A test cross-checks the backend list against the standard
+  library's CPU detection, so a backend cannot drop out and leave its tests vacuous, and
+  the conversion tests now expect the same backends the facade routes to.
+- Big-endian targets take the scalar path. The kernels bitcast between lane widths and read
+  a big-endian PNG sample as a native lane, which assumes little-endian lane layout.
+- The `Rgb` → `Rgba` widening and the indexed copy decline, instead of reporting a row
+  converted, when the target is not a whole number of pixels or (indexed) the channel count
+  is not 3 or 4. Callers never pass either today.
+- The facade and the kernels take the backend from one `Level::new()` value rather than a
+  private cache beside `fearless_simd`'s own.
+- Documentation states the crate's dependencies as they are: `fearless_simd` and the
+  build-time `#[simd]` macro crate, not `fearless_simd` alone, and not "nothing outside the
+  standard library".
+
 ## [0.5.0] - 2026-09-29
 
 ### Changed
@@ -13,7 +44,8 @@ no `repository` URL, so no version headings carry compare links.
 - **The SIMD kernels are portable.** The hand-written SSE2 `Paeth` kernel and the SSE2
   conversion kernels were replaced by one source written against `fearless_simd`'s portable
   vectors, compiled at run time for SSE2, SSE4.2, AVX2, AVX-512, NEON or wasm SIMD with the
-  scalar paths as the fallback. This gives the crate its only dependency, and it ends the
+  scalar paths as the fallback. This gives the crate two dependencies, `fearless_simd` and
+  its `#[simd]` macro crate, and it ends the
   kernels' x86-64-only status: the filter and conversion kernels now run on ARM and on the
   web, where every target previously took the scalar path. Measured in one harness against
   the SSE2 kernels they replace: 2–8% faster on `Paeth` workloads; against the scalar

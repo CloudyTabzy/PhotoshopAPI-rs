@@ -1,7 +1,8 @@
 # psd-png
 
-A streaming PNG decoder whose only dependency is `fearless_simd`, built to decode smart-object rasters for
-PhotoshopAPI-rs, the Rust port of PhotoshopAPI.
+A streaming PNG decoder with portable SIMD kernels, built to decode smart-object rasters for
+PhotoshopAPI-rs, the Rust port of PhotoshopAPI. Its only dependencies are `fearless_simd` and the
+build-time `#[simd]` macro crate that goes with it.
 
 `decode_to` hands out one reconstructed scanline at a time while holding only DEFLATE's 32 KiB
 match window, a segment of filtered rows, and a few rows of headroom — a few hundred kilobytes

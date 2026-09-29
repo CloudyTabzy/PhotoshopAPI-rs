@@ -28,27 +28,29 @@
 //! feature, which lets `PSD_PNG_FORCE_SCALAR=1` turn the kernels off for a whole process so
 //! the two can be measured and tested against each other.
 
-use std::sync::OnceLock;
-
 use fearless_simd::Level;
 
 /// The pixel strides the SIMD filter kernel reconstructs.
 const KERNEL_STRIDES: &[usize] = &[3, 4];
 
-/// The detected backend, cached: the facade asks for it once per row, so the answer must
-/// not be recomputed per call. `Level::new` caches internally on x86 as well; this keeps
-/// the facade's own path to it cheap on every target.
+/// The backend this process runs on. `Level::new` detects it once and caches the answer
+/// itself (on x86; every other target knows it at compile time), so this is a load, not a
+/// detection. The facade decides from this value and the kernels dispatch on it, so the two
+/// cannot disagree about the backend.
 fn level() -> Level {
-    *LEVEL.get_or_init(Level::new)
+    Level::new()
 }
-
-static LEVEL: OnceLock<Level> = OnceLock::new();
 
 /// Whether the dispatched backend is a real vector unit rather than the scalar fallback.
 /// The filter kernel works on every vector backend; on the fallback level its generic code
 /// runs one lane at a time and loses to the scalar wavefront.
+///
+/// Big-endian targets are treated as having no vector unit. The kernels bitcast between
+/// lane widths and read a big-endian PNG sample as a native lane, both of which assume the
+/// little-endian lane layout every supported vector backend has in practice; a target that
+/// breaks that assumption takes the scalar path, which is correct everywhere.
 fn vectors_available() -> bool {
-    !level().is_fallback()
+    cfg!(target_endian = "little") && !level().is_fallback()
 }
 
 /// Whether the dispatched backend has a hardware dynamic byte shuffle (`pshufb` and
@@ -173,7 +175,7 @@ pub(crate) fn convert_row(
     if !shuffles_available() {
         return Ok(false);
     }
-    kernels::convert_row(conv, row, target)
+    Ok(kernels::convert_row(conv, row, target))
 }
 
 /// Pixels the sub-byte depths are unpacked into before the byte-level paths run. Any
@@ -264,24 +266,24 @@ fn rgb_to_rgba(conv: &RowConversion<'_>, row: &[u8], target: &mut [u8]) -> Resul
     if conv.channels != 4 || conv.rgb_key.is_some() {
         return Ok(false);
     }
+    // A target that is not a whole number of pixels is declined: the paired chunk walk
+    // below would leave its tail unwritten while reporting the row converted.
     match (conv.bit_depth, conv.wide) {
         (BitDepth::Eight, true) => {
-            let width = target.len() / 8;
-            if row.len() != width * 3 {
+            if !target.len().is_multiple_of(8) || row.len() != target.len() / 8 * 3 {
                 return Ok(false);
             }
-            for (i, px) in row.chunks_exact(3).enumerate() {
+            for (px, out) in row.chunks_exact(3).zip(target.chunks_exact_mut(8)) {
                 let (r, g, b) = (px[0], px[1], px[2]);
-                target[8 * i..8 * i + 8].copy_from_slice(&[r, r, g, g, b, b, 0xFF, 0xFF]);
+                out.copy_from_slice(&[r, r, g, g, b, b, 0xFF, 0xFF]);
             }
         }
         (BitDepth::Sixteen, false) => {
-            let width = target.len() / 4;
-            if row.len() != width * 6 {
+            if !target.len().is_multiple_of(4) || row.len() != target.len() / 4 * 6 {
                 return Ok(false);
             }
-            for (i, px) in row.chunks_exact(6).enumerate() {
-                target[4 * i..4 * i + 4].copy_from_slice(&[px[0], px[2], px[4], 255]);
+            for (px, out) in row.chunks_exact(6).zip(target.chunks_exact_mut(4)) {
+                out.copy_from_slice(&[px[0], px[2], px[4], 255]);
             }
         }
         _ => return Ok(false),
@@ -302,12 +304,19 @@ fn indexed(
     palette: &Palette,
 ) -> Result<bool, Error> {
     let out = conv.channels * usize::from(conv.wide) + conv.channels;
+    // Anything but the four shapes `indexed_emit` is instantiated for is declined rather
+    // than reported as converted: a target that goes unwritten would surface as pixels
+    // nobody set. So is a target that is not a whole number of pixels, whose tail
+    // `chunks_exact_mut` would leave unwritten.
+    if !matches!(out, 3 | 4 | 6 | 8) || !target.len().is_multiple_of(out) {
+        return Ok(false);
+    }
     let mut emit = |indices: &[u8], target: &mut [u8]| match out {
         3 => indexed_emit::<3>(palette, indices, target),
         4 => indexed_emit::<4>(palette, indices, target),
         6 => indexed_emit::<6>(palette, indices, target),
         8 => indexed_emit::<8>(palette, indices, target),
-        _ => Ok(()),
+        _ => unreachable!("`out` was checked against the four instantiated widths above"),
     };
     match conv.bit_depth {
         BitDepth::Eight => {
@@ -341,29 +350,42 @@ fn indexed(
 // slice lengths, touch memory only through indexing, and leave a declined row untouched.
 
 mod kernels {
-    use fearless_simd::{Bytes, Level, Simd, dispatch, i16x8, prelude::*, u8x16, u16x8, u32x4};
+    use fearless_simd::{Bytes, Simd, dispatch, i16x8, prelude::*, u8x16, u16x8, u32x4};
     use fearless_simd_macros::simd;
 
-    use super::{Error, RowConversion};
+    use super::{RowConversion, level};
     use crate::common::{BitDepth, ColorType};
 
-    /// Picks the stride-specific filter kernel, or declines a stride it does not cover.
+    /// Reverses `Paeth` on one row at the best level this machine has, or declines a stride
+    /// the kernels do not cover.
+    ///
+    /// Each stride gets its own `dispatch!` rather than one around the stride match: with
+    /// both kernels inside a single dispatched closure the 4-byte kernel measured about
+    /// 1.6% slower on 2048x512 rows (3.13 against 3.18 ms, every alternating run), the
+    /// price of how the shared closure was laid out and nothing the source shows.
     pub(super) fn paeth_row(row: &mut [u8], prev: &[u8], bpp: usize) -> bool {
         match bpp {
-            3 => paeth3_row(row, prev),
-            4 => paeth4_row(row, prev),
+            3 => dispatch!(level(), simd => paeth3(simd, row, prev)),
+            4 => dispatch!(level(), simd => paeth4(simd, row, prev)),
             _ => false,
         }
     }
 
-    /// The RGB kernel, dispatched on its own so the parity tests can drive it directly.
-    pub(super) fn paeth3_row(row: &mut [u8], prev: &[u8]) -> bool {
-        dispatch!(Level::new(), simd => paeth3(simd, row, prev))
-    }
-
-    /// The RGBA kernel, dispatched on its own so the parity tests can drive it directly.
-    pub(super) fn paeth4_row(row: &mut [u8], prev: &[u8]) -> bool {
-        dispatch!(Level::new(), simd => paeth4(simd, row, prev))
+    /// [`paeth_row`] at a chosen level. The parity tests call this once per backend the
+    /// machine supports: `dispatch!` only ever reaches the best one, which would leave
+    /// every lower level's code unexercised.
+    #[cfg(test)]
+    pub(super) fn paeth_row_with<V: Simd>(
+        simd: V,
+        row: &mut [u8],
+        prev: &[u8],
+        bpp: usize,
+    ) -> bool {
+        match bpp {
+            3 => paeth3(simd, row, prev),
+            4 => paeth4(simd, row, prev),
+            _ => false,
+        }
     }
 
     /// The absolute value of each 16-bit lane.
@@ -430,9 +452,10 @@ mod kernels {
     ///
     /// The fourth lane carries the next pixel's first residual byte, which is computed and
     /// thrown away: it is what lets one register hold a whole pixel without lanes reading
-    /// across pixels. Bytes past the last whole pixel are finished by [`tail`], which for a
-    /// PNG never runs - a scanline is always a whole number of pixels - and is here so that
-    /// no length can overrun.
+    /// across pixels. That fourth byte has to exist, so the register loop stops one pixel
+    /// short of the row end and [`tail`] finishes the last pixel - on every row, not only on
+    /// a ragged one. A PNG scanline is always a whole number of pixels, so the tail is
+    /// exactly one pixel there; it also keeps an odd length from overrunning.
     ///
     /// Declines, leaving `row` untouched, unless `row` and `prev` are the same length and
     /// hold at least one pixel.
@@ -444,8 +467,8 @@ mod kernels {
         let mut left = i16x8::splat(simd, 0);
         let mut upper_left = i16x8::splat(simd, 0);
         let mut at = 0;
-        // Four bytes per iteration so the loads never cross the row end; the last pixel of
-        // a row whose length is not a whole number of pixels goes to `tail`.
+        // Each load reads four bytes but the pixel is three, so the loop needs a full four
+        // in reach: the last pixel of the row, whatever its length, goes to `tail`.
         while at + 4 <= row.len() {
             let above = widen_pixel(simd, &prev[at..]);
             let packed = predict(simd, widen_pixel(simd, &row[at..]), left, above, upper_left);
@@ -534,6 +557,13 @@ mod kernels {
         [16, 16, 16, 4, 16, 16, 16, 5, 16, 16, 16, 6, 16, 16, 16, 7],
         [16, 16, 16, 8, 16, 16, 16, 9, 16, 16, 16, 10, 16, 16, 16, 11],
         [16, 16, 16, 12, 16, 16, 16, 13, 16, 16, 16, 14, 16, 16, 16, 15],
+    ];
+
+    /// `ALPHA3` for a compare mask that is one 16-bit word per pixel: pixel *n*'s mask sits
+    /// in bytes `2n` and `2n + 1`, so the gather reads every other byte.
+    const ALPHA3_FROM_WORDS: [[u8; 16]; 2] = [
+        [16, 16, 16, 0, 16, 16, 16, 2, 16, 16, 16, 4, 16, 16, 16, 6],
+        [16, 16, 16, 8, 16, 16, 16, 10, 16, 16, 16, 12, 16, 16, 16, 14],
     ];
 
     /// The low half moved to the high half, for joining two gathered halves.
@@ -652,7 +682,9 @@ mod kernels {
             };
             for (k, pattern) in REPLICATE3[..2].iter().enumerate() {
                 let replicate = u8x16::from_slice(simd, pattern);
-                let alpha_pattern = u8x16::from_slice(simd, &ALPHA3[k]);
+                // `alpha` holds a 16-bit mask word per pixel here, not a byte per pixel as
+                // in `grey8_rgba8`, so it takes the word-indexed gather.
+                let alpha_pattern = u8x16::from_slice(simd, &ALPHA3_FROM_WORDS[k]);
                 let out = simd.swizzle_dyn_precise_u8x16(samples, replicate)
                     | simd.swizzle_dyn_precise_u8x16(alpha, alpha_pattern);
                 target[o + 16 * k..o + 16 * k + 16].copy_from_slice(&<[u8; 16]>::from(out));
@@ -869,51 +901,94 @@ mod kernels {
 
     /// The conversion dispatch: four-channel targets only - the three-channel layouts
     /// have no kernel and stay scalar.
-    pub(super) fn convert_row(
+    pub(super) fn convert_row(conv: &RowConversion<'_>, row: &[u8], target: &mut [u8]) -> bool {
+        dispatch!(level(), simd => convert_row_with(simd, conv, row, target))
+    }
+
+    /// [`convert_row`] at a chosen level, for the same reason as [`paeth_row_with`]: the
+    /// parity tests run it once per backend the machine supports. `false` leaves `target`
+    /// untouched.
+    #[inline(always)]
+    pub(super) fn convert_row_with<V: Simd>(
+        simd: V,
         conv: &RowConversion<'_>,
         row: &[u8],
         target: &mut [u8],
-    ) -> Result<bool, Error> {
+    ) -> bool {
         if conv.channels != 4 {
-            return Ok(false);
+            return false;
         }
         match (conv.color_type, conv.bit_depth) {
             // Measured against the scalar helpers, the depth-8 → 16-bit greyscale kernel
             // loses to the autovectorised scalar loop, so only the 8-bit target is
             // claimed here.
             (ColorType::Grayscale, BitDepth::Eight) if !conv.wide => {
-                Ok(dispatch!(Level::new(), simd => grey8_rgba8(simd, row, target, conv.grey_key)))
+                grey8_rgba8(simd, row, target, conv.grey_key)
             }
-            (ColorType::Grayscale, BitDepth::Sixteen) => Ok(dispatch!(Level::new(), simd => {
-                if conv.wide {
-                    grey16_rgba16(simd, row, target, conv.grey_key)
-                } else {
-                    grey16_rgba8(simd, row, target, conv.grey_key)
-                }
-            })),
-            (ColorType::GrayscaleAlpha, BitDepth::Eight) => Ok(dispatch!(Level::new(), simd => {
-                if conv.wide {
-                    graya8_rgba16(simd, row, target)
-                } else {
-                    graya8_rgba8(simd, row, target)
-                }
-            })),
-            (ColorType::GrayscaleAlpha, BitDepth::Sixteen) => Ok(dispatch!(Level::new(), simd => {
-                if conv.wide {
-                    graya16_rgba16(simd, row, target)
-                } else {
-                    graya16_rgba8(simd, row, target)
-                }
-            })),
-            (ColorType::Rgba, BitDepth::Eight) if conv.wide => {
-                Ok(dispatch!(Level::new(), simd => rgba8_rgba16(simd, row, target)))
+            (ColorType::Grayscale, BitDepth::Sixteen) if conv.wide => {
+                grey16_rgba16(simd, row, target, conv.grey_key)
             }
-            (ColorType::Rgba, BitDepth::Sixteen) if !conv.wide => {
-                Ok(dispatch!(Level::new(), simd => rgba16_rgba8(simd, row, target)))
+            (ColorType::Grayscale, BitDepth::Sixteen) => {
+                grey16_rgba8(simd, row, target, conv.grey_key)
             }
-            _ => Ok(false),
+            (ColorType::GrayscaleAlpha, BitDepth::Eight) if conv.wide => {
+                graya8_rgba16(simd, row, target)
+            }
+            (ColorType::GrayscaleAlpha, BitDepth::Eight) => graya8_rgba8(simd, row, target),
+            (ColorType::GrayscaleAlpha, BitDepth::Sixteen) if conv.wide => {
+                graya16_rgba16(simd, row, target)
+            }
+            (ColorType::GrayscaleAlpha, BitDepth::Sixteen) => graya16_rgba8(simd, row, target),
+            (ColorType::Rgba, BitDepth::Eight) if conv.wide => rgba8_rgba16(simd, row, target),
+            (ColorType::Rgba, BitDepth::Sixteen) if !conv.wide => rgba16_rgba8(simd, row, target),
+            _ => false,
         }
     }
+}
+
+/// Runs `$body` once for each vector backend this machine can run, with `$simd` bound to
+/// that backend's token, and collects `(backend name, result)` pairs.
+///
+/// `dispatch!` only ever reaches the best backend, so on any one machine every lower
+/// level's code - SSE2 and SSE4.2 on an AVX2 CPU, say - would go unexercised, although each
+/// is a separate lowering of the same source. A token for a lower level can be had from the
+/// detected one (`as_sse2` is `Some` on every x86 CPU that has anything better). The list is
+/// empty exactly where the facade sees no vector unit: the scalar fallback and big-endian
+/// targets. Annotate the result's type at the call site, so that it is known even on a
+/// target where no backend arm is compiled in.
+#[cfg(test)]
+macro_rules! on_each_backend {
+    (|$simd:ident| $body:expr) => {{
+        #[allow(unused_mut, reason = "no backend arm is compiled in on some targets")]
+        let mut results = Vec::new();
+        if vectors_available() {
+            let detected = level();
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                if let Some($simd) = detected.as_sse2() {
+                    results.push(("sse2", $body));
+                }
+                if let Some($simd) = detected.as_sse4_2() {
+                    results.push(("sse4.2", $body));
+                }
+                if let Some($simd) = detected.as_avx2() {
+                    results.push(("avx2", $body));
+                }
+                if let Some($simd) = detected.as_avx512() {
+                    results.push(("avx512", $body));
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            if let Some($simd) = detected.as_neon() {
+                results.push(("neon", $body));
+            }
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            if let Some($simd) = detected.as_wasm_simd128() {
+                results.push(("wasm-simd128", $body));
+            }
+        }
+        results
+    }};
 }
 
 #[cfg(test)]
@@ -921,10 +996,11 @@ mod tests {
     use super::*;
     use crate::filter::paeth_predictor;
 
-    /// Whether the conversion kernels can run on this backend at all. The parity tests
-    /// drive the kernels directly — they bypass the facade's scalar-override gate so that
-    /// `PSD_PNG_FORCE_SCALAR=1` cannot turn a kernel test into a test of the fallback — so
-    /// what they expect of a kernel-shaped row is the backend's answer, not the override's.
+    /// Whether the facade hands the conversion kernels any row on this machine: the backend
+    /// needs a hardware byte shuffle. The parity tests drive the kernels below the facade,
+    /// past its scalar-override gate, so `PSD_PNG_FORCE_SCALAR=1` cannot turn a kernel test
+    /// into a test of the fallback; what they expect of the facade's own route is this
+    /// machine's answer, not the override's.
     fn kernels_expected() -> bool {
         shuffles_available()
     }
@@ -952,26 +1028,53 @@ mod tests {
             .collect()
     }
 
-    /// The kernel for a stride, called directly.
+    /// The Paeth kernel for `bpp` run on `filtered` once per backend this machine can run,
+    /// as `(backend, claimed, row)`.
     ///
-    /// The parity tests go through this rather than [`paeth_row`] so that what they check does
-    /// not depend on the stride claim: with the scalar override in force the dispatch declines
-    /// everything, and a kernel test would quietly become a test of the scalar fallback.
-    fn kernel(bpp: usize) -> fn(&mut [u8], &[u8]) -> bool {
-        match bpp {
-            3 => super::kernels::paeth3_row,
-            4 => super::kernels::paeth4_row,
-            _ => unreachable!("no kernel for stride {bpp}"),
+    /// The parity tests go through this rather than [`paeth_row`] so that what they check
+    /// depends neither on the stride claim - with the scalar override in force the facade
+    /// declines everything, and a kernel test would quietly become a test of the scalar
+    /// fallback - nor on which single backend `dispatch!` would have picked.
+    fn paeth_runs(bpp: usize, filtered: &[u8], prev: &[u8]) -> Vec<(&'static str, bool, Vec<u8>)> {
+        let runs: Vec<(&'static str, (bool, Vec<u8>))> = on_each_backend!(|simd| {
+            let mut row = filtered.to_vec();
+            let claimed = kernels::paeth_row_with(simd, &mut row, prev, bpp);
+            (claimed, row)
+        });
+        runs.into_iter().map(|(backend, (claimed, row))| (backend, claimed, row)).collect()
+    }
+
+    /// Every backend the machine supports gets exercised - the tests above and below would
+    /// otherwise pass vacuously on a machine where the list came back empty - and the list
+    /// is empty exactly when the facade sees no vector unit.
+    #[test]
+    fn the_backend_list_follows_the_facade() {
+        let runs = paeth_runs(4, &[0u8; 8], &[0u8; 8]);
+        assert_eq!(runs.is_empty(), !vectors_available(), "backends run: {runs:?}");
+        // Cross-checked against the standard library's own detection, so that a backend
+        // silently dropping out of the list cannot make every parity test vacuous for it.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let ran = |name: &str| runs.iter().any(|(backend, ..)| *backend == name);
+            // SSE2 is x86-64's baseline.
+            assert!(ran("sse2"), "backends run: {runs:?}");
+            // The SSE4.2 level is the x86-64-v2 feature set.
+            if is_x86_feature_detected!("sse4.2")
+                && is_x86_feature_detected!("popcnt")
+                && is_x86_feature_detected!("cmpxchg16b")
+            {
+                assert!(ran("sse4.2"), "backends run: {runs:?}");
+            }
         }
     }
 
     /// The kernel must reproduce the scalar predictor for every stride it claims, at every
-    /// length — including lengths that are not a whole number of pixels, which the register
-    /// loop leaves to the tail and a PNG scanline never actually has.
+    /// length and on every backend — including lengths that are not a whole number of
+    /// pixels, which the register loop leaves to the tail and a PNG scanline never
+    /// actually has.
     #[test]
     fn kernel_matches_the_scalar_definition() {
         for bpp in [3usize, 4] {
-            let kernel = kernel(bpp);
             for pixels in [1usize, 2, 3, 4, 5, 7, 8, 15, 16, 17, 33, 64, 129] {
                 for extra in 0..bpp {
                     let len = pixels * bpp + extra;
@@ -981,9 +1084,10 @@ mod tests {
                     let mut want = filtered.clone();
                     reference(&mut want, &prev, bpp);
 
-                    let mut got = filtered.clone();
-                    assert!(kernel(&mut got, &prev), "bpp {bpp}, len {len}: declined");
-                    assert_eq!(got, want, "bpp {bpp}, len {len}");
+                    for (backend, claimed, got) in paeth_runs(bpp, &filtered, &prev) {
+                        assert!(claimed, "{backend}, bpp {bpp}, len {len}: declined");
+                        assert_eq!(got, want, "{backend}, bpp {bpp}, len {len}");
+                    }
                 }
             }
         }
@@ -994,15 +1098,16 @@ mod tests {
     #[test]
     fn kernel_handles_a_first_row_over_zeros() {
         for bpp in [3usize, 4] {
-            let kernel = kernel(bpp);
             let len = 37 * bpp;
             let filtered = corpus(len, 0x0123456789ABCDEF);
+            let zeros = vec![0u8; len];
             let mut want = filtered.clone();
-            reference(&mut want, &vec![0u8; len], bpp);
+            reference(&mut want, &zeros, bpp);
 
-            let mut got = filtered.clone();
-            assert!(kernel(&mut got, &vec![0u8; len]), "bpp {bpp}");
-            assert_eq!(got, want, "bpp {bpp}");
+            for (backend, claimed, got) in paeth_runs(bpp, &filtered, &zeros) {
+                assert!(claimed, "{backend}, bpp {bpp}: declined");
+                assert_eq!(got, want, "{backend}, bpp {bpp}");
+            }
         }
     }
 
@@ -1011,7 +1116,6 @@ mod tests {
     #[test]
     fn kernel_handles_extreme_values() {
         for bpp in [3usize, 4] {
-            let kernel = kernel(bpp);
             for seed in 0..4u64 {
                 let len = 8 * bpp;
                 let mut filtered = corpus(len, 0xFEED_FACE_CAFE_BEEF ^ seed);
@@ -1024,9 +1128,10 @@ mod tests {
                 }
                 let mut want = filtered.clone();
                 reference(&mut want, &prev, bpp);
-                let mut got = filtered.clone();
-                assert!(kernel(&mut got, &prev), "bpp {bpp} seed {seed}");
-                assert_eq!(got, want, "bpp {bpp} seed {seed}");
+                for (backend, claimed, got) in paeth_runs(bpp, &filtered, &prev) {
+                    assert!(claimed, "{backend}, bpp {bpp} seed {seed}: declined");
+                    assert_eq!(got, want, "{backend}, bpp {bpp} seed {seed}");
+                }
             }
         }
     }
@@ -1104,9 +1209,9 @@ mod tests {
     // ------------------------------------------------------------------
     // Conversion parity: every row the accelerated paths claim must equal the scalar
     // helpers in transform.rs byte for byte — they are the reference the kernels are
-    // pinned to. The tests drive `x86::convert_row` and the portable paths directly
-    // rather than the facade, so a compiled-in scalar override cannot turn a kernel
-    // test into a test of the fallback.
+    // pinned to. The tests drive the kernels (once per backend the machine supports) and
+    // the portable paths directly rather than the facade, so a compiled-in scalar
+    // override cannot turn a kernel test into a test of the fallback.
 
     use crate::transform::{self, Palette, RowSample};
 
@@ -1211,8 +1316,9 @@ mod tests {
         corpus(bytes, seed)
     }
 
-    /// The conversion kernels plus the portable paths, in the facade's own order — minus
-    /// the scalar-override and backend gates, so the kernels are always exercised.
+    /// The facade's routes in the facade's order - the portable paths, then the conversion
+    /// kernels on the best backend behind the shuffle gate - minus only the scalar override,
+    /// so that `PSD_PNG_FORCE_SCALAR=1` cannot turn a kernel test into a test of the fallback.
     fn accelerated(conv: &RowConversion<'_>, row: &[u8], target: &mut [u8]) -> Result<bool, Error> {
         if conv.color_type == ColorType::Indexed {
             let Some(palette) = conv.palette else { return Ok(false) };
@@ -1221,52 +1327,83 @@ mod tests {
         if conv.color_type == ColorType::Rgb {
             return rgb_to_rgba(conv, row, target);
         }
-        kernels::convert_row(conv, row, target)
+        if !shuffles_available() {
+            return Ok(false);
+        }
+        Ok(kernels::convert_row(conv, row, target))
     }
 
-    /// Asserts the accelerated path claims the row and matches the scalar helpers.
-    fn assert_parity(conv: &RowConversion<'_>, row: &[u8], width: usize, ctx: &str) {
-        assert_parity_expected(conv, row, width, ctx, true);
-    }
-
-    /// Asserts the conversion kernels claim the row and match the scalar helpers — or, on
-    /// a backend without a hardware shuffle, that they decline and leave it untouched.
-    fn assert_kernel_parity(conv: &RowConversion<'_>, row: &[u8], width: usize, ctx: &str) {
-        assert_parity_expected(conv, row, width, ctx, kernels_expected());
-    }
-
-    /// Asserts the accelerated path's claim matches `expected` and, when it claims, that
-    /// the output equals the scalar helpers byte for byte.
-    fn assert_parity_expected(
+    /// The byte-level conversion kernels on `row`, once per backend this machine can run, as
+    /// `(backend, claimed, target)` over a `0x55`-filled target of `target_len` bytes.
+    ///
+    /// Whether the facade would hand a backend the row is a policy (`shuffles_available`);
+    /// what a kernel produces once it has the row is its own contract, and is checked on
+    /// every backend, the bare-SSE2 one the facade declines included.
+    fn kernel_runs(
         conv: &RowConversion<'_>,
         row: &[u8],
-        width: usize,
-        ctx: &str,
-        expected: bool,
-    ) {
+        target_len: usize,
+    ) -> Vec<(&'static str, bool, Vec<u8>)> {
+        let runs: Vec<(&'static str, (bool, Vec<u8>))> = on_each_backend!(|simd| {
+            let mut target = vec![0x55u8; target_len];
+            let claimed = kernels::convert_row_with(simd, conv, row, &mut target);
+            (claimed, target)
+        });
+        runs.into_iter().map(|(backend, (claimed, target))| (backend, claimed, target)).collect()
+    }
+
+    /// Asserts a portable route (`Rgb` → `Rgba`, indexed) claims the row and matches the
+    /// scalar helpers.
+    fn assert_parity(conv: &RowConversion<'_>, row: &[u8], width: usize, ctx: &str) {
         let out = 4 * usize::from(conv.wide) + 4;
         let mut want = vec![0xCCu8; width * out];
         scalar(conv, row, &mut want).unwrap();
 
         let mut got = vec![0x55u8; width * out];
         let claimed = accelerated(conv, row, &mut got).unwrap();
-        if expected {
-            assert!(claimed, "{ctx}: the accelerated path declined a covered shape");
+        assert!(claimed, "{ctx}: the accelerated path declined a covered shape");
+        assert_eq!(got, want, "{ctx}: accelerated and scalar disagree");
+    }
+
+    /// Asserts the conversion kernels match the scalar helpers byte for byte on every
+    /// backend, and that the facade's own route claims the row exactly when this machine's
+    /// backend has the shuffle the kernels need - declining, on one that does not, with the
+    /// target untouched.
+    fn assert_kernel_parity(conv: &RowConversion<'_>, row: &[u8], width: usize, ctx: &str) {
+        let out = 4 * usize::from(conv.wide) + 4;
+        let mut want = vec![0xCCu8; width * out];
+        scalar(conv, row, &mut want).unwrap();
+
+        for (backend, claimed, got) in kernel_runs(conv, row, width * out) {
+            assert!(claimed, "{ctx}: {backend} declined a covered shape");
+            assert_eq!(got, want, "{ctx}: {backend} and scalar disagree");
+        }
+
+        let mut got = vec![0x55u8; width * out];
+        let claimed = accelerated(conv, row, &mut got).unwrap();
+        assert_eq!(claimed, kernels_expected(), "{ctx}: the route's claim must follow the backend");
+        if claimed {
             assert_eq!(got, want, "{ctx}: accelerated and scalar disagree");
         } else {
-            assert!(!claimed, "{ctx}: no kernel should claim on this backend");
             assert_eq!(got, vec![0x55u8; width * out], "{ctx}: a declined row must be untouched");
         }
     }
 
-    /// Asserts the accelerated path declines and leaves the target untouched.
+    /// Asserts the facade's route and every backend's kernel decline, leaving the target
+    /// untouched.
     fn assert_declined(conv: &RowConversion<'_>, row: &[u8], width: usize, ctx: &str) {
         let out = 4 * usize::from(conv.wide) + 4;
-        let mut got = vec![0x55u8; width * out];
-        let before = got.clone();
+        let before = vec![0x55u8; width * out];
+
+        let mut got = before.clone();
         let claimed = accelerated(conv, row, &mut got).unwrap();
         assert!(!claimed, "{ctx}: an uncovered shape was claimed");
         assert_eq!(got, before, "{ctx}: a declined row must be untouched");
+
+        for (backend, claimed, got) in kernel_runs(conv, row, width * out) {
+            assert!(!claimed, "{ctx}: {backend} claimed an uncovered shape");
+            assert_eq!(got, before, "{ctx}: {backend}: a declined row must be untouched");
+        }
     }
 
     /// The widths a parity check should cover: tails of every length below the block
@@ -1305,6 +1442,53 @@ mod tests {
         let spec = conv(ColorType::Grayscale, BitDepth::Eight, true, None);
         let row = native_row(ColorType::Grayscale, BitDepth::Eight, 64, 0xA511);
         assert_declined(&spec, &row, 64, "gray8 → rgba16 declines");
+    }
+
+    /// A greyscale row that matches `key` at every fifth pixel, so every lane of every
+    /// register block sees both a match and a miss.
+    ///
+    /// Random rows almost never contain a given 16-bit key, so parity over them alone leaves
+    /// the keyed compare - and the alpha gather behind it - untested. (It did: the 16-bit
+    /// to 8-bit kernel once gathered the wrong mask byte and made the wrong pixels
+    /// transparent, and every random-row parity test passed.)
+    fn keyed_grey_row(depth: BitDepth, width: usize, key: u16, seed: u64) -> Vec<u8> {
+        let mut row = native_row(ColorType::Grayscale, depth, width, seed);
+        for x in (2..width).step_by(5) {
+            match depth {
+                BitDepth::Eight => row[x] = key as u8,
+                BitDepth::Sixteen => row[2 * x..2 * x + 2].copy_from_slice(&key.to_be_bytes()),
+                _ => unreachable!("only the byte-level depths have kernels"),
+            }
+        }
+        row
+    }
+
+    /// Greyscale rows in which the `tRNS` key really occurs, at every width and both output
+    /// widths. The keys include ones whose byte swap differs from themselves, since the
+    /// 16-bit compare runs on native lanes against a swapped key.
+    #[test]
+    fn greyscale_keyed_conversion_matches_scalar() {
+        let keys8 = [0x00u16, 0x5A, 0xFF];
+        let keys16 = [0x0000u16, 0x0100, 0x1234, 0x5A5A, 0xFFFF];
+        for (depth, wide, keys) in [
+            (BitDepth::Eight, false, &keys8[..]),
+            (BitDepth::Sixteen, false, &keys16[..]),
+            (BitDepth::Sixteen, true, &keys16[..]),
+        ] {
+            for &key in keys {
+                let mut spec = conv(ColorType::Grayscale, depth, wide, None);
+                spec.grey_key = Some(key);
+                for width in widths() {
+                    let row = keyed_grey_row(depth, width, key, 0x7E57 ^ width as u64);
+                    assert_kernel_parity(
+                        &spec,
+                        &row,
+                        width,
+                        &format!("{depth:?} wide={wide} key={key:#06x} w={width}"),
+                    );
+                }
+            }
+        }
     }
 
     /// Sub-byte greyscale rows decline at every depth and output width: measured against
@@ -1391,6 +1575,34 @@ mod tests {
         spec.rgb_key = Some([0x11, 0x22, 0x33]);
         let row = native_row(ColorType::Rgb, BitDepth::Eight, width, 0xFACE);
         assert_declined(&spec, &row, width, "keyed RGB must decline");
+    }
+
+    /// A route that walks pixel-sized chunks would leave a ragged tail unwritten yet report
+    /// the row converted, so a target that is not a whole number of pixels, and a channel
+    /// count the indexed emitters are not instantiated for, decline instead.
+    #[test]
+    fn ragged_and_unknown_shapes_decline_untouched() {
+        let plte = vec![10u8, 20, 30, 40, 50, 60];
+        let palette = Palette::new(&plte, None);
+        let indexed_spec = conv(ColorType::Indexed, BitDepth::Eight, false, Some(&palette));
+        let rgb_8_to_16 = conv(ColorType::Rgb, BitDepth::Eight, true, None);
+        let rgb_16_to_8 = conv(ColorType::Rgb, BitDepth::Sixteen, false, None);
+        let mut five_channels = conv(ColorType::Indexed, BitDepth::Eight, false, Some(&palette));
+        five_channels.channels = 5;
+
+        // Three pixels' worth of row, and a target one byte longer than three pixels.
+        for (spec, row_len, target_len, what) in [
+            (&indexed_spec, 3, 13, "indexed, ragged target"),
+            (&rgb_8_to_16, 9, 25, "rgb8 -> rgba16, ragged target"),
+            (&rgb_16_to_8, 18, 13, "rgb16 -> rgba8, ragged target"),
+            (&five_channels, 3, 15, "indexed, five channels"),
+        ] {
+            let row = vec![0u8; row_len];
+            let mut target = vec![0x55u8; target_len];
+            let claimed = accelerated(spec, &row, &mut target).unwrap();
+            assert!(!claimed, "{what}: must decline");
+            assert_eq!(target, vec![0x55u8; target_len], "{what}: a declined row is untouched");
+        }
     }
 
     /// `Rgb` → `Rgba`, keyless: the widening shapes are claimed and pinned to the scalar
