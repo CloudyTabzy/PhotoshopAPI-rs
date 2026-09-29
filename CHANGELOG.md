@@ -12,6 +12,26 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.25] - 2026-09-29
+
+### Changed
+
+- `psd-png` 0.5.0, subtree-synced (`e8cf5f9`): its SIMD kernels are portable now. The
+  hand-written SSE2 `Paeth` filter kernel and every SSE2 conversion kernel were replaced by
+  one source written against `fearless_simd`'s portable vectors, compiled at run time for
+  SSE2, SSE4.2, AVX2, AVX-512, NEON or wasm SIMD with the scalar paths as the fallback. This
+  retires the crate's zero-dependency identity (with approval) and ends the kernels'
+  x86-64-only status: the filter and conversion kernels now run on ARM and on the web, which
+  never had them. Measured in one harness against the SSE2 kernels they replace: 3.190 vs
+  3.215 ms at 3-byte strides, 3.132 vs 3.415 ms at 4-byte strides, 13.058 vs 13.207 ms and
+  12.900 vs 13.922 ms at 2048², and 2.6% faster on a real fixture's own filtered bytes;
+  against the scalar wavefront, 11% at 3-byte strides and 37% at 4-byte strides. Every kernel
+  keeps the old contract (length checks, declines, exhaustive parity tests against the scalar
+  helpers) and `PSD_PNG_FORCE_SCALAR=1` still selects the scalar paths in one build. A new
+  `paeth_micro` bench bin measures the kernel alone. Note for developers: debug builds run
+  the kernels unoptimised, since generic code only inlines under optimisation, so
+  `cargo test --release` is the fast path.
+
 ## [0.6.24] - 2026-09-28
 
 ### Changed
