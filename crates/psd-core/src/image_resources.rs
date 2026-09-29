@@ -21,7 +21,10 @@
 
 use crate::enums::{DisplayUnit, ResolutionUnit};
 use crate::error::{PsdError, Result};
+use crate::grid_guides::GridGuides;
 use crate::io::{round_up, BeReader, BeWriter};
+use crate::layer_comps::LayerComps;
+use crate::slices::SlicesResource;
 use crate::strings::PascalString;
 use crate::types::FixedFloat4;
 
@@ -29,6 +32,12 @@ use crate::types::FixedFloat4;
 pub const ID_RESOLUTION_INFO: u16 = 1005;
 /// `8BIM` id of the ICC profile block ([`IccProfileBlock`]).
 pub const ID_ICC_PROFILE: u16 = 1039;
+/// `8BIM` id of the grid and guides block ([`GridGuides`](crate::grid_guides::GridGuides)).
+pub const ID_GRID_AND_GUIDES: u16 = 1032;
+/// `8BIM` id of the slices block ([`SlicesResource`](crate::slices::SlicesResource)).
+pub const ID_SLICES: u16 = 1050;
+/// `8BIM` id of the layer comps block ([`LayerComps`](crate::layer_comps::LayerComps)).
+pub const ID_LAYER_COMPS: u16 = 1065;
 
 /// A single image-resource block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +170,71 @@ impl ImageResources {
             }
         }
         self.blocks.push(ResourceBlock::ResolutionInfo(info));
+    }
+
+    /// Grid and guides (`1032`), parsed on demand.
+    ///
+    /// `None` when the document has no such block or its payload is malformed;
+    /// either way the raw block is what a save writes, so the bytes are kept.
+    pub fn grid_and_guides(&self) -> Option<GridGuides> {
+        let payload = self.raw_payload(ID_GRID_AND_GUIDES)?;
+        GridGuides::read(&mut BeReader::new(payload)).ok()
+    }
+
+    /// Replace the grid and guides block, or append one.
+    pub fn set_grid_and_guides(&mut self, guides: &GridGuides) -> Result<()> {
+        self.set_raw_payload(ID_GRID_AND_GUIDES, guides.to_payload()?);
+        Ok(())
+    }
+
+    /// Slices (`1050`), parsed on demand. `None` when absent or malformed.
+    pub fn slices(&self) -> Option<SlicesResource> {
+        let payload = self.raw_payload(ID_SLICES)?;
+        SlicesResource::read(&mut BeReader::new(payload)).ok()
+    }
+
+    /// Replace the slices block, or append one.
+    pub fn set_slices(&mut self, slices: &SlicesResource) -> Result<()> {
+        self.set_raw_payload(ID_SLICES, slices.to_payload()?);
+        Ok(())
+    }
+
+    /// Layer comps (`1065`), parsed on demand. `None` when absent or malformed.
+    pub fn layer_comps(&self) -> Option<LayerComps> {
+        let payload = self.raw_payload(ID_LAYER_COMPS)?;
+        LayerComps::read(&mut BeReader::new(payload)).ok()
+    }
+
+    /// Replace the layer comps block, or append one.
+    pub fn set_layer_comps(&mut self, comps: &LayerComps) -> Result<()> {
+        self.set_raw_payload(ID_LAYER_COMPS, comps.to_payload()?);
+        Ok(())
+    }
+
+    /// The payload of the first raw block with `id`.
+    fn raw_payload(&self, id: u16) -> Option<&[u8]> {
+        self.blocks.iter().find_map(|block| match block {
+            ResourceBlock::Raw(raw) if raw.id == id => Some(raw.data.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// Replace the payload of the first raw block with `id`, or append one,
+    /// keeping the block where it is so the section's layout is stable.
+    fn set_raw_payload(&mut self, id: u16, data: Vec<u8>) {
+        for block in &mut self.blocks {
+            if let ResourceBlock::Raw(raw) = block {
+                if raw.id == id {
+                    raw.data = data;
+                    return;
+                }
+            }
+        }
+        self.blocks.push(ResourceBlock::Raw(RawResourceBlock {
+            id,
+            name: PascalString::new("", 2),
+            data,
+        }));
     }
 
     /// Replace the first `ICCProfile` block, or append one.

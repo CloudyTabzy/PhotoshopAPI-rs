@@ -151,6 +151,7 @@ fn is_layer_metadata_key(key: TaggedBlockKey) -> bool {
         b"luni"
             | b"lnsr"
             | b"lyid"
+            | b"cmls"
             | b"clbl"
             | b"infx"
             | b"knko"
@@ -978,6 +979,21 @@ impl<T: BitDepth> Layer<T> {
     pub fn layer_id(&self) -> Option<u32> {
         let block = self.blocks.get(TaggedBlockKey::LYID)?;
         Some(u32::from_be_bytes(block.data.get(..4)?.try_into().ok()?))
+    }
+
+    /// This layer's state in each layer comp (`cmls`), in file order.
+    ///
+    /// A comp whose entry carries no enable flag leaves the layer's own
+    /// visibility in force, which is what the returned states report. An empty
+    /// vector means the layer takes part in no comp, or the block is malformed
+    /// — the raw bytes are preserved either way.
+    pub fn comp_states(&self) -> Vec<psd_core::layer_comps::LayerCompState> {
+        self.blocks
+            .get(TaggedBlockKey::CMLS)
+            .and_then(|block| {
+                psd_core::layer_comps::read_comp_states(&block.data, self.is_visible()).ok()
+            })
+            .unwrap_or_default()
     }
 
     /// Set the layer id, replacing an existing `lyid` block or adding one.

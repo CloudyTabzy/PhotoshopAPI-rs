@@ -41,6 +41,9 @@ impl TaggedBlockKey {
     pub const LSPF: Self = Self(*b"lspf");
     /// Layer id (`lyid`): a `u32`, unique within a document.
     pub const LYID: Self = Self(*b"lyid");
+    /// Layer comps state (`cmls`): a descriptor of this layer's per-comp
+    /// visibility and offsets.
+    pub const CMLS: Self = Self(*b"cmls");
     /// Sheet (display) color setting (`lclr`): `u16` color + 6 padding bytes.
     pub const LCLR: Self = Self(*b"lclr");
     /// Blend fill opacity (`iOpa`): `u8` fill + 3 padding bytes.

@@ -12,6 +12,34 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-09-30
+
+### Added
+
+- Typed views for three document resources that were only preserved raw before. Each parses
+  on demand from its block — nothing is retained until a caller asks — and each has a
+  `set_*` that replaces the payload, while a save still writes the raw block, so an
+  untouched document keeps its own bytes exactly:
+  - **Grid and guides (`1032`)** — `ImageResources::grid_and_guides`. Positions and the grid
+    cycle are in Photoshop's 1/32-pixel units, which `Guide::position_px` and
+    `GridGuides::grid_px` convert (the default cycle, 576, is 18px = a quarter inch at
+    72 dpi).
+  - **Slices (`1050`)** — `ImageResources::slices`. Version 6's record list (name, bounds,
+    URL, target, message, alt tag, cell text, alignment, colour) plus the descriptor that
+    versions 7 and 8 use, and the optional trailing descriptor a v6 payload may carry.
+  - **Layer comps (`1065`)** — `ImageResources::layer_comps`, the comp list with its capture
+    flags and the last applied comp, and `Layer::comp_states` for the per-layer `cmls`
+    block. A comp whose entry does not name a layer leaves that layer's own visibility in
+    force, which is what the states report.
+
+### Tests
+
+- A corpus sweep parses each of the three resources from every document that carries one and
+  re-serializes it, requiring the bytes to match: **531 guides, 529 slices (versions 6 and 8)
+  and 5 layer-comp resources round-trip byte for byte across 555 files**. A self-contained
+  test builds a document with a comp list and a layer's comp state and pins the accessors,
+  including the inherited-visibility case.
+
 ## [0.9.3] - 2026-09-30
 
 ### Fixed
