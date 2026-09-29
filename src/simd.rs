@@ -37,7 +37,7 @@ const KERNEL_STRIDES: &[usize] = &[3, 4];
 /// itself (on x86; every other target knows it at compile time), so this is a load, not a
 /// detection. The facade decides from this value and the kernels dispatch on it, so the two
 /// cannot disagree about the backend.
-fn level() -> Level {
+pub(crate) fn level() -> Level {
     Level::new()
 }
 
@@ -49,7 +49,7 @@ fn level() -> Level {
 /// lane widths and read a big-endian PNG sample as a native lane, both of which assume the
 /// little-endian lane layout every supported vector backend has in practice; a target that
 /// breaks that assumption takes the scalar path, which is correct everywhere.
-fn vectors_available() -> bool {
+pub(crate) fn vectors_available() -> bool {
     cfg!(target_endian = "little") && !level().is_fallback()
 }
 
@@ -961,8 +961,8 @@ macro_rules! on_each_backend {
     (|$simd:ident| $body:expr) => {{
         #[allow(unused_mut, reason = "no backend arm is compiled in on some targets")]
         let mut results = Vec::new();
-        if vectors_available() {
-            let detected = level();
+        if $crate::simd::vectors_available() {
+            let detected = $crate::simd::level();
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
                 if let Some($simd) = detected.as_sse2() {
@@ -990,6 +990,10 @@ macro_rules! on_each_backend {
         results
     }};
 }
+
+// Reachable by path, so the other kernels' tests can run once per backend too.
+#[cfg(test)]
+pub(crate) use on_each_backend;
 
 #[cfg(test)]
 mod tests {

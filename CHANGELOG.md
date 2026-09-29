@@ -34,6 +34,18 @@ no `repository` URL, so no version headings carry compare links.
   stays. Measured against the previous build with alternating runs: summed inflate time
   -0.1%, every stream within about 2%; whole-PNG decode summed +0.0%, `rgba8_mixed` about
   +2% (3.79 to 3.88 ms).
+- **Adler-32 is a portable vector kernel, 5.7 times faster, with no `unsafe`.** It replaces the
+  scalar loop everywhere but aarch64 and the hand-written NEON module there, whose five
+  `unsafe` blocks could not be run or tested off that architecture. The new kernel is one
+  source against `fearless_simd`'s vectors, run on every target with a vector unit, and its
+  tests run it on each x86 backend the machine has as well as against the scalar path. On
+  x86-64 with AVX2 it runs at 19.4 GB/s against 3.4 GB/s, so a `Checks::Full` decode pays
+  about 0.4 ms instead of 2.4 ms per 8 MB of output. The hand-tuned `simd-adler32` still
+  reaches 60-70 GB/s; the gap only shows under `Checks::Full`, which is why the kernel stops
+  where it does. The kernel works in 32-byte steps with the weights applied once per step and
+  the running-`a` term carried in a vector, every lane sized to stay under the same `NMAX`
+  bound as the scalar recurrence; a test runs a full block of saturated bytes from the largest
+  possible starting pair on every backend.
 - New `inflate_micro` benchmark: pure DEFLATE decode into a preallocated buffer, checksum
   off, against `fdeflate` doing the same. The earlier `bench -- inflate` comparison timed a
   whole-stream call with the Adler-32 on (this crate's runs at 3.4 GB/s) while the reference

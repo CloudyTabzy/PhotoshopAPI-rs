@@ -2,7 +2,8 @@
 //!
 //! Every byte of a PNG passes through this checksum twice over an encode/decode round trip,
 //! so it is worth real attention: a naive implementation is slower than the DEFLATE decoder
-//! it accompanies.
+//! it accompanies. (On the default decode path it does not run at all: the chunk CRC already
+//! covers the same bytes, and the zlib checksum is only verified under `Checks::Full`.)
 //!
 //! All the implementations here share one reformulation. Over a run of `n` bytes,
 //!
@@ -14,6 +15,15 @@
 //! which replaces the textbook `a += x; b += a;` per-byte recurrence with two independent
 //! reductions plus one multiply. The modulo is deferred until the accumulators are close to
 //! overflowing.
+//!
+//! The vector implementation is written once against `fearless_simd`'s portable vectors, like
+//! the filter and conversion kernels, and so runs on every target that has a vector unit
+//! without any `unsafe` of its own.
+
+use fearless_simd::{Simd, dispatch, prelude::*, u8x32, u16x16, u32x8};
+use fearless_simd_macros::simd;
+
+use crate::simd::{level, vectors_available};
 
 /// Largest prime below 65536; the modulus for both halves of the sum.
 const BASE: u32 = 65521;
@@ -24,14 +34,23 @@ const BASE: u32 = 65521;
 /// `255 * n * (n + 1) / 2 + (n + 1) * (BASE - 1)` still fits in 32 bits.
 const NMAX: usize = 5552;
 
-/// The largest multiple of 64 that fits in `NMAX`.
-///
-/// Using it as the block size keeps every vector block exactly full, so the scalar tail only
-/// runs once at the very end of the input rather than once per block.
-///
-/// Only the NEON path blocks this way; the portable one works in `NMAX` directly.
-#[cfg(target_arch = "aarch64")]
-const BLOCK: usize = 5504;
+/// Bytes one vector step consumes.
+const STEP: usize = 32;
+
+/// The weight of each byte within a step, `STEP - j` for the byte at index `j`.
+const WEIGHTS: [u16; STEP] = {
+    let mut weights = [0u16; STEP];
+    let mut j = 0;
+    while j < STEP {
+        weights[j] = (STEP - j) as u16;
+        j += 1;
+    }
+    weights
+};
+
+/// Inputs shorter than this take the scalar path: below two steps the vector setup and the
+/// dispatch cost more than the bytes they save.
+const VECTOR_MIN: usize = 2 * STEP;
 
 /// Incremental Adler-32 hasher.
 #[derive(Clone, Copy, Debug)]
@@ -62,19 +81,15 @@ impl Adler32 {
     /// Folds `data` into the running checksum. Any split into calls gives the same result.
     #[inline]
     pub fn update(&mut self, data: &[u8]) {
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: NEON is part of the aarch64 baseline, so no runtime check is needed.
-        unsafe {
-            aarch64::update_neon(&mut self.a, &mut self.b, data)
-        };
-
-        #[cfg(not(target_arch = "aarch64"))]
-        update_portable(&mut self.a, &mut self.b, data);
+        if data.len() >= VECTOR_MIN && vectors_available() {
+            dispatch!(level(), simd => update_with(simd, &mut self.a, &mut self.b, data));
+        } else {
+            update_portable(&mut self.a, &mut self.b, data);
+        }
     }
 }
 
 /// Scalar implementation, folding sixteen bytes at a time.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn update_portable(a_out: &mut u32, b_out: &mut u32, data: &[u8]) {
     let (mut a, mut b) = (*a_out, *b_out);
 
@@ -107,104 +122,78 @@ fn update_portable(a_out: &mut u32, b_out: &mut u32, data: &[u8]) {
     *b_out = b;
 }
 
-#[cfg(target_arch = "aarch64")]
-mod aarch64 {
-    use super::{BASE, BLOCK};
-    use core::arch::aarch64::*;
+/// The vector implementation at a chosen level: whole steps through [`fold_steps`], the
+/// bytes that do not fill a step through the scalar recurrence.
+///
+/// Each `NMAX`-byte block is folded and reduced modulo `BASE` on its own, exactly as the scalar
+/// path does, so the bound that keeps `b` inside a `u32` is the same one.
+#[inline(always)]
+fn update_with<V: Simd>(simd: V, a_out: &mut u32, b_out: &mut u32, data: &[u8]) {
+    let (mut a, mut b) = (*a_out, *b_out);
 
-    /// Descending weights `n .. 1` across a block of `n` bytes, as four 16-byte vectors.
-    const WEIGHTS_64: [u8; 64] = {
-        let mut weights = [0u8; 64];
-        let mut i = 0;
-        while i < 64 {
-            weights[i] = (64 - i) as u8;
-            i += 1;
-        }
-        weights
-    };
+    for block in data.chunks(NMAX) {
+        let (steps, tail) = block.split_at(block.len() / STEP * STEP);
+        (a, b) = fold_steps(simd, a, b, steps);
 
-    /// Adds the bytes accumulated so far to the running scalar pair and resets the vectors.
-    #[inline(always)]
-    unsafe fn fold(a: &mut u32, b: &mut u32, tail: &[u8]) {
         for &byte in tail {
-            *a += byte as u32;
-            *b += *a;
+            a += u32::from(byte);
+            b += a;
         }
-        *a %= BASE;
-        *b %= BASE;
+
+        a %= BASE;
+        b %= BASE;
     }
 
-    /// 64 bytes per iteration.
-    ///
-    /// The weighted sum needs a widening multiply and a pairwise accumulate per eight
-    /// bytes; splitting those across four independent accumulators keeps every dependency
-    /// chain one instruction long, which is what takes this from roughly 8 GB/s to over 30.
-    ///
-    /// ARMv8.4's `UDOT` would do the same reduction in a third of the instructions, and is
-    /// deliberately left alone: the checksum is not where the time goes. It does not run at
-    /// all on the default decode path, where the chunk CRC already covers the same bytes,
-    /// and it is about 2% of an encode. It would also need Rust 1.98, above this crate's
-    /// floor, but that is the lesser reason and the one that will expire.
-    ///
-    /// # Safety
-    /// Requires the `neon` target feature, which is baseline on aarch64.
-    pub unsafe fn update_neon(a_out: &mut u32, b_out: &mut u32, data: &[u8]) {
-        unsafe {
-            let (mut a, mut b) = (*a_out, *b_out);
+    *a_out = a;
+    *b_out = b;
+}
 
-            for block in data.chunks(BLOCK) {
-                let (chunks, remainder) = block.as_chunks::<64>();
-                let full = chunks.len() as u32;
+/// Folds `steps`, a whole number of [`STEP`]-byte steps, into the running pair, without
+/// reducing it modulo `BASE`.
+///
+/// The recurrence over one step of 32 bytes is `b += 32 * a + sum((32 - j) * x[j])`, and the
+/// vector form never needs `a` mid-block. Three vectors of `u32` lanes stand in for it:
+///
+/// - `sums` holds, per lane, the bytes seen so far. Its lanes total the `a` that the current
+///   step starts from, less the caller's own `a`.
+/// - `carry` adds `sums` in before each step, so its lanes total, over all steps, how many
+///   bytes each step had behind it. That times 32, plus the caller's `a` times the byte count,
+///   is the whole `32 * a` term.
+/// - `weighted` holds the `(32 - j) * x[j]` sums. A byte times its weight is at most
+///   `255 * 32`, so one step's products fit a `u16` lane and are widened once per step.
+///
+/// The lanes are `u32`, wide enough because the block is at most [`NMAX`] bytes: the sum they
+/// finally make is `b`, which that bound keeps under `2^32`, and no lane exceeds the total.
+///
+/// Requires `steps.len()` to be a multiple of [`STEP`] and at most `NMAX`.
+#[simd]
+fn fold_steps<V: Simd>(simd: V, a: u32, b: u32, steps: &[u8]) -> (u32, u32) {
+    debug_assert!(steps.len().is_multiple_of(STEP) && steps.len() <= NMAX);
 
-                if full > 0 {
-                    let weights = [
-                        vld1q_u8(WEIGHTS_64.as_ptr()),
-                        vld1q_u8(WEIGHTS_64.as_ptr().add(16)),
-                        vld1q_u8(WEIGHTS_64.as_ptr().add(32)),
-                        vld1q_u8(WEIGHTS_64.as_ptr().add(48)),
-                    ];
+    let weight_low = u16x16::from_slice(simd, &WEIGHTS[..16]);
+    let weight_high = u16x16::from_slice(simd, &WEIGHTS[16..]);
 
-                    let mut s1 = [vdupq_n_u32(0); 2];
-                    let mut s2 = [vdupq_n_u32(0); 4];
-                    let mut carry = vdupq_n_u32(0);
+    let mut sums = u32x8::splat(simd, 0);
+    let mut carry = u32x8::splat(simd, 0);
+    let mut weighted = u32x8::splat(simd, 0);
 
-                    for chunk in chunks {
-                        let v = [
-                            vld1q_u8(chunk.as_ptr()),
-                            vld1q_u8(chunk.as_ptr().add(16)),
-                            vld1q_u8(chunk.as_ptr().add(32)),
-                            vld1q_u8(chunk.as_ptr().add(48)),
-                        ];
+    for step in steps.chunks_exact(STEP) {
+        let (low, high) = u8x32::from_slice(simd, step).widen();
 
-                        let running = vaddq_u32(s1[0], s1[1]);
-                        carry = vaddq_u32(carry, vshlq_n_u32(running, 6));
+        carry += sums;
 
-                        // Pairwise widening keeps every partial sum in a lane wide enough for a
-                        // whole block; the two accumulators split the dependency chain.
-                        s1[0] = vpadalq_u16(s1[0], vaddq_u16(vpaddlq_u8(v[0]), vpaddlq_u8(v[1])));
-                        s1[1] = vpadalq_u16(s1[1], vaddq_u16(vpaddlq_u8(v[2]), vpaddlq_u8(v[3])));
+        let (weighted_low, weighted_high) = (low * weight_low + high * weight_high).widen();
+        weighted = weighted + weighted_low + weighted_high;
 
-                        // Each product is at most 255 * 64 = 16320, which still fits a `u16`.
-                        for i in 0..4 {
-                            let low = vmull_u8(vget_low_u8(v[i]), vget_low_u8(weights[i]));
-                            let high = vmull_u8(vget_high_u8(v[i]), vget_high_u8(weights[i]));
-                            s2[i] = vpadalq_u16(s2[i], vaddq_u16(low, high));
-                        }
-                    }
-
-                    b += a * (full * 64);
-                    b += vaddvq_u32(carry);
-                    b += vaddvq_u32(vaddq_u32(vaddq_u32(s2[0], s2[1]), vaddq_u32(s2[2], s2[3])));
-                    a += vaddvq_u32(vaddq_u32(s1[0], s1[1]));
-                }
-
-                fold(&mut a, &mut b, remainder);
-            }
-
-            *a_out = a;
-            *b_out = b;
-        }
+        let (sum_low, sum_high) = (low + high).widen();
+        sums = sums + sum_low + sum_high;
     }
+
+    // At most `NMAX`, so this cannot truncate.
+    let bytes = steps.len() as u32;
+    let b = b + a * bytes + STEP as u32 * carry.reduce_sum() + weighted.reduce_sum();
+    let a = a + sums.reduce_sum();
+    (a, b)
 }
 
 /// Computes the Adler-32 of `data` in one shot.
@@ -218,6 +207,7 @@ pub fn adler32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simd::on_each_backend;
 
     fn reference(data: &[u8]) -> u32 {
         let (mut a, mut b) = (1u32, 0u32);
@@ -228,9 +218,11 @@ mod tests {
         (b << 16) | a
     }
 
-    const LENGTHS: [usize; 20] = [
-        0, 1, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 5503, 5504, 5505, 11_007, 11_008, 11_009,
-        20_000,
+    /// Lengths around every boundary the implementations have: the sixteen-byte scalar
+    /// chunk, the thirty-two-byte vector step, the vector cut-over, and `NMAX` blocks.
+    const LENGTHS: [usize; 34] = [
+        0, 1, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95, 96, 97, 100, 1000, 5503, 5504, 5505, 5535,
+        5536, 5537, 5551, 5552, 5553, 5568, 11_007, 11_008, 11_009, 11_071, 11_104, 11_105, 20_000,
     ];
 
     #[test]
@@ -259,7 +251,30 @@ mod tests {
         assert_eq!(adler32(&data), reference(&data));
     }
 
-    /// Every implementation must agree, not just whichever one this CPU selects.
+    /// The worst case for the vector lanes: the largest block, every byte saturated, and a
+    /// running pair already at its largest, so the terms sum to the closest a block comes to
+    /// the `u32` limit. Run on every backend the machine has, with the scalar path beside it.
+    #[test]
+    fn a_full_block_at_its_limit_does_not_overflow() {
+        let data = vec![0xffu8; NMAX];
+        let start = (BASE - 1, BASE - 1);
+
+        let (mut a, mut b) = start;
+        update_portable(&mut a, &mut b, &data);
+        let want = (a, b);
+
+        let runs: Vec<(&'static str, (u32, u32))> = on_each_backend!(|simd| {
+            let (mut a, mut b) = start;
+            update_with(simd, &mut a, &mut b, &data);
+            (a, b)
+        });
+        for (backend, got) in runs {
+            assert_eq!(got, want, "{backend}");
+        }
+    }
+
+    /// Every implementation must agree, not just whichever one this CPU selects: the scalar
+    /// path, and the vector path on each backend the machine can run.
     #[test]
     fn all_implementations_agree() {
         let data = varied_data(20_000);
@@ -271,11 +286,13 @@ mod tests {
             update_portable(&mut a, &mut b, slice);
             assert_eq!((b << 16) | a, expected, "portable, len {len}");
 
-            #[cfg(target_arch = "aarch64")]
-            {
+            let runs: Vec<(&'static str, u32)> = on_each_backend!(|simd| {
                 let (mut a, mut b) = (1u32, 0u32);
-                unsafe { aarch64::update_neon(&mut a, &mut b, slice) };
-                assert_eq!((b << 16) | a, expected, "neon, len {len}");
+                update_with(simd, &mut a, &mut b, slice);
+                (b << 16) | a
+            });
+            for (backend, got) in runs {
+                assert_eq!(got, expected, "{backend}, len {len}");
             }
         }
     }
