@@ -18,18 +18,57 @@
 //! only bytes inside the row. And the stride is a runtime value here, so the kernel is
 //! chosen per call rather than compiled in.
 //!
-//! SSE2 is part of the x86-64 baseline, so the kernel needs no runtime detection: on x86-64
-//! it is always available, and everywhere else there is none. The choice between it and the
-//! scalar path is therefore made at compile time, except under the `scalar-override`
-//! feature, which lets `PSD_PNG_FORCE_SCALAR=1` turn the kernel off for a whole process so
+//! The kernels are written once against `fearless_simd`'s portable vectors and compiled for
+//! whatever the CPU supports at run time - SSE2, SSE4.2, AVX2, AVX-512, NEON or wasm SIMD -
+//! so the acceleration is no longer x86-64-only. Two backends are deliberately left to the
+//! scalar path: the scalar fallback, where the generic code runs a lane at a time and loses
+//! to this crate's own wavefront, and - for the shuffle-built conversion kernels - the bare
+//! SSE2 level, where a dynamic byte shuffle is emulated per lane. The choice between the
+//! kernels and the scalar path is made once per call, except under the `scalar-override`
+//! feature, which lets `PSD_PNG_FORCE_SCALAR=1` turn the kernels off for a whole process so
 //! the two can be measured and tested against each other.
 
-/// The pixel strides the SIMD kernel reconstructs on this target.
-#[cfg(target_arch = "x86_64")]
+use std::sync::OnceLock;
+
+use fearless_simd::Level;
+
+/// The pixel strides the SIMD filter kernel reconstructs.
 const KERNEL_STRIDES: &[usize] = &[3, 4];
-/// The pixel strides the SIMD kernel reconstructs on this target: none.
-#[cfg(not(target_arch = "x86_64"))]
-const KERNEL_STRIDES: &[usize] = &[];
+
+/// The detected backend, cached: the facade asks for it once per row, so the answer must
+/// not be recomputed per call. `Level::new` caches internally on x86 as well; this keeps
+/// the facade's own path to it cheap on every target.
+fn level() -> Level {
+    *LEVEL.get_or_init(Level::new)
+}
+
+static LEVEL: OnceLock<Level> = OnceLock::new();
+
+/// Whether the dispatched backend is a real vector unit rather than the scalar fallback.
+/// The filter kernel works on every vector backend; on the fallback level its generic code
+/// runs one lane at a time and loses to the scalar wavefront.
+fn vectors_available() -> bool {
+    !level().is_fallback()
+}
+
+/// Whether the dispatched backend has a hardware dynamic byte shuffle (`pshufb` and
+/// friends). The conversion kernels are built from shuffles; on the bare SSE2 backend
+/// `swizzle_dyn_precise` falls back to a per-lane scalar emulation, which measures slower
+/// than the autovectorised scalar loop, so those kernels decline there. Every other vector
+/// backend - SSE4.2 and up, NEON, wasm SIMD - has the real instruction.
+fn shuffles_available() -> bool {
+    if !vectors_available() {
+        return false;
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        level().as_sse4_2().is_some()
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        true
+    }
+}
 
 /// Reverses `Paeth` on one row with SIMD, or reports that it did not.
 ///
@@ -42,15 +81,7 @@ pub(crate) fn paeth_row(row: &mut [u8], prev: &[u8], bpp: usize) -> bool {
     if !claims_stride(bpp) {
         return false;
     }
-    #[cfg(target_arch = "x86_64")]
-    {
-        x86::paeth_row(row, prev, bpp)
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (row, prev);
-        false
-    }
+    kernels::paeth_row(row, prev, bpp)
 }
 
 /// Whether [`paeth_row`] claims this pixel stride.
@@ -58,11 +89,10 @@ pub(crate) fn paeth_row(row: &mut [u8], prev: &[u8], bpp: usize) -> bool {
 /// The scalar path reconstructs two adjacent `Paeth` rows as a wavefront, which is the other
 /// way to fill the dependency stall, so the caller has to choose between the two rather than
 /// run both. It asks here instead of calling the kernel and looking at the answer, because
-/// the choice is made per row and must be the same for every row of an image. Without the
-/// `scalar-override` feature this folds to a constant for each stride.
+/// the choice is made per row and must be the same for every row of an image.
 #[inline(always)]
 pub(crate) fn claims_stride(bpp: usize) -> bool {
-    KERNEL_STRIDES.contains(&bpp) && !scalar_forced()
+    KERNEL_STRIDES.contains(&bpp) && vectors_available() && !scalar_forced()
 }
 
 /// Whether `PSD_PNG_FORCE_SCALAR=1` has turned the kernel off, read once per process.
@@ -86,8 +116,8 @@ fn scalar_forced() -> bool {
 //
 // `transform.rs` converts a reconstructed row into the layout a caller asked for. Most of
 // that work is per-pixel shuffling — widen, narrow, replicate, resolve a palette — which
-// is the shape SIMD eats. The same rules as the filter kernels apply: SSE2 only (it is
-// x86-64 baseline), every load and store goes through bounds-checked indexing, the
+// is the shape SIMD eats. The same rules as the filter kernel apply: the kernels are
+// portable, every load and store goes through bounds-checked indexing, the
 // `scalar-override` switch turns the whole layer off for measurement, and anything not
 // claimed falls back to `transform.rs`'s scalar helpers untouched.
 
@@ -138,15 +168,12 @@ pub(crate) fn convert_row(
     if conv.color_type == ColorType::Rgb {
         return rgb_to_rgba(conv, row, target);
     }
-    #[cfg(target_arch = "x86_64")]
-    {
-        x86::convert_row(conv, row, target)
+    // The conversion kernels are shuffle-built, so a backend without a hardware shuffle
+    // leaves the row to the scalar helpers.
+    if !shuffles_available() {
+        return Ok(false);
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (row, target);
-        Ok(false)
-    }
+    kernels::convert_row(conv, row, target)
 }
 
 /// Pixels the sub-byte depths are unpacked into before the byte-level paths run. Any
@@ -297,114 +324,144 @@ fn indexed(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-mod x86 {
-    use core::arch::x86_64::*;
+// ---------------------------------------------------------------------------
+// Portable SIMD kernels.
+//
+// One source, compiled per backend: `fearless_simd` picks SSE2, SSE4.2, AVX2, AVX-512,
+// NEON or wasm SIMD at run time, with a scalar fallback for everything else. Two rules
+// from the crate's F2b evaluation carry over. Every kernel carries `#[simd]`: without it
+// the same source measured 2.4x *slower* than scalar. And a kernel that would lean on a
+// slow path for its backend declines instead, leaving the caller's scalar code to run.
+//
+// The filter kernel needs only lane arithmetic, so it claims every vector backend. The
+// conversion kernels are built from dynamic byte shuffles (`swizzle_dyn_precise`), which
+// are a single `pshufb` on SSE4.2+, NEON and wasm SIMD but a per-lane scalar emulation on
+// the bare SSE2 backend - so those decline on SSE2, where the autovectorised scalar loop
+// is faster than the emulation. The contract is the SSE2 kernels' contract: check the
+// slice lengths, touch memory only through indexing, and leave a declined row untouched.
+
+mod kernels {
+    use fearless_simd::{Bytes, Level, Simd, dispatch, i16x8, prelude::*, u8x16, u16x8, u32x4};
+    use fearless_simd_macros::simd;
 
     use super::{Error, RowConversion};
     use crate::common::{BitDepth, ColorType};
 
-    // Every kernel below is compiled for SSE2 and relies on nothing else. The x86-64 baseline
-    // includes it, so this holds on every x86-64 target; if a custom target ever turned it
-    // off, the build fails here instead of the kernels faulting at run time.
-    const _: () = assert!(cfg!(target_feature = "sse2"), "the Paeth kernel requires SSE2");
-
-    /// Picks the stride-specific kernel, or declines a stride it does not cover.
+    /// Picks the stride-specific filter kernel, or declines a stride it does not cover.
     pub(super) fn paeth_row(row: &mut [u8], prev: &[u8], bpp: usize) -> bool {
-        // SAFETY: the kernels are `#[target_feature(enable = "sse2")]` and require nothing
-        // beyond that feature — they check the slice lengths themselves and touch memory
-        // only through safe indexing. SSE2 is enabled for this whole build, as the assertion
-        // above guarantees at compile time.
-        unsafe {
-            match bpp {
-                3 => paeth3(row, prev),
-                4 => paeth4(row, prev),
-                _ => false,
-            }
+        match bpp {
+            3 => paeth3_row(row, prev),
+            4 => paeth4_row(row, prev),
+            _ => false,
         }
+    }
+
+    /// The RGB kernel, dispatched on its own so the parity tests can drive it directly.
+    pub(super) fn paeth3_row(row: &mut [u8], prev: &[u8]) -> bool {
+        dispatch!(Level::new(), simd => paeth3(simd, row, prev))
+    }
+
+    /// The RGBA kernel, dispatched on its own so the parity tests can drive it directly.
+    pub(super) fn paeth4_row(row: &mut [u8], prev: &[u8]) -> bool {
+        dispatch!(Level::new(), simd => paeth4(simd, row, prev))
     }
 
     /// The absolute value of each 16-bit lane.
     ///
-    /// The distances are bounded by 510, so the negate-and-subtract form cannot overflow.
-    #[target_feature(enable = "sse2")]
-    fn abs_i16(value: __m128i) -> __m128i {
-        let negative = _mm_cmpgt_epi16(_mm_setzero_si128(), value);
-        _mm_sub_epi16(_mm_xor_si128(value, negative), negative)
+    /// The distances are bounded by 510, so the negate-and-maximum form cannot overflow.
+    /// It is also the shortest form on the serial chain: one subtract and one maximum,
+    /// where a compare-and-select costs a blend the old kernel did not pay.
+    #[simd]
+    fn abs_i16<V: Simd>(simd: V, value: i16x8<V>) -> i16x8<V> {
+        simd.max_i16x8(value, i16x8::splat(simd, 0) - value)
     }
 
-    /// `mask ? yes : no`, lane by lane.
-    #[target_feature(enable = "sse2")]
-    fn if_then_else(mask: __m128i, yes: __m128i, no: __m128i) -> __m128i {
-        _mm_or_si128(_mm_and_si128(mask, yes), _mm_andnot_si128(mask, no))
-    }
-
-    /// Narrows four 16-bit lanes, each already inside `0..=255`, to four consecutive bytes.
-    ///
-    /// `packus` interleaves its two operands lane by lane, so packing a vector against
-    /// itself yields `s0, s0, s1, s1, ...`. The second operand is therefore the first shifted
-    /// one lane along, which puts `s0, s1, s2, s3` in the low four bytes. Saturating is
-    /// harmless here precisely because the wrapping eight-bit add already brought every lane
-    /// into range.
-    #[target_feature(enable = "sse2")]
-    fn narrow(sum: __m128i) -> u32 {
-        _mm_cvtsi128_si32(_mm_packus_epi16(sum, _mm_srli_si128(sum, 2))) as u32
-    }
-
-    /// One pixel's Paeth prediction added to its residual, in 16-bit lanes.
+    /// One pixel's Paeth prediction added to its residual, as the four reconstructed bytes
+    /// in the low lanes.
     ///
     /// `p - a` is `b - c` and `p - b` is `a - c`, so the three distances need only two
-    /// differences; `p - c` is their sum. Ties break a, then b, then c, as the specification
-    /// requires. The predictor is added in eight-bit lanes so the sum wraps modulo 256, and
-    /// the widened result is already inside `0..=255`, so a later narrow cannot saturate.
-    #[target_feature(enable = "sse2")]
-    fn predict(raw: __m128i, left: __m128i, above: __m128i, upper_left: __m128i) -> __m128i {
-        let da = _mm_sub_epi16(above, upper_left);
-        let db = _mm_sub_epi16(left, upper_left);
-        let dc = _mm_add_epi16(da, db);
-        let pa = abs_i16(da);
-        let pb = abs_i16(db);
-        let pc = abs_i16(dc);
+    /// differences; `p - c` is their sum. Ties break a, then b, then c, as the
+    /// specification requires. The predictor is added in eight-bit lanes so the sum wraps
+    /// modulo 256, and the narrowed result is already inside `0..=255`.
+    #[simd]
+    fn predict<V: Simd>(
+        simd: V,
+        raw: i16x8<V>,
+        left: i16x8<V>,
+        above: i16x8<V>,
+        upper_left: i16x8<V>,
+    ) -> u8x16<V> {
+        let da = above - upper_left;
+        let db = left - upper_left;
+        let dc = da + db;
+        let pa = abs_i16(simd, da);
+        let pb = abs_i16(simd, db);
+        let pc = abs_i16(simd, dc);
 
-        let smallest = _mm_min_epi16(pc, _mm_min_epi16(pa, pb));
-        let nearest = if_then_else(
-            _mm_cmpeq_epi16(smallest, pa),
+        let smallest = simd.min_i16x8(pc, simd.min_i16x8(pa, pb));
+        let nearest = simd.select_i16x8(
+            simd.simd_eq_i16x8(smallest, pa),
             left,
-            if_then_else(_mm_cmpeq_epi16(smallest, pb), above, upper_left),
+            simd.select_i16x8(simd.simd_eq_i16x8(smallest, pb), above, upper_left),
         );
-        _mm_add_epi8(raw, nearest)
+        // Both operands hold their bytes in the low half of each 16-bit lane (the widening
+        // zero-extended them), so the eight-bit add leaves each sum in its lane's low byte
+        // and the narrowing packs those four bytes together.
+        let sum = raw.bitcast::<u8x16<V>>() + nearest.bitcast::<u8x16<V>>();
+        simd.narrow_u16x8(sum.bitcast(), u16x8::splat(simd, 0))
+    }
+
+    /// Four adjacent bytes as four 16-bit lanes, the width the predictor's distances need:
+    /// `a + b - c` leaves the byte range, and 16-bit lanes hold it without overflow.
+    ///
+    /// The load is a single 32-bit read spread over the register by a splat, which is what
+    /// the SSE2 kernel did: it touches nothing outside the pixel, needs no branch for the
+    /// row end, and keeps the loop's L1 traffic to a pixel per iteration. The callers
+    /// guarantee four bytes are in reach.
+    #[simd]
+    fn widen_pixel<V: Simd>(simd: V, bytes: &[u8]) -> i16x8<V> {
+        let word = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let v: u8x16<V> = u32x4::splat(simd, word).bitcast();
+        let (low, _) = v.widen();
+        low.bitcast()
     }
 
     /// Reverses `Paeth` on an RGB row, three bytes per pixel.
     ///
-    /// The fourth lane carries a zero that is computed and thrown away, which is what lets
-    /// one 128-bit register hold a whole pixel: lanes never read across pixels. Bytes past
-    /// the last whole pixel are finished by [`tail`], which for a PNG never runs — a scanline
-    /// is always a whole number of pixels — and is here so that no length can overrun.
+    /// The fourth lane carries the next pixel's first residual byte, which is computed and
+    /// thrown away: it is what lets one register hold a whole pixel without lanes reading
+    /// across pixels. Bytes past the last whole pixel are finished by [`tail`], which for a
+    /// PNG never runs - a scanline is always a whole number of pixels - and is here so that
+    /// no length can overrun.
     ///
     /// Declines, leaving `row` untouched, unless `row` and `prev` are the same length and
     /// hold at least one pixel.
-    #[target_feature(enable = "sse2")]
-    pub(super) fn paeth3(row: &mut [u8], prev: &[u8]) -> bool {
+    #[simd]
+    fn paeth3<V: Simd>(simd: V, row: &mut [u8], prev: &[u8]) -> bool {
         if row.len() != prev.len() || row.len() < 3 {
             return false;
         }
-        // `left` is the previous pixel's reconstructed bytes, `upper_left` its above bytes.
-        let mut left = _mm_setzero_si128();
-        let mut upper_left = _mm_setzero_si128();
+        let mut left = i16x8::splat(simd, 0);
+        let mut upper_left = i16x8::splat(simd, 0);
         let mut at = 0;
-        while at + 3 <= row.len() {
-            let above = widen(load3(&prev[at..]));
-            let sum = predict(widen(load3(&row[at..])), left, above, upper_left);
-            // Three single-byte stores, deliberately: a three-byte `copy_from_slice` out of
-            // the packed word measured 8% slower on a Paeth-heavy RGB photograph.
-            let packed = narrow(sum);
-            row[at] = packed as u8;
-            row[at + 1] = (packed >> 8) as u8;
-            row[at + 2] = (packed >> 16) as u8;
+        // Four bytes per iteration so the loads never cross the row end; the last pixel of
+        // a row whose length is not a whole number of pixels goes to `tail`.
+        while at + 4 <= row.len() {
+            let above = widen_pixel(simd, &prev[at..]);
+            let packed = predict(simd, widen_pixel(simd, &row[at..]), left, above, upper_left);
+            // Three single-byte stores rather than four: the fourth byte belongs to the
+            // next pixel, and a store that reaches into it makes the next iteration's load
+            // of the row forward from a partly-overlapping store, which measured slower
+            // than the stores themselves.
+            let lanes: [u32; 4] = packed.bitcast::<u32x4<V>>().into();
+            let word = lanes[0];
+            row[at] = word as u8;
+            row[at + 1] = (word >> 8) as u8;
+            row[at + 2] = (word >> 16) as u8;
 
             upper_left = above;
-            left = sum;
+            let (low, _) = packed.widen();
+            left = low.bitcast();
             at += 3;
         }
         tail(row, prev, at, 3);
@@ -415,136 +472,150 @@ mod x86 {
     ///
     /// Declines, leaving `row` untouched, unless `row` and `prev` are the same length and
     /// hold at least one pixel.
-    #[target_feature(enable = "sse2")]
-    pub(super) fn paeth4(row: &mut [u8], prev: &[u8]) -> bool {
+    #[simd]
+    fn paeth4<V: Simd>(simd: V, row: &mut [u8], prev: &[u8]) -> bool {
         if row.len() != prev.len() || row.len() < 4 {
             return false;
         }
-        let mut left = _mm_setzero_si128();
-        let mut upper_left = _mm_setzero_si128();
+        let mut left = i16x8::splat(simd, 0);
+        let mut upper_left = i16x8::splat(simd, 0);
         let mut at = 0;
         while at + 4 <= row.len() {
-            let above = widen(load4(&prev[at..]));
-            let sum = predict(widen(load4(&row[at..])), left, above, upper_left);
-            row[at..at + 4].copy_from_slice(&narrow(sum).to_le_bytes());
+            let above = widen_pixel(simd, &prev[at..]);
+            let packed = predict(simd, widen_pixel(simd, &row[at..]), left, above, upper_left);
+            let lanes: [u32; 4] = packed.bitcast::<u32x4<V>>().into();
+            row[at..at + 4].copy_from_slice(&lanes[0].to_le_bytes());
 
             upper_left = above;
-            left = sum;
+            let (low, _) = packed.widen();
+            left = low.bitcast();
             at += 4;
         }
         tail(row, prev, at, 4);
         true
     }
 
-    /// Finishes the bytes the register loop could not cover, reading the left neighbour back
-    /// out of the row the loop has already reconstructed.
+    /// Finishes the bytes the register loop could not cover, reading the left neighbour
+    /// back out of the row the loop has already reconstructed. A byte with no left
+    /// neighbour - the first pixel of a row too short for the register loop - takes the
+    /// specification's zero, exactly as the scalar decoder's own reference does.
     fn tail(row: &mut [u8], prev: &[u8], at: usize, bpp: usize) {
         for x in at..row.len() {
-            let left = row[x - bpp];
-            let upper_left = prev[x - bpp];
+            let left = if x >= bpp { row[x - bpp] } else { 0 };
+            let upper_left = if x >= bpp { prev[x - bpp] } else { 0 };
             row[x] = row[x].wrapping_add(crate::filter::paeth_predictor(left, prev[x], upper_left));
         }
-    }
-
-    /// Three bytes into a zeroed word, so the fourth lane starts at zero.
-    fn load3(bytes: &[u8]) -> [u8; 4] {
-        [bytes[0], bytes[1], bytes[2], 0]
-    }
-
-    fn load4(bytes: &[u8]) -> [u8; 4] {
-        [bytes[0], bytes[1], bytes[2], bytes[3]]
-    }
-
-    /// Spreads four adjacent bytes into four 16-bit lanes, which is the width the predictor's
-    /// distances need: `a + b - c` leaves the byte range, and 16-bit lanes hold it without
-    /// overflow. The load itself is a single 32-bit read, so nothing outside the row is
-    /// touched.
-    #[target_feature(enable = "sse2")]
-    fn widen(bytes: [u8; 4]) -> __m128i {
-        _mm_unpacklo_epi8(_mm_cvtsi32_si128(i32::from_le_bytes(bytes)), _mm_setzero_si128())
     }
 
     // ------------------------------------------------------------------
     // Conversion kernels: a native-layout row in, interleaved pixels out.
     //
+    // Each kernel is a small table of compile-time swizzle patterns applied per 16-byte
+    // block, plus a lane compare when a `tRNS` key is in play. A pattern byte of 16 or
+    // more zeroes its output lane (`swizzle_dyn_precise`), which is how the alpha lane of
+    // a replicated sample is left for the alpha vector to fill.
+    //
     // The 16-bit cases never byteswap: a big-endian sample read as a little-endian lane is
-    // the swapped value, and storing that lane little-endian writes the same bytes back —
+    // the swapped value, and storing that lane little-endian writes the same bytes back -
     // the swap is invisible end to end. Only the `tRNS` compares see it, and they compare
     // against a swapped key instead.
 
-    /// Sixteen bytes of `bytes` as a vector, read through slice indexing rather than a
-    /// pointer load.
-    #[target_feature(enable = "sse2")]
-    fn load16(bytes: &[u8]) -> __m128i {
-        _mm_set_epi64x(
-            u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as i64,
-            u64::from_le_bytes(bytes[..8].try_into().unwrap()) as i64,
-        )
-    }
+    /// `[v, v, v, -]` per pixel for the four pixel positions of a 16-byte block.
+    const REPLICATE3: [[u8; 16]; 4] = [
+        [0, 0, 0, 16, 1, 1, 1, 16, 2, 2, 2, 16, 3, 3, 3, 16],
+        [4, 4, 4, 16, 5, 5, 5, 16, 6, 6, 6, 16, 7, 7, 7, 16],
+        [8, 8, 8, 16, 9, 9, 9, 16, 10, 10, 10, 16, 11, 11, 11, 16],
+        [12, 12, 12, 16, 13, 13, 13, 16, 14, 14, 14, 16, 15, 15, 15, 16],
+    ];
 
-    /// The sixteen bytes of `v` into `target`, again through indexing only.
-    #[target_feature(enable = "sse2")]
-    fn store16(target: &mut [u8], v: __m128i) {
-        target[..8].copy_from_slice(&_mm_cvtsi128_si64(v).to_le_bytes());
-        target[8..16].copy_from_slice(&_mm_cvtsi128_si64(_mm_srli_si128(v, 8)).to_le_bytes());
-    }
+    /// The matching `[-, -, -, alpha]` lane gather, reading the compare byte of each pixel.
+    const ALPHA3: [[u8; 16]; 4] = [
+        [16, 16, 16, 0, 16, 16, 16, 1, 16, 16, 16, 2, 16, 16, 16, 3],
+        [16, 16, 16, 4, 16, 16, 16, 5, 16, 16, 16, 6, 16, 16, 16, 7],
+        [16, 16, 16, 8, 16, 16, 16, 9, 16, 16, 16, 10, 16, 16, 16, 11],
+        [16, 16, 16, 12, 16, 16, 16, 13, 16, 16, 16, 14, 16, 16, 16, 15],
+    ];
 
-    /// Stores one block of four RGBA8 pixels built from a replicated sample: `u` holds
-    /// `v, v, v, v` per pixel, `matched` the `tRNS` compare expanded the same way (all
-    /// ones where the pixel is transparent). A zero `matched` leaves every pixel opaque.
-    #[target_feature(enable = "sse2")]
-    fn emit8(u: __m128i, matched: __m128i, target: &mut [u8]) {
-        let px = _mm_or_si128(
-            _mm_and_si128(u, _mm_set1_epi32(0x00FF_FFFF)),
-            _mm_andnot_si128(matched, _mm_set1_epi32(0xFF00_0000u32 as i32)),
-        );
-        store16(target, px);
-    }
+    /// The low half moved to the high half, for joining two gathered halves.
+    const UPPER_HALF: [u8; 16] = [16, 16, 16, 16, 16, 16, 16, 16, 0, 1, 2, 3, 4, 5, 6, 7];
 
-    /// The same for a 16-bit target: `u` holds four `u16` lanes per pixel, the last takes
-    /// the alpha. Lanes 3 and 7 are the two pixels' alpha positions.
-    #[target_feature(enable = "sse2")]
-    fn emit16(u: __m128i, matched: __m128i, target: &mut [u8]) {
-        let px = _mm_or_si128(
-            _mm_and_si128(u, _mm_set_epi16(0, -1, -1, -1, 0, -1, -1, -1)),
-            _mm_andnot_si128(matched, _mm_set_epi16(-1, 0, 0, 0, -1, 0, 0, 0)),
-        );
-        store16(target, px);
-    }
+    /// `[v, v, v, v]` per sample pair for the two sample positions of a 16-byte block:
+    /// 16-bit samples replicated three times with the alpha word left for another vector.
+    const REPLICATE2: [[u8; 16]; 4] = [
+        [0, 1, 0, 1, 0, 1, 16, 16, 2, 3, 2, 3, 2, 3, 16, 16],
+        [4, 5, 4, 5, 4, 5, 16, 16, 6, 7, 6, 7, 6, 7, 16, 16],
+        [8, 9, 8, 9, 8, 9, 16, 16, 10, 11, 10, 11, 10, 11, 16, 16],
+        [12, 13, 12, 13, 12, 13, 16, 16, 14, 15, 14, 15, 14, 15, 16, 16],
+    ];
+
+    /// The matching `[-, -, alpha]` word gather, reading the compare word of each sample.
+    const ALPHA2: [[u8; 16]; 4] = [
+        [16, 16, 16, 16, 16, 16, 0, 1, 16, 16, 16, 16, 16, 16, 2, 3],
+        [16, 16, 16, 16, 16, 16, 4, 5, 16, 16, 16, 16, 16, 16, 6, 7],
+        [16, 16, 16, 16, 16, 16, 8, 9, 16, 16, 16, 16, 16, 16, 10, 11],
+        [16, 16, 16, 16, 16, 16, 12, 13, 16, 16, 16, 16, 16, 16, 14, 15],
+    ];
+
+    /// `[g, g, g, a]` per pixel, from `[g, a]` pairs.
+    const GREY_ALPHA_PAIRS: [[u8; 16]; 2] = [
+        [0, 0, 0, 1, 2, 2, 2, 3, 4, 4, 4, 5, 6, 6, 6, 7],
+        [8, 8, 8, 9, 10, 10, 10, 11, 12, 12, 12, 13, 14, 14, 14, 15],
+    ];
+
+    /// `[g, g, g, g, g, g, a, a]` per pixel, from `[g, a]` pairs.
+    const GREY_ALPHA_PAIRS_WIDE: [[u8; 16]; 4] = [
+        [0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3],
+        [4, 4, 4, 4, 4, 4, 5, 5, 6, 6, 6, 6, 6, 6, 7, 7],
+        [8, 8, 8, 8, 8, 8, 9, 9, 10, 10, 10, 10, 10, 10, 11, 11],
+        [12, 12, 12, 12, 12, 12, 13, 13, 14, 14, 14, 14, 14, 14, 15, 15],
+    ];
+
+    /// `[G, G, G, A]` from `[G, A]` samples, one 16-byte block per two samples.
+    const GREY_ALPHA_WIDE_SAMPLES: [[u8; 16]; 2] = [
+        [0, 1, 0, 1, 0, 1, 2, 3, 4, 5, 4, 5, 4, 5, 6, 7],
+        [8, 9, 8, 9, 8, 9, 10, 11, 12, 13, 12, 13, 12, 13, 14, 15],
+    ];
+
+    /// Every other byte of a 16-byte block, gathered into the low half: the file's high
+    /// bytes of the eight big-endian samples.
+    const SAMPLE_HIGH: [u8; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 16, 16, 16, 16, 16, 16, 16, 16];
+
+    /// `[g, g, g, a]` from `[G_hi, G_lo, A_hi, A_lo]` pixels, one block per four pixels.
+    const GREY_ALPHA_16_TO_8: [u8; 16] = [0, 0, 0, 2, 4, 4, 4, 6, 8, 8, 8, 10, 12, 12, 12, 14];
+
+    /// `[v, v]` per byte for the two eight-byte pixels of a 16-byte block.
+    const WIDEN_BYTES: [[u8; 16]; 2] = [
+        [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7],
+        [8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15],
+    ];
 
     /// `Greyscale` at depth 8 → RGBA8: every byte becomes `v, v, v, alpha`.
-    #[target_feature(enable = "sse2")]
-    fn grey8_rgba8(row: &[u8], target: &mut [u8], key: Option<u16>) -> bool {
+    #[simd]
+    fn grey8_rgba8<V: Simd>(simd: V, row: &[u8], target: &mut [u8], key: Option<u16>) -> bool {
         let width = target.len() / 4;
         if row.len() != width {
             return false;
         }
-        // A key past one byte can never equal a byte sample — every pixel stays opaque.
+        // A key past one byte can never equal a byte sample - every pixel stays opaque.
         let key = key.and_then(|k| u8::try_from(k).ok());
-        let keyv = key.map_or_else(|| _mm_setzero_si128(), |k| _mm_set1_epi8(k as i8));
+        let keyv = u8x16::splat(simd, key.unwrap_or(0));
         let mut x = 0;
         let mut o = 0;
         while x + 16 <= width {
-            let v = load16(&row[x..]);
-            let c = if key.is_some() { _mm_cmpeq_epi8(v, keyv) } else { _mm_setzero_si128() };
-            let (t_lo, t_hi) = (_mm_unpacklo_epi8(v, v), _mm_unpackhi_epi8(v, v));
-            let (c_lo, c_hi) = (_mm_unpacklo_epi8(c, c), _mm_unpackhi_epi8(c, c));
-            emit8(_mm_unpacklo_epi16(t_lo, t_lo), _mm_unpacklo_epi16(c_lo, c_lo), &mut target[o..]);
-            emit8(
-                _mm_unpackhi_epi16(t_lo, t_lo),
-                _mm_unpackhi_epi16(c_lo, c_lo),
-                &mut target[o + 16..],
-            );
-            emit8(
-                _mm_unpacklo_epi16(t_hi, t_hi),
-                _mm_unpacklo_epi16(c_hi, c_hi),
-                &mut target[o + 32..],
-            );
-            emit8(
-                _mm_unpackhi_epi16(t_hi, t_hi),
-                _mm_unpackhi_epi16(c_hi, c_hi),
-                &mut target[o + 48..],
-            );
+            let v = u8x16::from_slice(simd, &row[x..x + 16]);
+            let alpha = if key.is_some() {
+                let matched = simd.simd_eq_u8x16(v, keyv);
+                simd.select_u8x16(matched, u8x16::splat(simd, 0), u8x16::splat(simd, 0xFF))
+            } else {
+                u8x16::splat(simd, 0xFF)
+            };
+            for (k, pattern) in REPLICATE3.iter().enumerate() {
+                let replicate = u8x16::from_slice(simd, pattern);
+                let alpha_pattern = u8x16::from_slice(simd, &ALPHA3[k]);
+                let out = simd.swizzle_dyn_precise_u8x16(v, replicate)
+                    | simd.swizzle_dyn_precise_u8x16(alpha, alpha_pattern);
+                target[o + 16 * k..o + 16 * k + 16].copy_from_slice(&<[u8; 16]>::from(out));
+            }
             x += 16;
             o += 64;
         }
@@ -556,52 +627,38 @@ mod x86 {
         true
     }
 
-    /// `Greyscale` at depth 16 → RGBA8: the file's high byte is the output sample —
-    /// which is the low byte of the swapped `u16` lane — replicated, with the `tRNS`
-    /// compare still taken at the full 16 bits against a swapped key.
-    #[target_feature(enable = "sse2")]
-    fn grey16_rgba8(row: &[u8], target: &mut [u8], key: Option<u16>) -> bool {
+    /// `Greyscale` at depth 16 → RGBA8: the file's high byte is the output sample - the
+    /// even byte of the big-endian pair - replicated, with the `tRNS` compare still taken
+    /// at the full 16 bits against a swapped key.
+    #[simd]
+    fn grey16_rgba8<V: Simd>(simd: V, row: &[u8], target: &mut [u8], key: Option<u16>) -> bool {
         let width = target.len() / 4;
         if row.len() != width * 2 {
             return false;
         }
-        let keyv =
-            key.map_or_else(|| _mm_setzero_si128(), |k| _mm_set1_epi16(k.swap_bytes() as i16));
-        let low = _mm_set1_epi16(0x00FF);
+        let keyv = u16x8::splat(simd, key.unwrap_or(0).swap_bytes());
         let mut x = 0;
         let mut o = 0;
-        while x + 16 <= width {
-            let a = load16(&row[2 * x..]);
-            let b = load16(&row[2 * x + 16..]);
-            let g = _mm_packus_epi16(_mm_and_si128(a, low), _mm_and_si128(b, low));
-            let c = if key.is_some() {
-                _mm_packus_epi16(
-                    _mm_and_si128(_mm_cmpeq_epi16(a, keyv), low),
-                    _mm_and_si128(_mm_cmpeq_epi16(b, keyv), low),
-                )
+        while x + 8 <= width {
+            let v = u8x16::from_slice(simd, &row[2 * x..2 * x + 16]);
+            let samples = simd.swizzle_dyn_precise_u8x16(v, u8x16::from_slice(simd, &SAMPLE_HIGH));
+            let alpha = if key.is_some() {
+                let matched = simd.simd_eq_u16x8(v.bitcast(), keyv);
+                let words =
+                    simd.select_u16x8(matched, u16x8::splat(simd, 0), u16x8::splat(simd, 0xFFFF));
+                words.bitcast::<u8x16<V>>()
             } else {
-                _mm_setzero_si128()
+                u8x16::splat(simd, 0xFF)
             };
-            let (t_lo, t_hi) = (_mm_unpacklo_epi8(g, g), _mm_unpackhi_epi8(g, g));
-            let (c_lo, c_hi) = (_mm_unpacklo_epi8(c, c), _mm_unpackhi_epi8(c, c));
-            emit8(_mm_unpacklo_epi16(t_lo, t_lo), _mm_unpacklo_epi16(c_lo, c_lo), &mut target[o..]);
-            emit8(
-                _mm_unpackhi_epi16(t_lo, t_lo),
-                _mm_unpackhi_epi16(c_lo, c_lo),
-                &mut target[o + 16..],
-            );
-            emit8(
-                _mm_unpacklo_epi16(t_hi, t_hi),
-                _mm_unpacklo_epi16(c_hi, c_hi),
-                &mut target[o + 32..],
-            );
-            emit8(
-                _mm_unpackhi_epi16(t_hi, t_hi),
-                _mm_unpackhi_epi16(c_hi, c_hi),
-                &mut target[o + 48..],
-            );
-            x += 16;
-            o += 64;
+            for (k, pattern) in REPLICATE3[..2].iter().enumerate() {
+                let replicate = u8x16::from_slice(simd, pattern);
+                let alpha_pattern = u8x16::from_slice(simd, &ALPHA3[k]);
+                let out = simd.swizzle_dyn_precise_u8x16(samples, replicate)
+                    | simd.swizzle_dyn_precise_u8x16(alpha, alpha_pattern);
+                target[o + 16 * k..o + 16 * k + 16].copy_from_slice(&<[u8; 16]>::from(out));
+            }
+            x += 8;
+            o += 32;
         }
         for px in row[2 * x..2 * width].chunks_exact(2) {
             let raw = u16::from_be_bytes([px[0], px[1]]);
@@ -612,42 +669,33 @@ mod x86 {
         true
     }
 
-    /// `Greyscale` at depth 16 → RGBA16: the `u16` lane is already the output sample.
-    #[target_feature(enable = "sse2")]
-    fn grey16_rgba16(row: &[u8], target: &mut [u8], key: Option<u16>) -> bool {
+    /// `Greyscale` at depth 16 → RGBA16: the `u16` sample is already the output sample.
+    #[simd]
+    fn grey16_rgba16<V: Simd>(simd: V, row: &[u8], target: &mut [u8], key: Option<u16>) -> bool {
         let width = target.len() / 8;
         if row.len() != width * 2 {
             return false;
         }
-        let keyv =
-            key.map_or_else(|| _mm_setzero_si128(), |k| _mm_set1_epi16(k.swap_bytes() as i16));
+        let keyv = u16x8::splat(simd, key.unwrap_or(0).swap_bytes());
         let mut x = 0;
         let mut o = 0;
         while x + 8 <= width {
-            let v = load16(&row[2 * x..]);
-            let c = if key.is_some() { _mm_cmpeq_epi16(v, keyv) } else { _mm_setzero_si128() };
-            let (d_lo, d_hi) = (_mm_unpacklo_epi16(v, v), _mm_unpackhi_epi16(v, v));
-            let (m_lo, m_hi) = (_mm_unpacklo_epi16(c, c), _mm_unpackhi_epi16(c, c));
-            emit16(
-                _mm_unpacklo_epi32(d_lo, d_lo),
-                _mm_unpacklo_epi32(m_lo, m_lo),
-                &mut target[o..],
-            );
-            emit16(
-                _mm_unpackhi_epi32(d_lo, d_lo),
-                _mm_unpackhi_epi32(m_lo, m_lo),
-                &mut target[o + 16..],
-            );
-            emit16(
-                _mm_unpacklo_epi32(d_hi, d_hi),
-                _mm_unpacklo_epi32(m_hi, m_hi),
-                &mut target[o + 32..],
-            );
-            emit16(
-                _mm_unpackhi_epi32(d_hi, d_hi),
-                _mm_unpackhi_epi32(m_hi, m_hi),
-                &mut target[o + 48..],
-            );
+            let v = u8x16::from_slice(simd, &row[2 * x..2 * x + 16]);
+            let alpha = if key.is_some() {
+                let matched = simd.simd_eq_u16x8(v.bitcast(), keyv);
+                let words =
+                    simd.select_u16x8(matched, u16x8::splat(simd, 0), u16x8::splat(simd, 0xFFFF));
+                words.bitcast::<u8x16<V>>()
+            } else {
+                u8x16::splat(simd, 0xFF)
+            };
+            for (k, pattern) in REPLICATE2.iter().enumerate() {
+                let replicate = u8x16::from_slice(simd, pattern);
+                let alpha_pattern = u8x16::from_slice(simd, &ALPHA2[k]);
+                let out = simd.swizzle_dyn_precise_u8x16(v, replicate)
+                    | simd.swizzle_dyn_precise_u8x16(alpha, alpha_pattern);
+                target[o + 16 * k..o + 16 * k + 16].copy_from_slice(&<[u8; 16]>::from(out));
+            }
             x += 8;
             o += 64;
         }
@@ -661,25 +709,9 @@ mod x86 {
         true
     }
 
-    /// `Greyscale` at depth 16 → RGBA, whichever output width was asked for.
-    #[target_feature(enable = "sse2")]
-    fn grey16_rgba(row: &[u8], target: &mut [u8], wide: bool, key: Option<u16>) -> bool {
-        if wide { grey16_rgba16(row, target, key) } else { grey16_rgba8(row, target, key) }
-    }
-
-    /// The `GreyscaleAlpha` lane fix shared by every output shape: a `[g, g, a, a]`
-    /// byte pattern per pixel becomes `[g, g, g, a]`.
-    #[target_feature(enable = "sse2")]
-    fn graya_fix(t: __m128i) -> __m128i {
-        _mm_or_si128(
-            _mm_and_si128(t, _mm_set1_epi32(0xFF00_FFFFu32 as i32)),
-            _mm_and_si128(_mm_slli_epi32(t, 8), _mm_set1_epi32(0x00FF_0000)),
-        )
-    }
-
     /// `GreyscaleAlpha` at depth 8 → RGBA8: `[g, a]` pairs become `g, g, g, a`.
-    #[target_feature(enable = "sse2")]
-    fn graya8_rgba8(row: &[u8], target: &mut [u8]) -> bool {
+    #[simd]
+    fn graya8_rgba8<V: Simd>(simd: V, row: &[u8], target: &mut [u8]) -> bool {
         let width = target.len() / 4;
         if row.len() != width * 2 {
             return false;
@@ -687,9 +719,11 @@ mod x86 {
         let mut x = 0;
         let mut o = 0;
         while x + 8 <= width {
-            let v = load16(&row[2 * x..]);
-            store16(&mut target[o..], graya_fix(_mm_unpacklo_epi8(v, v)));
-            store16(&mut target[o + 16..], graya_fix(_mm_unpackhi_epi8(v, v)));
+            let v = u8x16::from_slice(simd, &row[2 * x..2 * x + 16]);
+            for (k, pattern) in GREY_ALPHA_PAIRS.iter().enumerate() {
+                let out = simd.swizzle_dyn_precise_u8x16(v, u8x16::from_slice(simd, pattern));
+                target[o + 16 * k..o + 16 * k + 16].copy_from_slice(&<[u8; 16]>::from(out));
+            }
             x += 8;
             o += 32;
         }
@@ -700,10 +734,10 @@ mod x86 {
         true
     }
 
-    /// `GreyscaleAlpha` at depth 8 → RGBA16: the fixed `[g, g, g, a]` bytes widen to
-    /// `u16` samples by one more byte-pair unpack each.
-    #[target_feature(enable = "sse2")]
-    fn graya8_rgba16(row: &[u8], target: &mut [u8]) -> bool {
+    /// `GreyscaleAlpha` at depth 8 → RGBA16: the `[g, g, g, a]` bytes widen to `u16`
+    /// samples by replicating each byte once more.
+    #[simd]
+    fn graya8_rgba16<V: Simd>(simd: V, row: &[u8], target: &mut [u8]) -> bool {
         let width = target.len() / 8;
         if row.len() != width * 2 {
             return false;
@@ -711,14 +745,13 @@ mod x86 {
         let mut x = 0;
         let mut o = 0;
         while x + 8 <= width {
-            let v = load16(&row[2 * x..]);
-            for t in [_mm_unpacklo_epi8(v, v), _mm_unpackhi_epi8(v, v)] {
-                let px = graya_fix(t);
-                store16(&mut target[o..], _mm_unpacklo_epi8(px, px));
-                store16(&mut target[o + 16..], _mm_unpackhi_epi8(px, px));
-                o += 32;
+            let v = u8x16::from_slice(simd, &row[2 * x..2 * x + 16]);
+            for (k, pattern) in GREY_ALPHA_PAIRS_WIDE.iter().enumerate() {
+                let out = simd.swizzle_dyn_precise_u8x16(v, u8x16::from_slice(simd, pattern));
+                target[o + 16 * k..o + 16 * k + 16].copy_from_slice(&<[u8; 16]>::from(out));
             }
             x += 8;
+            o += 64;
         }
         for px in row[2 * x..2 * width].chunks_exact(2) {
             let (g, a) = (px[0], px[1]);
@@ -728,25 +761,23 @@ mod x86 {
         true
     }
 
-    /// `GreyscaleAlpha` at depth 16 → RGBA8: lanes narrow to their low bytes (the file's
-    /// high bytes), giving the same `[g, a]` pairs the 8-bit kernel expands.
-    #[target_feature(enable = "sse2")]
-    fn graya16_rgba8(row: &[u8], target: &mut [u8]) -> bool {
+    /// `GreyscaleAlpha` at depth 16 → RGBA8: the file's high bytes of `[G, A]` become
+    /// `g, g, g, a`.
+    #[simd]
+    fn graya16_rgba8<V: Simd>(simd: V, row: &[u8], target: &mut [u8]) -> bool {
         let width = target.len() / 4;
         if row.len() != width * 4 {
             return false;
         }
-        let low = _mm_set1_epi16(0x00FF);
         let mut x = 0;
         let mut o = 0;
-        while x + 8 <= width {
-            let a = load16(&row[4 * x..]);
-            let b = load16(&row[4 * x + 16..]);
-            let pairs = _mm_packus_epi16(_mm_and_si128(a, low), _mm_and_si128(b, low));
-            store16(&mut target[o..], graya_fix(_mm_unpacklo_epi8(pairs, pairs)));
-            store16(&mut target[o + 16..], graya_fix(_mm_unpackhi_epi8(pairs, pairs)));
-            x += 8;
-            o += 32;
+        while x + 4 <= width {
+            let v = u8x16::from_slice(simd, &row[4 * x..4 * x + 16]);
+            let out =
+                simd.swizzle_dyn_precise_u8x16(v, u8x16::from_slice(simd, &GREY_ALPHA_16_TO_8));
+            target[o..o + 16].copy_from_slice(&<[u8; 16]>::from(out));
+            x += 4;
+            o += 16;
         }
         for px in row[4 * x..4 * width].chunks_exact(4) {
             target[o..o + 4].copy_from_slice(&[px[0], px[0], px[0], px[2]]);
@@ -755,32 +786,24 @@ mod x86 {
         true
     }
 
-    /// `GreyscaleAlpha` at depth 16 → RGBA16: `[G, A]` lanes become `G, G, G, A`, the
+    /// `GreyscaleAlpha` at depth 16 → RGBA16: `[G, A]` samples become `G, G, G, A`, the
     /// byte order riding through untouched.
-    #[target_feature(enable = "sse2")]
-    fn graya16_rgba16(row: &[u8], target: &mut [u8]) -> bool {
+    #[simd]
+    fn graya16_rgba16<V: Simd>(simd: V, row: &[u8], target: &mut [u8]) -> bool {
         let width = target.len() / 8;
         if row.len() != width * 4 {
             return false;
         }
-        // Per u64 lane the pair pattern is `[G, G, A, A]`; lane 2 must hold a copy of
-        // lane 0 instead of the second `A`.
-        let keep = _mm_set_epi64x(0xFFFF_0000_FFFF_FFFFu64 as i64, 0xFFFF_0000_FFFF_FFFFu64 as i64);
-        let fill_at =
-            _mm_set_epi64x(0x0000_FFFF_0000_0000u64 as i64, 0x0000_FFFF_0000_0000u64 as i64);
         let mut x = 0;
         let mut o = 0;
         while x + 4 <= width {
-            let v = load16(&row[4 * x..]);
-            for t in [_mm_unpacklo_epi16(v, v), _mm_unpackhi_epi16(v, v)] {
-                let px = _mm_or_si128(
-                    _mm_and_si128(t, keep),
-                    _mm_and_si128(_mm_slli_epi64(t, 32), fill_at),
-                );
-                store16(&mut target[o..], px);
-                o += 16;
+            let v = u8x16::from_slice(simd, &row[4 * x..4 * x + 16]);
+            for (k, pattern) in GREY_ALPHA_WIDE_SAMPLES.iter().enumerate() {
+                let out = simd.swizzle_dyn_precise_u8x16(v, u8x16::from_slice(simd, pattern));
+                target[o + 16 * k..o + 16 * k + 16].copy_from_slice(&<[u8; 16]>::from(out));
             }
             x += 4;
+            o += 32;
         }
         for px in row[4 * x..4 * width].chunks_exact(4) {
             let (g, a) = ([px[0], px[1]], [px[2], px[3]]);
@@ -790,36 +813,24 @@ mod x86 {
         true
     }
 
-    /// `GreyscaleAlpha` at either depth → RGBA, whichever output width was asked for.
-    #[target_feature(enable = "sse2")]
-    fn graya_rgba(row: &[u8], target: &mut [u8], depth: BitDepth, wide: bool) -> bool {
-        match (depth, wide) {
-            (BitDepth::Eight, false) => graya8_rgba8(row, target),
-            (BitDepth::Eight, true) => graya8_rgba16(row, target),
-            (BitDepth::Sixteen, false) => graya16_rgba8(row, target),
-            (BitDepth::Sixteen, true) => graya16_rgba16(row, target),
-            _ => false,
-        }
-    }
-
-    /// `Rgba` at depth 16 → RGBA8: each `u16` lane narrows to its low byte — the file's
-    /// high byte.
-    #[target_feature(enable = "sse2")]
-    fn rgba16_rgba8(row: &[u8], target: &mut [u8]) -> bool {
+    /// `Rgba` at depth 16 → RGBA8: each `u16` sample narrows to its high byte - the even
+    /// byte of the big-endian pair.
+    #[simd]
+    fn rgba16_rgba8<V: Simd>(simd: V, row: &[u8], target: &mut [u8]) -> bool {
         let width = target.len() / 4;
         if row.len() != width * 8 {
             return false;
         }
-        let low = _mm_set1_epi16(0x00FF);
         let mut x = 0;
         let mut o = 0;
         while x + 4 <= width {
-            let a = load16(&row[8 * x..]);
-            let b = load16(&row[8 * x + 16..]);
-            store16(
-                &mut target[o..],
-                _mm_packus_epi16(_mm_and_si128(a, low), _mm_and_si128(b, low)),
-            );
+            let a = u8x16::from_slice(simd, &row[8 * x..8 * x + 16]);
+            let b = u8x16::from_slice(simd, &row[8 * x + 16..8 * x + 32]);
+            let low = simd.swizzle_dyn_precise_u8x16(a, u8x16::from_slice(simd, &SAMPLE_HIGH));
+            let high = simd.swizzle_dyn_precise_u8x16(b, u8x16::from_slice(simd, &SAMPLE_HIGH));
+            let joined =
+                low | simd.swizzle_dyn_precise_u8x16(high, u8x16::from_slice(simd, &UPPER_HALF));
+            target[o..o + 16].copy_from_slice(&<[u8; 16]>::from(joined));
             x += 4;
             o += 16;
         }
@@ -830,10 +841,9 @@ mod x86 {
         true
     }
 
-    /// `Rgba` at depth 8 → RGBA16: one byte-pair unpack per half block widens every
-    /// sample by `v * 257` for free.
-    #[target_feature(enable = "sse2")]
-    fn rgba8_rgba16(row: &[u8], target: &mut [u8]) -> bool {
+    /// `Rgba` at depth 8 → RGBA16: every byte widens to `v * 257` by repeating it.
+    #[simd]
+    fn rgba8_rgba16<V: Simd>(simd: V, row: &[u8], target: &mut [u8]) -> bool {
         let width = target.len() / 8;
         if row.len() != width * 4 {
             return false;
@@ -841,9 +851,11 @@ mod x86 {
         let mut x = 0;
         let mut o = 0;
         while x + 4 <= width {
-            let v = load16(&row[4 * x..]);
-            store16(&mut target[o..], _mm_unpacklo_epi8(v, v));
-            store16(&mut target[o + 16..], _mm_unpackhi_epi8(v, v));
+            let v = u8x16::from_slice(simd, &row[4 * x..4 * x + 16]);
+            for (k, pattern) in WIDEN_BYTES.iter().enumerate() {
+                let out = simd.swizzle_dyn_precise_u8x16(v, u8x16::from_slice(simd, pattern));
+                target[o + 16 * k..o + 16 * k + 16].copy_from_slice(&<[u8; 16]>::from(out));
+            }
             x += 4;
             o += 32;
         }
@@ -855,8 +867,8 @@ mod x86 {
         true
     }
 
-    /// The conversion dispatch for this target: four-channel targets only — the
-    /// three-channel layouts have no kernel and stay scalar.
+    /// The conversion dispatch: four-channel targets only - the three-channel layouts
+    /// have no kernel and stay scalar.
     pub(super) fn convert_row(
         conv: &RowConversion<'_>,
         row: &[u8],
@@ -865,27 +877,41 @@ mod x86 {
         if conv.channels != 4 {
             return Ok(false);
         }
-        // SAFETY: every kernel below needs only SSE2, which the x86-64 baseline enables
-        // for this whole build (the module asserts it at compile time). The kernels
-        // check the slice lengths themselves and touch memory only through indexing.
-        unsafe {
-            match (conv.color_type, conv.bit_depth) {
-                // Measured against the scalar helpers, the depth-8 → 16-bit greyscale
-                // kernel loses to the autovectorised scalar loop, so only the 8-bit
-                // target is claimed here.
-                (ColorType::Grayscale, BitDepth::Eight) if !conv.wide => {
-                    Ok(grey8_rgba8(row, target, conv.grey_key))
-                }
-                (ColorType::Grayscale, BitDepth::Sixteen) => {
-                    Ok(grey16_rgba(row, target, conv.wide, conv.grey_key))
-                }
-                (ColorType::GrayscaleAlpha, d @ (BitDepth::Eight | BitDepth::Sixteen)) => {
-                    Ok(graya_rgba(row, target, d, conv.wide))
-                }
-                (ColorType::Rgba, BitDepth::Eight) if conv.wide => Ok(rgba8_rgba16(row, target)),
-                (ColorType::Rgba, BitDepth::Sixteen) if !conv.wide => Ok(rgba16_rgba8(row, target)),
-                _ => Ok(false),
+        match (conv.color_type, conv.bit_depth) {
+            // Measured against the scalar helpers, the depth-8 → 16-bit greyscale kernel
+            // loses to the autovectorised scalar loop, so only the 8-bit target is
+            // claimed here.
+            (ColorType::Grayscale, BitDepth::Eight) if !conv.wide => {
+                Ok(dispatch!(Level::new(), simd => grey8_rgba8(simd, row, target, conv.grey_key)))
             }
+            (ColorType::Grayscale, BitDepth::Sixteen) => Ok(dispatch!(Level::new(), simd => {
+                if conv.wide {
+                    grey16_rgba16(simd, row, target, conv.grey_key)
+                } else {
+                    grey16_rgba8(simd, row, target, conv.grey_key)
+                }
+            })),
+            (ColorType::GrayscaleAlpha, BitDepth::Eight) => Ok(dispatch!(Level::new(), simd => {
+                if conv.wide {
+                    graya8_rgba16(simd, row, target)
+                } else {
+                    graya8_rgba8(simd, row, target)
+                }
+            })),
+            (ColorType::GrayscaleAlpha, BitDepth::Sixteen) => Ok(dispatch!(Level::new(), simd => {
+                if conv.wide {
+                    graya16_rgba16(simd, row, target)
+                } else {
+                    graya16_rgba8(simd, row, target)
+                }
+            })),
+            (ColorType::Rgba, BitDepth::Eight) if conv.wide => {
+                Ok(dispatch!(Level::new(), simd => rgba8_rgba16(simd, row, target)))
+            }
+            (ColorType::Rgba, BitDepth::Sixteen) if !conv.wide => {
+                Ok(dispatch!(Level::new(), simd => rgba16_rgba8(simd, row, target)))
+            }
+            _ => Ok(false),
         }
     }
 }
@@ -893,12 +919,18 @@ mod x86 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_arch = "x86_64")]
     use crate::filter::paeth_predictor;
+
+    /// Whether the conversion kernels can run on this backend at all. The parity tests
+    /// drive the kernels directly — they bypass the facade's scalar-override gate so that
+    /// `PSD_PNG_FORCE_SCALAR=1` cannot turn a kernel test into a test of the fallback — so
+    /// what they expect of a kernel-shaped row is the backend's answer, not the override's.
+    fn kernels_expected() -> bool {
+        shuffles_available()
+    }
 
     /// The scalar definition, written out here rather than borrowed from the filter loops,
     /// so a change to those loops cannot make this test agree with a wrong kernel.
-    #[cfg(target_arch = "x86_64")]
     fn reference(row: &mut [u8], prev: &[u8], bpp: usize) {
         for x in 0..row.len() {
             let left = if x >= bpp { row[x - bpp] } else { 0 };
@@ -925,13 +957,10 @@ mod tests {
     /// The parity tests go through this rather than [`paeth_row`] so that what they check does
     /// not depend on the stride claim: with the scalar override in force the dispatch declines
     /// everything, and a kernel test would quietly become a test of the scalar fallback.
-    #[cfg(target_arch = "x86_64")]
     fn kernel(bpp: usize) -> fn(&mut [u8], &[u8]) -> bool {
-        // SAFETY: the kernels need only SSE2, which the x86-64 baseline enables for this
-        // whole build (the module asserts it at compile time).
         match bpp {
-            3 => |row, prev| unsafe { super::x86::paeth3(row, prev) },
-            4 => |row, prev| unsafe { super::x86::paeth4(row, prev) },
+            3 => super::kernels::paeth3_row,
+            4 => super::kernels::paeth4_row,
             _ => unreachable!("no kernel for stride {bpp}"),
         }
     }
@@ -940,7 +969,6 @@ mod tests {
     /// length — including lengths that are not a whole number of pixels, which the register
     /// loop leaves to the tail and a PNG scanline never actually has.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn kernel_matches_the_scalar_definition() {
         for bpp in [3usize, 4] {
             let kernel = kernel(bpp);
@@ -964,7 +992,6 @@ mod tests {
     /// The first row of an image has no row above, and the specification defines every
     /// neighbour as zero there — which reduces `Paeth` to `Sub`.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn kernel_handles_a_first_row_over_zeros() {
         for bpp in [3usize, 4] {
             let kernel = kernel(bpp);
@@ -982,7 +1009,6 @@ mod tests {
     /// Extreme byte values exercise the wrap in the final add and the extremes of the
     /// predictor's distances, which are where a lane-wise port most easily diverges.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn kernel_handles_extreme_values() {
         for bpp in [3usize, 4] {
             let kernel = kernel(bpp);
@@ -1040,12 +1066,13 @@ mod tests {
         assert_eq!(row, filtered[..16], "a declined row must be untouched");
     }
 
-    /// On x86-64 the kernel claims exactly the RGB and RGBA strides, unless the scalar
-    /// override is in force; elsewhere it claims nothing.
+    /// The kernel claims exactly the RGB and RGBA strides whenever a vector backend is in
+    /// force, and nothing otherwise — which is also the promise the caller relies on when
+    /// it picks between the kernel and the scalar two-row wavefront.
     #[test]
-    fn the_claimed_strides_follow_the_target() {
+    fn the_claimed_strides_follow_the_backend() {
         let expected: &[usize] =
-            if cfg!(target_arch = "x86_64") && !scalar_forced() { &[3, 4] } else { &[] };
+            if vectors_available() && !scalar_forced() { &[3, 4] } else { &[] };
         let claimed: Vec<usize> =
             [1usize, 2, 3, 4, 6, 8].into_iter().filter(|&bpp| claims_stride(bpp)).collect();
         assert_eq!(claimed, expected);
@@ -1184,8 +1211,8 @@ mod tests {
         corpus(bytes, seed)
     }
 
-    /// `x86::convert_row` plus the portable paths, in the facade's own order — minus the
-    /// scalar-override gate, so kernels are always exercised.
+    /// The conversion kernels plus the portable paths, in the facade's own order — minus
+    /// the scalar-override and backend gates, so the kernels are always exercised.
     fn accelerated(conv: &RowConversion<'_>, row: &[u8], target: &mut [u8]) -> Result<bool, Error> {
         if conv.color_type == ColorType::Indexed {
             let Some(palette) = conv.palette else { return Ok(false) };
@@ -1194,27 +1221,42 @@ mod tests {
         if conv.color_type == ColorType::Rgb {
             return rgb_to_rgba(conv, row, target);
         }
-        #[cfg(target_arch = "x86_64")]
-        {
-            x86::convert_row(conv, row, target)
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (row, target);
-            Ok(false)
-        }
+        kernels::convert_row(conv, row, target)
     }
 
     /// Asserts the accelerated path claims the row and matches the scalar helpers.
     fn assert_parity(conv: &RowConversion<'_>, row: &[u8], width: usize, ctx: &str) {
+        assert_parity_expected(conv, row, width, ctx, true);
+    }
+
+    /// Asserts the conversion kernels claim the row and match the scalar helpers — or, on
+    /// a backend without a hardware shuffle, that they decline and leave it untouched.
+    fn assert_kernel_parity(conv: &RowConversion<'_>, row: &[u8], width: usize, ctx: &str) {
+        assert_parity_expected(conv, row, width, ctx, kernels_expected());
+    }
+
+    /// Asserts the accelerated path's claim matches `expected` and, when it claims, that
+    /// the output equals the scalar helpers byte for byte.
+    fn assert_parity_expected(
+        conv: &RowConversion<'_>,
+        row: &[u8],
+        width: usize,
+        ctx: &str,
+        expected: bool,
+    ) {
         let out = 4 * usize::from(conv.wide) + 4;
         let mut want = vec![0xCCu8; width * out];
         scalar(conv, row, &mut want).unwrap();
 
         let mut got = vec![0x55u8; width * out];
         let claimed = accelerated(conv, row, &mut got).unwrap();
-        assert!(claimed, "{ctx}: the accelerated path declined a covered shape");
-        assert_eq!(got, want, "{ctx}: accelerated and scalar disagree");
+        if expected {
+            assert!(claimed, "{ctx}: the accelerated path declined a covered shape");
+            assert_eq!(got, want, "{ctx}: accelerated and scalar disagree");
+        } else {
+            assert!(!claimed, "{ctx}: no kernel should claim on this backend");
+            assert_eq!(got, vec![0x55u8; width * out], "{ctx}: a declined row must be untouched");
+        }
     }
 
     /// Asserts the accelerated path declines and leaves the target untouched.
@@ -1238,7 +1280,6 @@ mod tests {
     /// range, which can never match a depth-8 sample. The depth-8 → 16-bit target is
     /// not covered: measured to lose to the autovectorised scalar loop, it declines.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn greyscale_conversion_matches_scalar() {
         for depth in [BitDepth::Eight, BitDepth::Sixteen] {
             for wide in [false, true] {
@@ -1251,7 +1292,7 @@ mod tests {
                     for width in widths() {
                         let row =
                             native_row(ColorType::Grayscale, depth, width, 0xA511 ^ width as u64);
-                        assert_parity(
+                        assert_kernel_parity(
                             &spec,
                             &row,
                             width,
@@ -1270,7 +1311,6 @@ mod tests {
     /// the scalar helpers, the chunked unpack plus byte kernels loses to the
     /// autovectorised scalar loop, keyed or not.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn subbyte_greyscale_declines() {
         for depth in [BitDepth::One, BitDepth::Two, BitDepth::Four] {
             for wide in [false, true] {
@@ -1286,7 +1326,6 @@ mod tests {
 
     /// Greyscale-alpha rows at both depths and both output widths.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn greyscale_alpha_conversion_matches_scalar() {
         for depth in [BitDepth::Eight, BitDepth::Sixteen] {
             for wide in [false, true] {
@@ -1298,7 +1337,12 @@ mod tests {
                         width,
                         0xC0DE ^ (width as u64) << 3,
                     );
-                    assert_parity(&spec, &row, width, &format!("{depth:?} wide={wide} w={width}"));
+                    assert_kernel_parity(
+                        &spec,
+                        &row,
+                        width,
+                        &format!("{depth:?} wide={wide} w={width}"),
+                    );
                 }
             }
         }
@@ -1307,13 +1351,17 @@ mod tests {
     /// The RGBA width conversions the kernels claim — 8→16 and 16→8. The equal-width
     /// cases never reach conversion at all (`passes_through` in transform.rs).
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn rgba_width_conversion_matches_scalar() {
         for (depth, wide) in [(BitDepth::Eight, true), (BitDepth::Sixteen, false)] {
             let spec = conv(ColorType::Rgba, depth, wide, None);
             for width in widths() {
                 let row = native_row(ColorType::Rgba, depth, width, 0xD00D ^ width as u64);
-                assert_parity(&spec, &row, width, &format!("{depth:?} wide={wide} w={width}"));
+                assert_kernel_parity(
+                    &spec,
+                    &row,
+                    width,
+                    &format!("{depth:?} wide={wide} w={width}"),
+                );
             }
         }
     }

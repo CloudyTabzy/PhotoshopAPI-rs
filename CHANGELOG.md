@@ -6,6 +6,31 @@ no `repository` URL, so no version headings carry compare links.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-29
+
+### Changed
+
+- **The SIMD kernels are portable.** The hand-written SSE2 `Paeth` kernel and the SSE2
+  conversion kernels were replaced by one source written against `fearless_simd`'s portable
+  vectors, compiled at run time for SSE2, SSE4.2, AVX2, AVX-512, NEON or wasm SIMD with the
+  scalar paths as the fallback. This gives the crate its only dependency, and it ends the
+  kernels' x86-64-only status: the filter and conversion kernels now run on ARM and on the
+  web, where every target previously took the scalar path. Measured in one harness against
+  the SSE2 kernels they replace: 2–8% faster on `Paeth` workloads; against the scalar
+  wavefront, 11% at 3-byte strides and 37% at 4-byte strides. Every kernel is still pinned to
+  the scalar helpers by the same parity tests, and `PSD_PNG_FORCE_SCALAR=1` (with the
+  `scalar-override` feature) still selects the scalar paths in one build. Two backends
+  deliberately decline to the scalar path: the scalar fallback, where generic code runs a
+  lane at a time, and the bare SSE2 level for the shuffle-built conversion kernels, where a
+  dynamic byte shuffle is emulated per lane.
+
+### Notes
+
+- Debug builds run the kernels unoptimised: generic code only inlines under optimisation,
+  where the old `core::arch` intrinsics emitted real instructions either way. The
+  conversion-heavy test suites are correspondingly slower under a plain `cargo test`; every
+  number in `docs/benchmarks.md`, and `cargo test --release`, are the fast ones.
+
 ## [0.4.0] - 2026-09-28
 
 ### Added

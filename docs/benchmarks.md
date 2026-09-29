@@ -259,6 +259,50 @@ For scale: that 4K fixture's `decode_to_rgba8` was 49.48 ms before the kernel an
 after, so the kernel is worth more on that file than fused reconstruction and fused
 conversion combined.
 
+### Portable kernels: what the rewrite measured
+
+The hand-written SSE2 kernel the tables above measure has since been replaced by one written
+against `fearless_simd`'s portable vectors, so the same source compiles for SSE4.2, AVX2,
+AVX-512, NEON and wasm SIMD as well. The comparison below is same-machine and same-harness:
+`bench/src/bin/paeth_micro` builds one all-`Paeth` image, runs `unfilter_image` on it best of
+30, and takes a real fixture's own filtered bytes when given a PNG path. The SSE2 column is
+the same harness against a `git stash` of the old kernel, so nothing depends on a
+cross-run baseline.
+
+| workload | scalar | SSE2 kernel | portable kernel |
+|---|---:|---:|---:|
+| 2048x512, 3-byte stride | 3.580 ms | 3.215 ms | **3.190 ms** |
+| 2048x512, 4-byte stride | 4.951 ms | 3.415 ms | **3.132 ms** |
+| 2048x2048, 3-byte stride | 14.601 ms | 13.207 ms | **13.058 ms** |
+| 2048x2048, 4-byte stride | 20.143 ms | 13.922 ms | **12.900 ms** |
+| `rgb8_photo_2048`, its own bytes | — | 13.272 ms | **12.923 ms** |
+
+The portable kernel is 2–8% faster than the SSE2 kernel it replaced, and 11–37% faster than
+the scalar wavefront — the first time the kernel has beaten the scalar path on the 3-byte
+stride by a clear margin, rather than by the ~10% the SSE2 kernel managed.
+
+Three findings from the rewrite are worth recording, because each cost a measurement round:
+
+- **`#[simd]` is not optional.** Without the attribute the identical generic source measured
+  2.4× *slower* than scalar; with it, 2× faster. Every kernel in the crate carries it.
+- **The byte-add's lane layout matters more than the op count.** The predictor's distances
+  live in 16-bit lanes, so the reconstructed bytes end up in the low byte of each lane, and
+  the narrowing (`narrow_u16x8`) is what packs them back — one instruction, the same one the
+  SSE2 kernel used.
+- **The RGB kernel stores three bytes, not four.** Writing the fourth byte as well (which the
+  register already holds) makes the next iteration's load of the row forward from a
+  partly-overlapping store; that measured 25% *slower* than the three-byte store it was meant
+  to improve.
+
+`PSD_PNG_FORCE_SCALAR=1` still selects the scalar paths in one build, and every kernel is
+pinned to the scalar helpers by the same parity tests as before.
+
+One measurement caveat: the old kernels were `core::arch` intrinsics, which emit real
+instructions even in an unoptimised build, while the generic kernels only inline under
+optimisation. `cargo test` (debug) therefore runs the kernels unoptimised and the
+conversion-heavy suites take noticeably longer there; `cargo test --release` and every number
+above are the fast ones.
+
 ### Cross-library context
 
 Whole-PNG decode against the `png` crate (which uses `fdeflate`), interleaved best-of-30.
@@ -364,6 +408,7 @@ cargo run --release -p psd-png-bench --bin profile -- tmp/large
 cargo run --release -p psd-png-bench --bin stream_decode -- tmp/large
 cargo run --release -p psd-png-bench --bin stage_split -- tmp/large
 cargo run --release -p psd-png-bench --bin convert_bench -- tmp/large
+cargo run --release -p psd-png-bench --bin paeth_micro -- 2048 512 3   # the kernel alone
 python3 bench/tools/filters.py tmp/large
 ```
 
