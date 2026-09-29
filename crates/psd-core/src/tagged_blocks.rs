@@ -178,9 +178,49 @@ impl TaggedBlock {
     /// four-byte aligned after the declared length. Per-layer blocks follow a
     /// different rule — see [`write_layer_block`](Self::write_layer_block).
     pub fn write(&self, writer: &mut BeWriter, header: &FileHeader, padding: usize) -> Result<()> {
+        self.write_to(writer, header, padding)
+    }
+
+    /// [`write`](Self::write) to any sink, so a large payload can go straight
+    /// to a file without being copied into a staging buffer first.
+    pub fn write_to<W: std::io::Write>(
+        &self,
+        sink: &mut W,
+        header: &FileHeader,
+        padding: usize,
+    ) -> Result<()> {
         let declared = self.data.len();
         let pad = round_up(declared, padding) - declared;
-        self.write_with_declared(writer, header, declared, pad)
+        sink.write_all(&self.header_bytes(header, declared as u64)?)?;
+        sink.write_all(&self.data)?;
+        sink.write_all(&ZEROS[..pad])?;
+        Ok(())
+    }
+
+    /// Bytes [`write`](Self::write) produces: signature, key, length field,
+    /// payload and its padding to a multiple of `padding`.
+    pub fn encoded_len(&self, header: &FileHeader, padding: usize) -> u64 {
+        let declared = self.data.len();
+        (8 + self.length_width(header) + round_up(declared, padding)) as u64
+    }
+
+    /// The signature, key and length field that lead a block whose payload
+    /// declares `declared` bytes. A block streamed in pieces (the `Lr16`/`Lr32`
+    /// layer data) needs this before its payload exists.
+    pub fn header_bytes(&self, header: &FileHeader, declared: u64) -> Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&self.signature);
+        bytes.extend_from_slice(&self.key.as_bytes());
+        if self.length_width(header) == 8 {
+            bytes.extend_from_slice(&declared.to_be_bytes());
+        } else {
+            let narrowed = u32::try_from(declared).map_err(|_| PsdError::LengthOverflow {
+                actual: declared,
+                width: 4,
+            })?;
+            bytes.extend_from_slice(&narrowed.to_be_bytes());
+        }
+        Ok(bytes)
     }
 
     /// Write a per-layer block the way Photoshop's layer-record walk requires:
@@ -197,28 +237,7 @@ impl TaggedBlock {
     /// writes — are byte-identical to what the input carried.
     pub fn write_layer_block(&self, writer: &mut BeWriter, header: &FileHeader) -> Result<()> {
         let pad = self.data.len() % 2;
-        self.write_with_declared(writer, header, self.data.len() + pad, pad)
-    }
-
-    fn write_with_declared(
-        &self,
-        writer: &mut BeWriter,
-        header: &FileHeader,
-        declared: usize,
-        pad: usize,
-    ) -> Result<()> {
-        writer.bytes(&self.signature);
-        writer.bytes(&self.key.as_bytes());
-        let declared = declared as u64;
-        if self.length_width(header) == 8 {
-            writer.u64(declared);
-        } else {
-            let narrowed = u32::try_from(declared).map_err(|_| PsdError::LengthOverflow {
-                actual: declared,
-                width: 4,
-            })?;
-            writer.u32(narrowed);
-        }
+        writer.bytes(&self.header_bytes(header, (self.data.len() + pad) as u64)?);
         writer.bytes(&self.data);
         writer.bytes(&ZEROS[..pad]);
         Ok(())

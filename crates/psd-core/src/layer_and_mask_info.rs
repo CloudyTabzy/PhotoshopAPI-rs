@@ -30,6 +30,7 @@
 //!   write adds a marker its own reader would choke on).
 
 use std::borrow::Cow;
+use std::io::Write;
 
 use crate::enums::{BitDepth, BlendMode, ChannelId, Compression, Version};
 use crate::error::{PsdError, Result};
@@ -204,6 +205,124 @@ impl<'a> LayerAndMaskInformation<'a> {
         writer.patch_len(header.version, marker, end, false)
     }
 
+    /// Stream the section to `sink`: the same bytes as [`write`](Self::write),
+    /// without assembling the section in memory first, and each channel payload
+    /// is released once it has been written.
+    ///
+    /// Every length is worked out before the first byte goes out (layer records
+    /// and other small parts are staged, payload sizes are known), so a section
+    /// that cannot be written, one whose length overflows a PSD field, fails
+    /// before any of the section reaches `sink`.
+    ///
+    /// One difference from `write`: when a 16/32-bit document carries several
+    /// `Lr16`/`Lr32` blocks, `write` regenerates the layer data into each of
+    /// them, and this writes it once, into the first, and drops the others.
+    /// A second copy of the layer tree can only be stale.
+    pub(crate) fn write_to<W: Write>(&mut self, sink: &mut W, header: &FileHeader) -> Result<()> {
+        let version = header.version;
+        let records = &self.layer_info.layer_records;
+        let mut pieces: Vec<Piece<'_>> = Vec::new();
+
+        // The layer records, and the length of records plus channel data.
+        let mut head = BeWriter::new();
+        self.layer_info.write_head(&mut head, header)?;
+        let head = head.into_inner();
+        let content_len = head.len() as u64 + self.layer_info.channel_data_len();
+
+        // LayerInfo: real data only in 8-bit documents; the 16/32-bit layer
+        // data goes into the `Lr16`/`Lr32` block below.
+        if header.depth == BitDepth::Eight {
+            if records.is_empty() {
+                tracing::warn!("writing a document without layers (empty layer info section)");
+                pieces.push(Piece::Bytes(length_field(version, 0)?));
+            } else {
+                let pad = pad_to_four(content_len);
+                pieces.push(Piece::Bytes(length_field(version, content_len + pad)?));
+                pieces.push(Piece::Head);
+                pieces.push(Piece::ChannelData);
+                pieces.push(Piece::Bytes(zeros(pad)));
+            }
+        } else {
+            pieces.push(Piece::Bytes(length_field(version, 0)?));
+        }
+
+        // GlobalLayerMaskInfo.
+        let mask = &self.global_layer_mask_info.data;
+        let mask_len = u32::try_from(mask.len()).map_err(|_| PsdError::LengthOverflow {
+            actual: mask.len() as u64,
+            width: 4,
+        })?;
+        let mut mask_bytes = mask_len.to_be_bytes().to_vec();
+        mask_bytes.extend_from_slice(mask);
+        pieces.push(Piece::Bytes(mask_bytes));
+
+        // Document-level tagged blocks, with the layer data of a 16/32-bit
+        // document in its `Lr16`/`Lr32` block (first, for a new document, like
+        // Photoshop).
+        let nested_key = match header.depth {
+            BitDepth::Sixteen => Some(TaggedBlockKey::LR16),
+            BitDepth::ThirtyTwo => Some(TaggedBlockKey::LR32),
+            BitDepth::One | BitDepth::Eight => None,
+        }
+        .filter(|_| !records.is_empty());
+        let blocks = self
+            .additional_layer_info
+            .as_ref()
+            .map(|ali| ali.blocks.as_slice())
+            .unwrap_or(&[]);
+        let mut nested_placed = false;
+        let nested = |template: TaggedBlock, pieces: &mut Vec<Piece<'_>>| -> Result<()> {
+            // The payload has no inner length marker, and the block pads to four
+            // outside its declared length.
+            pieces.push(Piece::Bytes(template.header_bytes(header, content_len)?));
+            pieces.push(Piece::Head);
+            pieces.push(Piece::ChannelData);
+            pieces.push(Piece::Bytes(zeros(pad_to_four(content_len))));
+            Ok(())
+        };
+        if let Some(key) = nested_key {
+            if !blocks.iter().any(|block| block.key == key) {
+                nested(TaggedBlock::new(key, Vec::new()), &mut pieces)?;
+                nested_placed = true;
+            }
+        }
+        for block in blocks {
+            if nested_key == Some(block.key) {
+                if !nested_placed {
+                    let mut template = block.clone();
+                    template.data = Vec::new();
+                    nested(template, &mut pieces)?;
+                    nested_placed = true;
+                }
+            } else {
+                pieces.push(Piece::Block(block));
+            }
+        }
+
+        // The section length covers everything above, padded to four.
+        let total: u64 = pieces
+            .iter()
+            .map(|piece| match piece {
+                Piece::Bytes(bytes) => bytes.len() as u64,
+                Piece::Head => head.len() as u64,
+                Piece::Block(block) => block.encoded_len(header, 4),
+                Piece::ChannelData => self.layer_info.channel_data_len(),
+            })
+            .sum();
+        let pad = pad_to_four(total);
+        sink.write_all(&length_field(version, total + pad)?)?;
+        for piece in &pieces {
+            match piece {
+                Piece::Bytes(bytes) => sink.write_all(bytes)?,
+                Piece::Head => sink.write_all(&head)?,
+                Piece::Block(block) => block.write_to(sink, header, 4)?,
+                Piece::ChannelData => self.layer_info.stream_channel_data(sink)?,
+            }
+        }
+        sink.write_all(&zeros(pad))?;
+        Ok(())
+    }
+
     fn write_additional_layer_info(
         &self,
         writer: &mut BeWriter,
@@ -373,6 +492,16 @@ impl<'a> LayerInfo<'a> {
     /// Write count + records + channel data without a leading length marker
     /// (the `Lr16`/`Lr32` payload).
     pub fn write_content(&self, writer: &mut BeWriter, header: &FileHeader) -> Result<()> {
+        self.write_head(writer, header)?;
+        for channels in &self.channel_image_data {
+            channels.write(writer)?;
+        }
+        Ok(())
+    }
+
+    /// Write the layer count and the layer records: everything that precedes
+    /// the channel image data in [`write_content`](Self::write_content).
+    fn write_head(&self, writer: &mut BeWriter, header: &FileHeader) -> Result<()> {
         if self.layer_records.len() != self.channel_image_data.len() {
             return Err(PsdError::InvalidData {
                 offset: 0,
@@ -389,11 +518,61 @@ impl<'a> LayerInfo<'a> {
         for record in &self.layer_records {
             record.write(writer, header)?;
         }
-        for channels in &self.channel_image_data {
-            channels.write(writer)?;
+        Ok(())
+    }
+
+    /// Bytes of every channel's compression marker and payload.
+    fn channel_data_len(&self) -> u64 {
+        self.channel_image_data
+            .iter()
+            .flat_map(|layer| &layer.channels)
+            .map(channel_disk_size)
+            .sum()
+    }
+
+    /// Stream every channel to `sink`, releasing each payload as soon as it is
+    /// written so the compressed data does not stay resident beside the file
+    /// being produced.
+    fn stream_channel_data<W: Write>(&mut self, sink: &mut W) -> Result<()> {
+        for layer in &mut self.channel_image_data {
+            for channel in &mut layer.channels {
+                sink.write_all(&channel.compression.as_raw().to_be_bytes())?;
+                sink.write_all(&channel.data)?;
+                channel.data = Vec::new();
+            }
         }
         Ok(())
     }
+}
+
+/// A piece of the layer-and-mask section in the order it is written, for
+/// [`LayerAndMaskInformation::write_to`].
+enum Piece<'b> {
+    /// Small bytes staged in memory: markers, records, padding.
+    Bytes(Vec<u8>),
+    /// A tagged block whose payload is written straight from where it lives.
+    Block(&'b TaggedBlock),
+    /// The layer count and layer records.
+    Head,
+    /// The channel image data.
+    ChannelData,
+}
+
+/// `len` zero bytes.
+fn zeros(len: u64) -> Vec<u8> {
+    vec![0; len as usize]
+}
+
+/// Zero bytes that align a section of `len` bytes to a multiple of four.
+fn pad_to_four(len: u64) -> u64 {
+    (4 - len % 4) % 4
+}
+
+/// A length field of the width the file's version uses.
+fn length_field(version: Version, value: u64) -> Result<Vec<u8>> {
+    let mut writer = BeWriter::new();
+    writer.len(version, value)?;
+    Ok(writer.into_inner())
 }
 
 /// A single layer record.

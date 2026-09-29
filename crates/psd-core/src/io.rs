@@ -159,6 +159,19 @@ pub struct BeWriter {
     buf: Vec<u8>,
 }
 
+/// Lets code that streams to any [`std::io::Write`] sink also target a
+/// `BeWriter`: writing appends, and never fails.
+impl std::io::Write for BeWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl BeWriter {
     pub fn new() -> Self {
         Self { buf: Vec::new() }

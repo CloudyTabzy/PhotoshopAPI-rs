@@ -56,6 +56,44 @@ impl<'a> PhotoshopFile<'a> {
         self.image_data.write(writer, &self.header)?;
         Ok(())
     }
+
+    /// Stream all five sections to `sink`: the bytes [`write`](Self::write)
+    /// produces, without holding the whole file in memory. The layer-and-mask
+    /// section, which is nearly all of a real document, is written straight from
+    /// the channel payloads, and each payload is released once written, so this
+    /// takes `&mut self` and leaves the channel data empty.
+    ///
+    /// `sink` should be buffered when it is a file. When it is a `Vec`, reserve
+    /// [`size_hint`](Self::size_hint) bytes first.
+    pub fn write_to<W: std::io::Write>(&mut self, sink: &mut W) -> Result<()> {
+        // The small leading sections and the trailing composite are staged.
+        let mut leading = BeWriter::new();
+        self.header.write(&mut leading);
+        self.color_mode_data.write(&mut leading, &self.header)?;
+        self.image_resources.write(&mut leading)?;
+        let mut composite = BeWriter::new();
+        self.image_data.write(&mut composite, &self.header)?;
+
+        sink.write_all(leading.as_slice())?;
+        drop(leading);
+        self.layer_and_mask_info.write_to(sink, &self.header)?;
+        sink.write_all(composite.as_slice())?;
+        Ok(())
+    }
+
+    /// A close estimate of the file's size in bytes, for reserving space in a
+    /// buffer: the channel data plus room for everything else.
+    pub fn size_hint(&self) -> usize {
+        let payload: usize = self
+            .layer_and_mask_info
+            .layer_info
+            .channel_image_data
+            .iter()
+            .flat_map(|layer| &layer.channels)
+            .map(|channel| channel.data.len() + 2)
+            .sum();
+        payload + (1 << 20)
+    }
 }
 
 #[cfg(test)]

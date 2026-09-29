@@ -1565,16 +1565,21 @@ impl<T: BitDepth> LayeredFile<T> {
         &self,
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<Vec<u8>> {
-        let file = self.to_photoshop_file_with_progress(progress)?;
-        let mut writer = BeWriter::new();
-        file.write(&mut writer)?;
-        Ok(writer.into_inner())
+        let mut file = self.to_photoshop_file_with_progress(progress)?;
+        // Streaming into a buffer of the right size: the file is assembled in
+        // place, not grown by doubling (which briefly holds two copies).
+        let mut bytes = Vec::with_capacity(file.size_hint());
+        file.write_to(&mut bytes)?;
+        Ok(bytes)
     }
 
     /// Write the document to disk.
+    ///
+    /// The file is streamed out channel by channel, so writing needs memory for
+    /// the compressed channels but not for a second, whole-file copy of them.
+    /// A write that fails part way removes the partial file.
     pub fn write(&self, path: impl AsRef<Path>) -> Result<()> {
-        std::fs::write(path, self.to_bytes()?)?;
-        Ok(())
+        self.write_with_progress(path, &mut ignore_progress)
     }
 
     /// Write the document to disk, reporting one [`ProgressEvent`] per layer.
@@ -1583,8 +1588,18 @@ impl<T: BitDepth> LayeredFile<T> {
         path: impl AsRef<Path>,
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<()> {
-        std::fs::write(path, self.to_bytes_with_progress(progress)?)?;
-        Ok(())
+        use std::io::Write as _;
+        let path = path.as_ref();
+        // Compression can fail; it happens before the file is created.
+        let mut file = self.to_photoshop_file_with_progress(progress)?;
+        let sink = std::fs::File::create(path)?;
+        let mut sink = std::io::BufWriter::with_capacity(1 << 20, sink);
+        let written = file.write_to(&mut sink).and_then(|()| Ok(sink.flush()?));
+        if written.is_err() {
+            drop(sink);
+            let _ = std::fs::remove_file(path);
+        }
+        written
     }
 
     /// Number of records a subtree serializes to (groups gain a synthesized

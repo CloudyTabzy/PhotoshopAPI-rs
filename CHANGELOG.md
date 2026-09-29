@@ -12,6 +12,41 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-09-30
+
+Writing a document no longer needs a second, whole-file copy of it in memory.
+
+### Changed
+
+- `LayeredFile::write` and `write_with_progress` stream the file to disk instead of building
+  it in a buffer first, and each compressed channel is released as soon as it is written.
+  On a 4000 x 3000, 12-layer, 8-bit document the heap peak while writing falls from 1,708 MB
+  to 999 MB (the decoded pixels plus the compressed channels, nothing more), and the write
+  takes 0.56 s instead of 1.57 s. A 16-bit document falls from 2,133 MB to 1,398 MB. A write
+  that fails part way removes the partial file.
+- `LayeredFile::to_bytes` fills a buffer sized up front, not one grown by doubling, and
+  releases each channel as it goes. Its operating-system peak on the same 8-bit document falls
+  from 1,724 MB to 1,006 MB of resident memory.
+- For 16- and 32-bit documents the layer data is written straight into its `Lr16`/`Lr32`
+  block. It used to be regenerated into a buffer, cloned into a replacement block and copied
+  again, three or four copies of all the compressed channels at once.
+- The output is byte for byte what it was, except in one case: a 16/32-bit document that
+  carries several `Lr16`/`Lr32` blocks now has its layer data written into the first and the
+  others dropped, where each used to receive its own copy of the layer data.
+
+### Added
+
+- `PhotoshopFile::write_to`, which streams the five sections to any `std::io::Write` and
+  empties each channel payload as it is written, and `PhotoshopFile::size_hint`.
+  `PhotoshopFile::write` to a `BeWriter` is unchanged.
+- `TaggedBlock::write_to`, `TaggedBlock::encoded_len` and `TaggedBlock::header_bytes`, and
+  `std::io::Write` for `BeWriter`.
+
+### Verified
+
+- The streamed bytes equal the buffered writer's on every document in the corpora, 8-, 16- and
+  32-bit, PSD and PSB, and on synthetic documents of each depth.
+
 ## [0.8.4] - 2026-09-30
 
 ### Changed
