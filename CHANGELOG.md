@@ -12,6 +12,40 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-30
+
+### Fixed
+
+- An unedited save no longer rewrites the resolution resource. `dpi` was written
+  unconditionally, so a file with unequal X/Y resolutions or non-inch units was saved with
+  both axes at the horizontal value in pixels per inch — silently losing the vertical axis
+  and the units. The resource is now the authority: it is written only when `dpi` differs
+  from what it says, and setting `dpi` still sets both axes to that many pixels per inch. A
+  file that had no resolution resource keeps lacking it (the format's default is 72 ppi);
+  `LayeredFile::new` now creates one, as Photoshop's own documents have.
+- A layer whose name lives only in the legacy pascal record no longer gains a `luni` block
+  on save. Adding one changed a file that round-tripped without it, so a second save
+  differed from the first. The block is added only when the record cannot carry the name —
+  a character outside Windows-1252, or a payload past the one-byte length marker — which is
+  exactly when the pascal string alone would corrupt it. An existing `luni` is still
+  refreshed when the name changes.
+
+### Added
+
+- `psd_core::PascalString::fits`, which reports whether a value survives a write/read round
+  trip at a given alignment; it is what the name-block rule uses.
+
+### Changed
+
+- `PascalString::section_size` measures the encoded payload rather than the UTF-8 length,
+  which differ for non-ASCII values.
+
+### Tests
+
+- The corpus harness compares document-level image resources (by id and payload, typed
+  blocks by value) between the original and the re-read document. It previously checked
+  only the code that reads them, which let the resolution rewrite above pass every sweep.
+
 ## [0.9.1] - 2026-09-30
 
 ### Changed

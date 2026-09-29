@@ -32,6 +32,10 @@ use crate::text::TextCacheBaseline;
 /// The name Photoshop gives the bounding section divider of a group.
 const DIVIDER_NAME: &str = "</Layer group>";
 
+/// The resolution a document has when nothing says otherwise: the format's own
+/// default, and what a new document is created with.
+const DEFAULT_DPI: f32 = 72.0;
+
 fn absolute_or_current_dir(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -225,7 +229,14 @@ pub struct LayeredFile<T: BitDepth> {
     /// for 1-bit (bitmap mode) documents, whose packed pixels are expanded to
     /// 8-bit samples on read; saving such a document writes 8-bit.
     pub source_depth: u16,
-    /// Document resolution in dots per inch.
+    /// Document resolution in dots per inch, read from the resolution resource's
+    /// horizontal axis (72 when the file has none).
+    ///
+    /// A save rewrites the resolution resource only when this value differs from
+    /// what the resource says, so an unedited document keeps its own axes, units,
+    /// and payload. Setting it sets both axes to that many pixels per inch; the
+    /// full resource stays available through
+    /// [`image_resources`](Self::image_resources) for anything finer.
     pub dpi: f32,
     /// Raw ICC profile bytes (empty = no profile). This is the document's only
     /// copy: a read moves the profile here out of `image_resources`, and a save
@@ -302,6 +313,11 @@ impl<T: BitDepth> LayeredFile<T> {
             depth_enum::<T>(),
             color_mode,
         )?;
+        // A new document carries the 72 ppi resolution resource Photoshop's own
+        // documents have. A file read without one keeps lacking it: the write
+        // path preserves that absence rather than normalizing it.
+        let mut image_resources = ImageResources::new();
+        image_resources.set_resolution_info(ResolutionInfoBlock::new(DEFAULT_DPI));
         Ok(Self {
             version: Version::Psd,
             source_depth: T::DEPTH,
@@ -309,10 +325,10 @@ impl<T: BitDepth> LayeredFile<T> {
             height,
             color_mode,
             num_channels: num_channels.max(1),
-            dpi: 72.0,
+            dpi: DEFAULT_DPI,
             icc_profile: Vec::new(),
             color_mode_data: ColorModeData::default(),
-            image_resources: ImageResources::new(),
+            image_resources,
             global_layer_mask_info: GlobalLayerMaskInfo::default(),
             document_blocks: None,
             has_merged_alpha: false,
@@ -452,7 +468,7 @@ impl<T: BitDepth> LayeredFile<T> {
         let dpi = image_resources
             .resolution_info()
             .map(|info| info.horizontal_resolution.to_f32())
-            .unwrap_or(72.0);
+            .unwrap_or(DEFAULT_DPI);
         // The profile moves out of its resource block, which stays as an empty
         // placeholder that keeps its place among the resources. `icc_profile` is
         // what a save writes, so a copy left in the block would only sit in memory
@@ -1533,9 +1549,25 @@ impl<T: BitDepth> LayeredFile<T> {
             progress,
         )?;
 
-        // Refresh DPI/ICC while preserving every other resource block.
+        // Refresh DPI/ICC while preserving every other resource block. The
+        // resolution resource is the authority for a document read from disk: it
+        // is rewritten only when the scalar `dpi` was changed, so unequal X/Y
+        // resolutions, non-inch units, and the exact payload all survive an
+        // unedited save. Setting `dpi` sets both axes to that many pixels per
+        // inch, which is what the scalar means.
         let mut image_resources = self.image_resources.clone();
-        image_resources.set_resolution_info(ResolutionInfoBlock::new(self.dpi));
+        let existing_dpi = image_resources
+            .resolution_info()
+            .map(|info| info.horizontal_resolution.to_f32());
+        match existing_dpi {
+            // The resource already says what `dpi` says: leave it, bytes and all.
+            Some(resolution) if resolution == self.dpi => {}
+            // The file had no resolution resource and nobody changed `dpi`: keep it
+            // that way, since adding the block would change a file that round-tripped
+            // without it. The format's default is 72 ppi either way.
+            None if self.dpi == DEFAULT_DPI => {}
+            _ => image_resources.set_resolution_info(ResolutionInfoBlock::new(self.dpi)),
+        }
         if self.icc_profile.is_empty() {
             image_resources.remove_icc_profile();
         } else {
@@ -1737,13 +1769,16 @@ impl<T: BitDepth> LayeredFile<T> {
             .blocks
             .get(TaggedBlockKey::LUNI)
             .and_then(|block| UnicodeString::read(&mut BeReader::new(&block.data), 1).ok());
-        // An unnamed layer that never had the block does not gain one: an
-        // empty `luni` says nothing, and adding it changes a file that
-        // round-tripped without it (Photoshop writes dividers with `lsct`
-        // alone).
-        let needs_name_block = current_name.as_ref().map(UnicodeString::value)
-            != Some(layer.name.as_str())
-            && !(layer.name.is_empty() && current_name.is_none());
+        // An existing `luni` is refreshed when the name has changed. A layer whose
+        // name lives only in the legacy pascal record keeps it there: the record
+        // carries the name, so adding the block changes a file that round-tripped
+        // without it. The block is added only when the record cannot carry the
+        // name itself — a character outside Windows-1252, or a payload past the
+        // one-byte length marker — where the pascal string alone would corrupt it.
+        let needs_name_block = match current_name.as_ref() {
+            Some(current) => current.value() != layer.name,
+            None => !layer.name.is_empty() && !PascalString::fits(&layer.name, 4),
+        };
         if needs_name_block {
             let mut writer = BeWriter::new();
             UnicodeString::new(layer.name.as_str(), 4)?.write_verbatim(&mut writer)?;
@@ -2092,6 +2127,48 @@ mod tests {
         image.set_channel(ChannelKey::color(1), vec![value; 16]);
         image.set_channel(ChannelKey::color(2), vec![value; 16]);
         layer
+    }
+
+    /// A name the pascal record can carry needs no `luni`: adding one would change
+    /// the bytes of every legacy file that round-tripped without it, and a second
+    /// save would differ from the first. A name the record cannot carry still gets
+    /// the block, so the name survives.
+    #[test]
+    fn a_pascal_only_name_gains_a_unicode_block_only_when_it_must() {
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 4, 4).unwrap();
+        let mut layer = layer_with_pixel(10);
+        layer.name = "Layer".to_owned();
+        document.add_layer(layer);
+        let mut unicode = layer_with_pixel(20);
+        unicode.name = "名前 – ü".to_owned();
+        document.add_layer(unicode);
+
+        let back = LayeredFile::<u8>::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        let plain = back.layer_by_path("Layer").unwrap();
+        assert_eq!(plain.name, "Layer");
+        assert!(
+            plain.blocks.get(TaggedBlockKey::LUNI).is_none(),
+            "a representable name must not gain a luni block"
+        );
+        assert_eq!(back.layer_by_path("名前 – ü").unwrap().name, "名前 – ü");
+        assert!(
+            back.layer_by_path("名前 – ü")
+                .unwrap()
+                .blocks
+                .get(TaggedBlockKey::LUNI)
+                .is_some(),
+            "a name outside the record's codepage needs the unicode block"
+        );
+
+        // The second save is identical to the first: nothing is added later either.
+        let again = LayeredFile::<u8>::from_bytes(&back.to_bytes().unwrap()).unwrap();
+        assert!(again
+            .layer_by_path("Layer")
+            .unwrap()
+            .blocks
+            .get(TaggedBlockKey::LUNI)
+            .is_none());
+        assert_eq!(again.to_bytes().unwrap(), back.to_bytes().unwrap());
     }
 
     #[test]

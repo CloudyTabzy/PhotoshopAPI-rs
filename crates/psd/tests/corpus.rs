@@ -295,6 +295,29 @@ fn compare<T: BitDepth>(before: &LayeredFile<T>, after: &LayeredFile<T>) -> Resu
             block_diff(document_before.as_ref(), document_after.as_ref())
         ));
     }
+    // Document-level resources, by id and payload (typed blocks by value). These
+    // used to be compared only indirectly, through the code that reads them, which
+    // let a save rewrite an unedited resolution resource without any check
+    // noticing.
+    let resources_before = before.image_resources.blocks();
+    let resources_after = after.image_resources.blocks();
+    if resources_before != resources_after {
+        let ids = |blocks: &[psd::core::ResourceBlock]| {
+            blocks
+                .iter()
+                .map(|block| match block {
+                    psd::core::ResourceBlock::Raw(raw) => raw.id,
+                    psd::core::ResourceBlock::ResolutionInfo(_) => psd::core::ID_RESOLUTION_INFO,
+                    psd::core::ResourceBlock::IccProfile(_) => psd::core::ID_ICC_PROFILE,
+                })
+                .collect::<Vec<_>>()
+        };
+        return Err(format!(
+            "image resources differ: ids {:?} became {:?}",
+            ids(resources_before),
+            ids(resources_after)
+        ));
+    }
     if before.layer_count() != after.layer_count() {
         return Err(format!(
             "layer count {} became {}",

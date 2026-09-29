@@ -170,9 +170,33 @@ impl PascalString {
         &self.value
     }
 
-    /// Total on-disk section size in bytes (marker + payload + zero padding).
+    /// Whether a value survives a write/read round trip at this alignment:
+    /// every character is representable in the payload encoding and the encoded
+    /// payload fits the one-byte length marker.
+    ///
+    /// This is what decides whether a layer whose name lives only in the legacy
+    /// record needs a `luni` companion: a name this predicate rejects would come
+    /// back as `?`s (or truncated), and one it accepts comes back unchanged.
+    pub fn fits(value: &str, padding: usize) -> bool {
+        let (windows, _) = reverse_tables();
+        let mut encoded = 0;
+        for c in value.chars() {
+            if !c.is_ascii() && !windows.contains_key(&c) {
+                return false;
+            }
+            encoded += 1;
+        }
+        encoded <= Self::max_len(padding)
+    }
+
+    /// Total on-disk section size in bytes (marker + encoded payload + zero
+    /// padding). The payload is measured as it is written — encoded to the
+    /// payload codepage — not as UTF-8, which differs for non-ASCII names.
     pub fn section_size(&self) -> usize {
-        round_up(self.value.len() + 1, self.padding)
+        round_up(
+            encode(PascalEncoding::Windows1252, &self.value).len() + 1,
+            self.padding,
+        )
     }
 
     /// Read a Pascal string of the given alignment (Windows-1252 payload).
@@ -421,6 +445,33 @@ mod tests {
         assert_eq!(s.value().len(), 252); // 254 - 254 % 4
         let s = PascalString::new("x".repeat(300), 2);
         assert_eq!(s.value().len(), 254);
+    }
+
+    #[test]
+    fn pascal_fits_reports_what_a_round_trip_would_change() {
+        // Representable and short: the record carries it, so no `luni` is needed.
+        assert!(PascalString::fits("Layer 1", 4));
+        assert!(PascalString::fits("Ünïcode – é", 4));
+        // Outside the payload codepage: would come back as '?'s.
+        assert!(!PascalString::fits("名前", 4));
+        assert!(!PascalString::fits("emoji 🌸", 4));
+        // Past the one-byte length marker: would come back truncated. The cap is
+        // 254 rounded down to the alignment, so 252 at padding 4 and 254 at 2.
+        assert!(PascalString::fits(&"x".repeat(252), 4));
+        assert!(!PascalString::fits(&"x".repeat(253), 4));
+        assert!(PascalString::fits(&"x".repeat(254), 2));
+        assert!(!PascalString::fits(&"x".repeat(255), 2));
+    }
+
+    #[test]
+    fn pascal_section_size_measures_the_encoded_payload() {
+        // The written payload is one byte per character in Windows-1252, not its
+        // UTF-8 length: a name of two 3-byte characters pads as 2 + marker.
+        let s = PascalString::new("名", 4);
+        assert_eq!(s.section_size(), 4);
+        let mut w = BeWriter::new();
+        s.write(&mut w).unwrap();
+        assert_eq!(w.as_slice().len(), s.section_size());
     }
 
     #[test]
