@@ -263,29 +263,26 @@ impl Info {
     }
 }
 
-/// Allocates `len` zeroed bytes, returning `None` rather than aborting when the allocator
-/// cannot provide them.
+/// Allocates `len` zeroed bytes, returning `None` when the allocator cannot provide them.
 ///
-/// `vec![0u8; len]` compiles to this same `alloc_zeroed` call, and for buffers of image size
-/// that matters: the allocator hands back pages the operating system has already zeroed
-/// instead of writing over freshly mapped memory, so the zeroing is free. What `vec!` also
-/// does is abort the process on failure, which is not a library's decision to make. Calling
-/// the allocator directly keeps the free zeroing and turns refusal into a value.
+/// `vec![0u8; len]` compiles to an `alloc_zeroed` call, and for buffers of image size that
+/// matters: the allocator hands back pages the operating system has already zeroed instead
+/// of writing over freshly mapped memory, so the zeroing is free. Zeroing by hand instead
+/// (`try_reserve_exact` then `resize`) measured 4-14% slower on whole-image decodes. What
+/// `vec!` also does is abort the process on failure, which is not a library's decision to
+/// make on a size an untrusted header chose.
+///
+/// So the size is probed first: asking the allocator for the bytes with `try_reserve_exact`
+/// and giving them straight back turns a refusal into a value, at the cost of a reservation
+/// nothing touches, which is not measurable. This is not the guarantee a direct fallible
+/// `alloc_zeroed` gave. If the memory is taken by something else in the instant between the
+/// probe and the allocation, `vec!` aborts; that needs the process to be out of memory to
+/// within one buffer while the probe still succeeded, which is not the case a size limit is
+/// there for. Getting the guarantee back needs an `unsafe` allocation, which this crate no
+/// longer has.
 pub(crate) fn zeroed_vec(len: usize) -> Option<Vec<u8>> {
-    if len == 0 {
-        return Some(Vec::new());
-    }
-    // Fails only when `len` exceeds `isize::MAX`, which no allocator would satisfy either.
-    let layout = std::alloc::Layout::from_size_align(len, 1).ok()?;
-    // SAFETY: `len` is non-zero above, so the layout has non-zero size.
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    if ptr.is_null() {
-        return None;
-    }
-    // SAFETY: `ptr` was just allocated by the global allocator under a layout of exactly
-    // `len` bytes at align 1, which is what a `Vec<u8>` of length and capacity `len` requires
-    // of its buffer, and `alloc_zeroed` initialised every one of those bytes.
-    Some(unsafe { Vec::from_raw_parts(ptr, len, len) })
+    Vec::<u8>::new().try_reserve_exact(len).ok()?;
+    Some(vec![0u8; len])
 }
 
 /// Bytes needed for `width` pixels of `bits_per_pixel` bits each.
@@ -312,9 +309,8 @@ mod tests {
 
     #[test]
     fn zeroed_vec_hands_back_an_owned_zeroed_buffer() {
-        // Built from a raw allocation rather than `vec![]`, so what needs checking is that
-        // the result behaves as a `Vec` in every respect: correct length, every byte
-        // initialised to zero, writable, and freed under the layout it was allocated with.
+        // What needs checking is that the result behaves as a `Vec` in every respect: correct
+        // length, exact capacity, every byte zero, and writable.
         assert_eq!(zeroed_vec(0).unwrap(), Vec::<u8>::new());
 
         for len in [1usize, 7, 16, 1000, 65_536] {
@@ -328,19 +324,15 @@ mod tests {
             assert_eq!(buffer.len(), len + 1);
         }
 
-        // A size no `Layout` can describe is refused before the allocator is asked, and a
-        // size it can describe but no allocator can satisfy is refused by the null check.
-        // Both paths have to work: the first is arithmetic, the second is the whole reason
-        // this function exists.
+        // A size no allocation can describe is refused by the probe's arithmetic, and a size
+        // that can be described but no allocator can satisfy is refused by the allocator.
+        // Both must come back as `None` before `vec!` is reached, which would abort: that is
+        // the whole reason this function exists.
         assert!(zeroed_vec(usize::MAX).is_none());
         if !cfg!(miri) {
-            // Both `black_box` calls are load-bearing, and this assertion silently passes
-            // without them at any optimisation level above zero. The inner one stops the
-            // size being folded through `Layout::from_size_align` at compile time; the outer
-            // one stops the allocation being removed as dead, which takes the null check
-            // with it and leaves the refusal looking like a success. Skipped under Miri,
-            // which treats a request this large as an error of its own rather than modelling
-            // the null a real allocator returns.
+            // Skipped under Miri, which treats a request this large as an error of its own
+            // rather than modelling the failure a real allocator returns. `black_box` keeps
+            // the optimiser from deciding the outcome at compile time.
             use std::hint::black_box;
             assert!(black_box(zeroed_vec(black_box(isize::MAX as usize))).is_none());
         }

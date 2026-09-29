@@ -46,6 +46,18 @@ no `repository` URL, so no version headings carry compare links.
   the running-`a` term carried in a vector, every lane sized to stay under the same `NMAX`
   bound as the scalar recurrence; a test runs a full block of saturated bytes from the largest
   possible starting pair on every backend.
+- **The decoder's buffer allocation is safe code.** It called `alloc_zeroed` and
+  `Vec::from_raw_parts` directly so that an allocation the system refuses became an error and
+  not an abort, while keeping the operating system's free zero pages. It now probes with
+  `try_reserve_exact`, gives the reservation straight back, and allocates with `vec![0; n]`,
+  which is the same `alloc_zeroed` underneath: whole-image decode measured the same (0.88x
+  the `png` crate on both builds, individual files within 1-3%). Zeroing by hand
+  (`try_reserve_exact` and `resize`) was the obvious safe form and cost 4-14%, which is why it
+  was not used. **This is a weaker guarantee than before.** A refusal the probe sees is still
+  an `OutOfMemory` error, but if the memory is taken by something else between the probe and
+  the allocation, `vec!` aborts. That needs the process to be out of memory to within one
+  buffer while the probe still succeeded, which is not the case the decompression-size limit
+  exists for. Getting the old guarantee back needs an `unsafe` allocation.
 - New `inflate_micro` benchmark: pure DEFLATE decode into a preallocated buffer, checksum
   off, against `fdeflate` doing the same. The earlier `bench -- inflate` comparison timed a
   whole-stream call with the Adler-32 on (this crate's runs at 3.4 GB/s) while the reference
