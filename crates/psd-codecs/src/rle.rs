@@ -27,10 +27,24 @@ pub const PARALLEL_MIN_BYTES: usize = 64 * 1024;
 /// (`Core/Compression/Compress_RLE.h`): a run/literal state machine where
 /// `run_len` counts repeat *matches* and both counters flush at 128.
 pub fn pack_bits_compress(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() / 4 + 2);
+    let mut out = Vec::new();
+    pack_bits_compress_into(data, &mut out);
+    out
+}
+
+/// [`pack_bits_compress`] appending to `out`, so a caller compressing many
+/// scanlines can fill one buffer instead of allocating one per row. Returns
+/// the number of bytes appended, padding included; the padding is per row (it
+/// aligns this row's packets, not the buffer), and an empty row appends
+/// nothing.
+pub fn pack_bits_compress_into(data: &[u8], out: &mut Vec<u8>) -> usize {
+    let start = out.len();
     if data.is_empty() {
-        return out;
+        return 0;
     }
+    // Packed rows of noisy data can exceed the input by one header per 128
+    // bytes; reserving that bound once means the row never reallocates.
+    out.reserve(data.len() + data.len() / MAX_PACKET_LEN + 2);
 
     let mut run_len: usize = 0;
     let mut lit_len: usize = 0;
@@ -44,20 +58,20 @@ pub fn pack_bits_compress(data: &[u8]) -> Vec<u8> {
             // A repeat starts: flush any pending literal run first
             // (upstream flushes `data[i - nonRunLen - 1 ..= i - 2]`).
             if lit_len != 0 {
-                write_literal(&mut out, &data[i - lit_len - 1..i - 1]);
+                write_literal(out, &data[i - lit_len - 1..i - 1]);
                 lit_len = 0;
             }
 
             run_len += 1;
             if run_len == MAX_PACKET_LEN {
-                write_run(&mut out, run_len, curr);
+                write_run(out, run_len, curr);
                 run_len = 0;
             }
         } else {
             // Run ended (or never started).
             if run_len != 0 {
                 run_len += 1;
-                write_run(&mut out, run_len, prev);
+                write_run(out, run_len, prev);
                 run_len = 0;
             } else {
                 lit_len += 1;
@@ -66,7 +80,7 @@ pub fn pack_bits_compress(data: &[u8]) -> Vec<u8> {
             if lit_len == MAX_PACKET_LEN {
                 // Upstream flushes `data[i - nonRunLen ..= i - 1]` here;
                 // the current byte stays pending for the next iteration.
-                write_literal(&mut out, &data[i - lit_len..i]);
+                write_literal(out, &data[i - lit_len..i]);
                 lit_len = 0;
             }
         }
@@ -76,17 +90,17 @@ pub fn pack_bits_compress(data: &[u8]) -> Vec<u8> {
     let n = data.len();
     if run_len != 0 {
         run_len += 1;
-        write_run(&mut out, run_len, data[n - 1]);
+        write_run(out, run_len, data[n - 1]);
     } else {
         lit_len += 1;
-        write_literal(&mut out, &data[n - lit_len..]);
+        write_literal(out, &data[n - lit_len..]);
     }
 
-    // Pad to 2-byte alignment with the no-op packet.
-    if out.len() % 2 != 0 {
+    // Pad this row to 2-byte alignment with the no-op packet.
+    if !(out.len() - start).is_multiple_of(2) {
         out.push(128);
     }
-    out
+    out.len() - start
 }
 
 /// Run packet: header `257 - len`, then the repeated byte.
@@ -259,38 +273,72 @@ pub fn compress_scanlines(
         ));
     }
 
-    let packed: Vec<Vec<u8>> = if data.len() >= PARALLEL_MIN_BYTES {
-        // Scanlines are independent; rayon collect preserves order, so the
-        // table-first layout is unchanged.
-        data.par_chunks(scanline_bytes)
-            .map(pack_bits_compress)
-            .collect()
-    } else {
-        data.chunks(scanline_bytes)
-            .map(pack_bits_compress)
-            .collect()
+    let rows = data.len() / scanline_bytes;
+
+    // Rows are packed a block at a time: one byte buffer and one size list per
+    // block instead of a `Vec` per scanline (a large 8-bit document has
+    // hundreds of thousands of rows, each of which used to allocate and grow
+    // its own buffer). Blocks are independent and rayon's collect preserves
+    // their order, so the table-first layout is unchanged.
+    let block_rows = block_rows(rows, scanline_bytes, data.len() >= PARALLEL_MIN_BYTES);
+    let block_bytes = block_rows * scanline_bytes;
+    let pack_block = |block: &[u8]| -> PackedBlock {
+        let mut bytes = Vec::new();
+        let mut sizes = Vec::with_capacity(block.len() / scanline_bytes);
+        for row in block.chunks(scanline_bytes) {
+            sizes.push(pack_bits_compress_into(row, &mut bytes));
+        }
+        PackedBlock { bytes, sizes }
     };
-    let mut out =
-        Vec::with_capacity(packed.len() * size_width + packed.iter().map(Vec::len).sum::<usize>());
-    for scanline in &packed {
+    let blocks: Vec<PackedBlock> = if data.len() >= PARALLEL_MIN_BYTES {
+        data.par_chunks(block_bytes).map(pack_block).collect()
+    } else {
+        data.chunks(block_bytes).map(pack_block).collect()
+    };
+
+    let packed_len: usize = blocks.iter().map(|b| b.bytes.len()).sum();
+    let mut out = Vec::with_capacity(rows * size_width + packed_len);
+    for size in blocks.iter().flat_map(|b| &b.sizes) {
         if size_width == 2 {
-            let size = u16::try_from(scanline.len()).map_err(|_| CodecError::OutputLength {
+            let size = u16::try_from(*size).map_err(|_| CodecError::OutputLength {
                 expected: u16::MAX as usize,
-                actual: scanline.len(),
+                actual: *size,
             })?;
             out.extend_from_slice(&size.to_be_bytes());
         } else {
-            let size = u32::try_from(scanline.len()).map_err(|_| CodecError::OutputLength {
+            let size = u32::try_from(*size).map_err(|_| CodecError::OutputLength {
                 expected: u32::MAX as usize,
-                actual: scanline.len(),
+                actual: *size,
             })?;
             out.extend_from_slice(&size.to_be_bytes());
         }
     }
-    for scanline in packed {
-        out.extend_from_slice(&scanline);
+    for block in &blocks {
+        out.extend_from_slice(&block.bytes);
     }
     Ok(out)
+}
+
+/// The packed rows of one block of scanlines: their bytes back to back, and
+/// each row's packed length.
+struct PackedBlock {
+    bytes: Vec<u8>,
+    sizes: Vec<usize>,
+}
+
+/// Rows per compression block. Sequential compression is one block. Parallel
+/// compression aims for several blocks per thread so the work balances, but
+/// keeps a block within about 1 MiB of input so its buffer stays small, and
+/// never splits a row.
+fn block_rows(rows: usize, scanline_bytes: usize, parallel: bool) -> usize {
+    if !parallel {
+        return rows.max(1);
+    }
+    const MAX_BLOCK_BYTES: usize = 1 << 20;
+    let balanced = rows.div_ceil(rayon::current_num_threads() * 4);
+    balanced
+        .min((MAX_BLOCK_BYTES / scanline_bytes).max(1))
+        .max(1)
 }
 
 /// Decompress a PSD/PSB RLE channel produced by [`compress_scanlines`].
@@ -554,5 +602,121 @@ mod tests {
             decompress_scanlines(&compressed, 512, 4, 256).unwrap(),
             data
         );
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    /// The definition `compress_scanlines` must keep: a size table, then every row
+    /// packed on its own.
+    fn reference(data: &[u8], scanline_bytes: usize, size_width: usize) -> Vec<u8> {
+        let packed: Vec<Vec<u8>> = data
+            .chunks(scanline_bytes)
+            .map(pack_bits_compress)
+            .collect();
+        let mut out = Vec::new();
+        for row in &packed {
+            if size_width == 2 {
+                out.extend_from_slice(&(row.len() as u16).to_be_bytes());
+            } else {
+                out.extend_from_slice(&(row.len() as u32).to_be_bytes());
+            }
+        }
+        for row in &packed {
+            out.extend_from_slice(row);
+        }
+        out
+    }
+
+    /// Rows that mix runs, literals and noise, so packed lengths vary (and are
+    /// sometimes odd before padding).
+    fn image(width: usize, height: usize) -> Vec<u8> {
+        let mut state = 0x9e37_79b9_u32;
+        let mut data = Vec::with_capacity(width * height);
+        for y in 0..height {
+            for x in 0..width {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                data.push(match y % 4 {
+                    0 => 7,
+                    1 => (x / 5) as u8,
+                    2 => (state >> 24) as u8,
+                    _ => {
+                        if x % 9 < 4 {
+                            200
+                        } else {
+                            (state >> 24) as u8
+                        }
+                    }
+                });
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn into_appends_a_padded_row_and_reports_its_length() {
+        let mut out = vec![0xAA, 0xBB, 0xCC]; // odd prefix: padding is per row, not per buffer
+        let first = pack_bits_compress_into(&[1, 2, 3], &mut out);
+        assert_eq!(first, 4); // literal header + 3 bytes = 4, already even
+        let second = pack_bits_compress_into(&[9, 9, 9], &mut out);
+        assert_eq!(second, 2); // one run packet
+        let third = pack_bits_compress_into(&[1, 2], &mut out);
+        assert_eq!(third, 4); // literal header + 2 bytes = 3, padded with 0x80
+        assert_eq!(&out[..3], [0xAA, 0xBB, 0xCC]);
+        assert_eq!(&out[3..], [2, 1, 2, 3, 254, 9, 1, 1, 2, 128]);
+        assert_eq!(pack_bits_compress_into(&[], &mut out), 0);
+        assert_eq!(out.len(), 13);
+        assert_eq!(pack_bits_compress(&[1, 2]), [1, 1, 2, 128]);
+    }
+
+    #[test]
+    fn blocked_compression_equals_row_by_row_at_every_shape() {
+        // Sequential (small) and parallel (>= PARALLEL_MIN_BYTES) shapes, odd and
+        // single-column widths, single-row images, PSD and PSB size tables.
+        for (width, height) in [
+            (1, 1),
+            (1, 700),
+            (3, 5),
+            (63, 61),
+            (255, 300),
+            (1000, 9),
+            (4099, 41),
+            (600, 1000),
+        ] {
+            let data = image(width, height);
+            for size_width in [2, 4] {
+                assert_eq!(
+                    compress_scanlines(&data, width, size_width).unwrap(),
+                    reference(&data, width, size_width),
+                    "{width}x{height}, size width {size_width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_never_splits_a_row() {
+        assert_eq!(block_rows(0, 10, false), 1);
+        assert_eq!(block_rows(5, 10, false), 5);
+        for (rows, scanline_bytes) in [(1, 5_000_000), (10, 2_000_000), (100_000, 4), (7, 300_000)]
+        {
+            let per_block = block_rows(rows, scanline_bytes, true);
+            assert!(per_block >= 1);
+            // A row larger than the block budget still gets a block of its own.
+            assert!(per_block * scanline_bytes <= (1 << 20).max(scanline_bytes));
+        }
+    }
+
+    #[test]
+    fn a_row_too_long_for_a_psd_size_entry_is_an_error() {
+        // 70,000 incompressible bytes pack to more than u16::MAX.
+        let noisy = image(70_000, 4).split_off(70_000 * 2);
+        assert!(matches!(
+            compress_scanlines(&noisy, 70_000, 2),
+            Err(CodecError::OutputLength { .. })
+        ));
+        assert!(compress_scanlines(&noisy, 70_000, 4).is_ok());
     }
 }
