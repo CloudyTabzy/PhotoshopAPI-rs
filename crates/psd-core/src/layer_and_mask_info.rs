@@ -289,12 +289,17 @@ impl<'a> LayerAndMaskInformation<'a> {
         for block in blocks {
             if nested_key == Some(block.key) {
                 if !nested_placed {
-                    let mut template = block.clone();
-                    template.data = Vec::new();
+                    // Only its signature and key are needed; cloning the block
+                    // would copy the whole layer data it carried from the read.
+                    let template = TaggedBlock {
+                        signature: block.signature,
+                        key: block.key,
+                        data: Vec::new(),
+                    };
                     nested(template, &mut pieces)?;
                     nested_placed = true;
                 }
-            } else {
+            } else if !is_emptied_layer_data(block, header) {
                 pieces.push(Piece::Block(block));
             }
         }
@@ -365,6 +370,7 @@ impl<'a> LayerAndMaskInformation<'a> {
                     replacement.data = data.clone();
                     replacement.write(writer, header, 4)?;
                 }
+                _ if is_emptied_layer_data(block, header) => {}
                 _ => block.write(writer, header, 4)?,
             }
         }
@@ -556,6 +562,20 @@ enum Piece<'b> {
     Head,
     /// The channel image data.
     ChannelData,
+}
+
+/// Whether `block` is the `Lr16`/`Lr32` block of a 16/32-bit document with its
+/// layer data taken out (a reader keeps such a block empty to remember its
+/// position and drops the copy of the data, which the writer regenerates from the
+/// layer tree). When there are no layers left to regenerate it from, the block
+/// has nothing to say and is not written.
+fn is_emptied_layer_data(block: &TaggedBlock, header: &FileHeader) -> bool {
+    let key = match header.depth {
+        BitDepth::Sixteen => TaggedBlockKey::LR16,
+        BitDepth::ThirtyTwo => TaggedBlockKey::LR32,
+        BitDepth::One | BitDepth::Eight => return false,
+    };
+    block.key == key && block.data.is_empty()
 }
 
 /// `len` zero bytes.

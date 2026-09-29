@@ -163,3 +163,42 @@ fn write_streams_to_disk_and_a_failed_write_leaves_no_file() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The `Lr16`/`Lr32` block of a document, if it carries one.
+fn nested_block<T: BitDepth>(document: &LayeredFile<T>, key: [u8; 4]) -> Option<usize> {
+    document
+        .document_blocks
+        .as_ref()?
+        .blocks
+        .iter()
+        .find(|block| block.key.as_bytes() == key)
+        .map(|block| block.data.len())
+}
+
+#[test]
+fn a_read_document_keeps_no_copy_of_its_16_and_32_bit_layer_data() {
+    let written = synthetic::<u16>(48, 3).to_bytes().unwrap();
+    let document = LayeredFile::<u16>::from_bytes(&written).unwrap();
+    // The block stays, which keeps its place among the others, but empty.
+    assert_eq!(nested_block(&document, *b"Lr16"), Some(0));
+    assert_eq!(document.layer_count(), 3);
+    // The layer data is regenerated on write, byte for byte.
+    assert_eq!(document.to_bytes().unwrap(), written);
+
+    let written = synthetic::<f32>(16, 2).to_bytes().unwrap();
+    let document = LayeredFile::<f32>::from_bytes(&written).unwrap();
+    assert_eq!(nested_block(&document, *b"Lr32"), Some(0));
+    assert_eq!(document.to_bytes().unwrap(), written);
+
+    // Nothing to regenerate it from once the layers are gone: the empty block is
+    // not written, and the file still reads.
+    let mut document =
+        LayeredFile::<u16>::from_bytes(&synthetic::<u16>(16, 2).to_bytes().unwrap()).unwrap();
+    for id in document.root_children().to_vec() {
+        document.remove_layer(id).unwrap();
+    }
+    let bytes = document.to_bytes().unwrap();
+    let back = LayeredFile::<u16>::from_bytes(&bytes).unwrap();
+    assert_eq!(back.layer_count(), 0);
+    assert_eq!(nested_block(&back, *b"Lr16"), None);
+}

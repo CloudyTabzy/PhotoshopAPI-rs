@@ -46,6 +46,10 @@ pub fn compress(uncompressed: &[u8]) -> Result<Vec<u8>> {
     out[0] = 0x78;
     out[1] = zlib_header_byte(COMPRESSION_LEVEL);
     out.extend_from_slice(&adler32(uncompressed).to_be_bytes());
+    // The buffer was sized for incompressible input. Keeping that capacity
+    // would hold every compressed channel at its raw size for as long as it
+    // lives, so hand back the memory the stream did not use.
+    out.shrink_to_fit();
     Ok(out)
 }
 
@@ -78,6 +82,16 @@ mod tests {
     fn sample_data() -> Vec<u8> {
         // Repetitive-ish data so deflate actually compresses.
         (0..4096u32).map(|i| ((i / 7) % 251) as u8).collect()
+    }
+
+    #[test]
+    fn compress_keeps_no_capacity_beyond_the_stream() {
+        // The output buffer is sized for incompressible input; a compressible
+        // channel must not carry that capacity around.
+        let data = vec![7u8; 1 << 20];
+        let compressed = compress(&data).unwrap();
+        assert!(compressed.len() < 4096);
+        assert_eq!(compressed.capacity(), compressed.len());
     }
 
     #[test]

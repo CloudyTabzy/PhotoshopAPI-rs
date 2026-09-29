@@ -19,6 +19,13 @@ pub trait BeConvert: Copy {
     fn from_be_bytes(bytes: &[u8]) -> Self;
     fn write_be_into(self, out: &mut [u8]);
     fn swap_be(self) -> Self;
+
+    /// The slice itself as bytes, for the type whose big-endian form is its
+    /// memory (`u8`); `None` for every other type. Lets [`be_bytes`] skip a
+    /// copy without any unsafe reinterpretation.
+    fn as_bytes(_data: &[Self]) -> Option<&[u8]> {
+        None
+    }
 }
 
 macro_rules! impl_be_convert_int {
@@ -67,6 +74,10 @@ impl BeConvert for u8 {
     #[inline]
     fn swap_be(self) -> Self {
         self
+    }
+
+    fn as_bytes(data: &[Self]) -> Option<&[u8]> {
+        Some(data)
     }
 }
 
@@ -149,6 +160,15 @@ pub fn encode_be_bytes<T: BeConvert>(data: &[T]) -> Vec<u8> {
     out
 }
 
+/// [`encode_be_bytes`] that borrows when the bytes already exist: `u8` samples
+/// are their own big-endian form, so an 8-bit channel is not copied to be read.
+pub fn be_bytes<T: BeConvert>(data: &[T]) -> std::borrow::Cow<'_, [u8]> {
+    match T::as_bytes(data) {
+        Some(bytes) => std::borrow::Cow::Borrowed(bytes),
+        None => std::borrow::Cow::Owned(encode_be_bytes(data)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +241,21 @@ mod tests {
         let mut data = vec![0u8, 1, 128, 255];
         encode_be_slice(&mut data);
         assert_eq!(data, [0, 1, 128, 255]);
+    }
+}
+
+#[cfg(test)]
+mod be_bytes_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    #[test]
+    fn eight_bit_samples_are_borrowed_and_wider_ones_are_encoded() {
+        let bytes = [1u8, 2, 3];
+        assert!(matches!(be_bytes(&bytes), Cow::Borrowed(b) if b == bytes));
+        let words = [0x0102u16, 0x0304];
+        assert!(matches!(be_bytes(&words), Cow::Owned(ref b) if b == &[1, 2, 3, 4]));
+        assert_eq!(be_bytes(&words), encode_be_bytes(&words));
+        assert!(be_bytes::<i8>(&[-1]).len() == 1);
     }
 }

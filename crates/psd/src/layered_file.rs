@@ -455,6 +455,26 @@ impl<T: BitDepth> LayeredFile<T> {
             .map(|icc| icc.data().to_vec())
             .unwrap_or_default();
         let mut layer_and_mask_info = file.layer_and_mask_info;
+        // A 16/32-bit document's layer data was parsed out of its `Lr16`/`Lr32`
+        // block, and the writer regenerates that block from the layer tree. Keep
+        // the block, which fixes where it is written, but not the copy of every
+        // compressed channel it holds: for a large document that is as much
+        // memory again as the file, kept for as long as the document lives.
+        if !layer_and_mask_info.layer_info.layer_records.is_empty() {
+            let nested_key = match header.depth {
+                CoreBitDepth::Sixteen => Some(TaggedBlockKey::LR16),
+                CoreBitDepth::ThirtyTwo => Some(TaggedBlockKey::LR32),
+                CoreBitDepth::One | CoreBitDepth::Eight => None,
+            };
+            if let (Some(key), Some(blocks)) = (
+                nested_key,
+                layer_and_mask_info.additional_layer_info.as_mut(),
+            ) {
+                if let Some(block) = blocks.to_mut().get_mut(key) {
+                    block.data = Vec::new();
+                }
+            }
+        }
 
         let mut document = Self {
             version: header.version,

@@ -29,7 +29,7 @@ use fearless_simd::{dispatch, f32x4, prelude::*, u16x8, u8x16, Bytes, Level, Sim
 use fearless_simd_macros::simd;
 use rayon::prelude::*;
 
-use crate::endian::{decode_be_bytes, encode_be_bytes, BeConvert};
+use crate::endian::{decode_be_bytes, BeConvert};
 use crate::error::{CodecError, Result};
 use crate::rle::PARALLEL_MIN_BYTES;
 
@@ -222,10 +222,32 @@ pub(crate) fn row_bytes(width: usize, bytes_per_sample: usize) -> Result<usize> 
 /// Prediction-encode integer samples. Mirrors `PredictionEncode<T>`.
 pub fn encode<T: DeltaSample>(data: &[T], width: usize, height: usize) -> Result<Vec<u8>> {
     check_sample_count(data.len(), width, height)?;
-    let mut work = data.to_vec();
-    T::delta_rows(&mut work, width);
-    Ok(encode_be_bytes(&work))
+    let mut out = vec![0u8; data.len() * T::SIZE];
+    if data.is_empty() {
+        return Ok(out);
+    }
+    // Delta a block of rows in a small scratch buffer and write it out
+    // big-endian, so the channel is never copied at full size: the output is
+    // the only large allocation.
+    let block_rows = (BLOCK_SAMPLES / width).max(1);
+    let mut scratch: Vec<T> = Vec::with_capacity(block_rows * width);
+    for (src, dst) in data
+        .chunks(block_rows * width)
+        .zip(out.chunks_mut(block_rows * width * T::SIZE))
+    {
+        scratch.clear();
+        scratch.extend_from_slice(src);
+        T::delta_rows(&mut scratch, width);
+        for (value, bytes) in scratch.iter().zip(dst.chunks_exact_mut(T::SIZE)) {
+            value.write_be_into(bytes);
+        }
+    }
+    Ok(out)
 }
+
+/// Samples per block of rows in [`encode`]: about 64 KiB of `u16`, small
+/// enough to stay in cache.
+const BLOCK_SAMPLES: usize = 32 * 1024;
 
 /// Prediction-decode integer samples. Mirrors `RemovePredictionEncoding<T>`.
 pub fn decode<T: DeltaSample>(bytes: &[u8], width: usize, height: usize) -> Result<Vec<T>> {
@@ -740,5 +762,67 @@ mod tests {
         let mut scalar_out = vec![0.0f32; 64];
         decode_f32_scalar(&encoded, 8, 32, &mut scalar_out);
         assert_eq!(scalar_out, data);
+    }
+}
+
+#[cfg(test)]
+mod block_encode_tests {
+    use super::*;
+    use crate::endian::encode_be_bytes;
+
+    /// The definition `encode` must keep: delta every row of a full copy, then
+    /// write it big-endian.
+    fn reference<T: DeltaSample>(data: &[T], width: usize) -> Vec<u8> {
+        let mut work = data.to_vec();
+        if !work.is_empty() {
+            T::delta_rows(&mut work, width);
+        }
+        encode_be_bytes(&work)
+    }
+
+    fn samples(count: usize) -> Vec<u16> {
+        let mut state = 0x2545_f491_u32;
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 12) as u16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blocked_encode_equals_the_full_copy_at_every_shape() {
+        // Rows narrower than, equal to and wider than a block; a block boundary
+        // that falls between rows; single rows and columns.
+        for (width, height) in [
+            (1, 1),
+            (1, 5000),
+            (7, 3),
+            (100, 999),
+            (4096, 9),
+            (BLOCK_SAMPLES, 3),
+            (BLOCK_SAMPLES + 5, 3),
+            (40_000, 2),
+        ] {
+            let wide = samples(width * height);
+            assert_eq!(
+                encode::<u16>(&wide, width, height).unwrap(),
+                reference(&wide, width),
+                "u16 {width}x{height}"
+            );
+            let narrow: Vec<u8> = wide.iter().map(|&v| v as u8).collect();
+            assert_eq!(
+                encode::<u8>(&narrow, width, height).unwrap(),
+                reference(&narrow, width),
+                "u8 {width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_of_nothing_is_nothing() {
+        assert!(encode::<u16>(&[], 0, 0).unwrap().is_empty());
+        assert!(encode::<u8>(&[], 5, 0).unwrap().is_empty());
+        assert!(encode::<u8>(&[1, 2, 3], 2, 2).is_err());
     }
 }

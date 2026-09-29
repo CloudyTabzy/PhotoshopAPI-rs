@@ -12,6 +12,31 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-09-30
+
+Less memory to write a 16-bit document, and to hold one after reading it.
+
+### Changed
+
+- A 16- or 32-bit document read from disk no longer keeps a second copy of its compressed
+  layer data. The `Lr16`/`Lr32` block stays in `document_blocks`, which fixes where it is
+  written, but its data is empty: the writer regenerates it from the layer tree, as it always
+  did. On a 3000 x 2000, 10-layer, 16-bit document the decoded document takes 458 MB instead of
+  698 MB, and the operating-system peak while reading falls from 966 MB to 729 MB. If every
+  layer is later removed the empty block is not written.
+- Compressed channels no longer carry unused capacity. The ZIP compressor sized its output for
+  incompressible input and kept that capacity, so a compressible channel stayed at its raw size in
+  memory until it was written.
+- ZIP-with-prediction encoding of 8- and 16-bit channels no longer copies the channel at full
+  size: rows are delta-coded a block at a time in a small scratch buffer and written out
+  big-endian. The bytes are the same.
+- Compressing an 8-bit channel no longer copies it to hand it to the RLE or ZIP codec
+  (`psd_codecs::endian::be_bytes` borrows the samples when they are already bytes).
+- Writing the layer data of a 16/32-bit document no longer clones the block it replaces, which
+  had copied all of the layer data once more.
+- Together with 0.8.5, the heap peak while writing that 16-bit document (decoded pixels plus
+  compressed channels) falls from 2,133 MB to 713 MB, and the file is byte for byte the same.
+
 ## [0.8.5] - 2026-09-30
 
 Writing a document no longer needs a second, whole-file copy of it in memory.

@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use psd_codecs::endian::{decode_be_bytes, encode_be_bytes};
+use psd_codecs::endian::{be_bytes, decode_be_bytes, encode_be_bytes};
 use psd_codecs::rle;
 use psd_codecs::zip;
 use psd_core::{Compression, PsdError, Result, Version};
@@ -342,19 +342,21 @@ pub fn compress_channel<T: BitDepth>(
     match codec {
         Compression::Raw => Ok((Compression::Raw, encode_be_bytes(data))),
         Compression::Rle => {
-            let raw = encode_be_bytes(data);
+            // 8-bit samples are their own bytes, so nothing is copied unless
+            // the channel turns out not to compress and is stored raw.
+            let raw = be_bytes(data);
             let size_width = if version == Version::Psd { 2 } else { 4 };
             let packed =
                 rle::compress_scanlines(&raw, width * T::SIZE, size_width).map_err(codec_error)?;
             if forced.is_none() && packed.len() >= raw.len() {
-                Ok((Compression::Raw, raw))
+                Ok((Compression::Raw, raw.into_owned()))
             } else {
                 Ok((Compression::Rle, packed))
             }
         }
         Compression::Zip => Ok((
             Compression::Zip,
-            zip::compress(&encode_be_bytes(data)).map_err(codec_error)?,
+            zip::compress(&be_bytes(data)).map_err(codec_error)?,
         )),
         Compression::ZipPrediction => {
             let encoded = T::zip_prediction_encode(data, width, height).map_err(codec_error)?;
