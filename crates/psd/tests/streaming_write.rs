@@ -202,3 +202,48 @@ fn a_read_document_keeps_no_copy_of_its_16_and_32_bit_layer_data() {
     assert_eq!(back.layer_count(), 0);
     assert_eq!(nested_block(&back, *b"Lr16"), None);
 }
+
+#[test]
+fn a_lazy_document_writes_its_compressed_channels_without_copying_them() {
+    use std::borrow::Cow;
+
+    for bytes in [
+        synthetic::<u8>(48, 3).to_bytes().unwrap(),
+        synthetic::<u16>(48, 3).to_bytes().unwrap(),
+    ] {
+        let depth = u16::from_be_bytes([bytes[22], bytes[23]]);
+        let options = psd::ReadOptions::unlimited().with_raw_data(true);
+        let check = |staged: &psd::core::PhotoshopFile<'_>| {
+            let mut borrowed = 0;
+            for layer in &staged.layer_and_mask_info.layer_info.channel_image_data {
+                for channel in &layer.channels {
+                    // The divider records a group would add are owned and empty;
+                    // every channel with pixels borrows the document's payload.
+                    if !channel.data.is_empty() {
+                        assert!(matches!(channel.data, Cow::Borrowed(_)));
+                        borrowed += 1;
+                    }
+                }
+            }
+            assert!(borrowed >= 9, "expected every layer channel to borrow");
+        };
+        if depth == 16 {
+            let document = LayeredFile::<u16>::from_bytes_with_options(&bytes, options).unwrap();
+            check(&document.to_photoshop_file().unwrap());
+            assert_eq!(document.to_bytes().unwrap(), bytes);
+        } else {
+            let document = LayeredFile::<u8>::from_bytes_with_options(&bytes, options).unwrap();
+            check(&document.to_photoshop_file().unwrap());
+            assert_eq!(document.to_bytes().unwrap(), bytes);
+        }
+    }
+
+    // A decoded document compresses afresh, so its payloads are its own.
+    let document = synthetic::<u8>(16, 1);
+    let staged = document.to_photoshop_file().unwrap();
+    for layer in &staged.layer_and_mask_info.layer_info.channel_image_data {
+        for channel in &layer.channels {
+            assert!(matches!(channel.data, Cow::Owned(_)));
+        }
+    }
+}

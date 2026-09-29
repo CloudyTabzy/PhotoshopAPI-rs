@@ -138,6 +138,21 @@ impl TaggedBlock {
     /// pads blocks to (1 inside layer records, 4 at document level); padding
     /// bytes are skipped but not part of [`data`](Self::data).
     pub fn read(reader: &mut BeReader, header: &FileHeader, padding: usize) -> Result<Self> {
+        Ok(Self::read_eliding(reader, header, padding, None)?.0)
+    }
+
+    /// [`read`](Self::read), except that when the block's key is `elide` its
+    /// payload is not copied: the block comes back with empty data, and the
+    /// payload is returned as a slice of the reader's own bytes for the caller to
+    /// parse in place. This is how the layer data inside a 16/32-bit document's
+    /// `Lr16`/`Lr32` block, which is most of the file, is read without a second
+    /// copy of it existing beside the parsed layers.
+    pub(crate) fn read_eliding<'r>(
+        reader: &mut BeReader<'r>,
+        header: &FileHeader,
+        padding: usize,
+        elide: Option<TaggedBlockKey>,
+    ) -> Result<(Self, Option<&'r [u8]>)> {
         let offset = reader.position() as u64;
         let mut signature = [0u8; 4];
         signature.copy_from_slice(reader.take(4)?);
@@ -162,13 +177,21 @@ impl TaggedBlock {
             message: "tagged block length does not fit the platform",
         })?;
 
-        let data = reader.take(length)?.to_vec();
+        let payload = reader.take(length)?;
         reader.skip(round_up(length, padding) - length)?;
-        Ok(Self {
-            signature,
-            key,
-            data,
-        })
+        let (data, elided) = if elide == Some(key) {
+            (Vec::new(), Some(payload))
+        } else {
+            (payload.to_vec(), None)
+        };
+        Ok((
+            Self {
+                signature,
+                key,
+                data,
+            },
+            elided,
+        ))
     }
 
     /// Write the block with its length marker and alignment padding.
@@ -293,6 +316,22 @@ impl AdditionalLayerInfo {
         max_len: usize,
         padding: usize,
     ) -> Result<(Self, usize)> {
+        let (blocks, content_end, _) = Self::read_eliding(reader, header, max_len, padding, None)?;
+        Ok((blocks, content_end))
+    }
+
+    /// [`read_tracking_end`](Self::read_tracking_end) that does not copy the
+    /// payload of the first block whose key is `elide`: that block is kept with
+    /// empty data and its payload is returned, borrowed from the reader's bytes.
+    /// See [`TaggedBlock::read_eliding`].
+    pub(crate) fn read_eliding<'r>(
+        reader: &mut BeReader<'r>,
+        header: &FileHeader,
+        max_len: usize,
+        padding: usize,
+        mut elide: Option<TaggedBlockKey>,
+    ) -> Result<(Self, usize, Option<&'r [u8]>)> {
+        let mut elided = None;
         let start = reader.position();
         let end = start.checked_add(max_len).ok_or(PsdError::InvalidData {
             offset: start as u64,
@@ -310,7 +349,14 @@ impl AdditionalLayerInfo {
         let mut blocks = Vec::new();
         while end.saturating_sub(reader.position()) >= min_block {
             let before = reader.position();
-            blocks.push(TaggedBlock::read(reader, header, padding)?);
+            let (block, payload) = TaggedBlock::read_eliding(reader, header, padding, elide)?;
+            if payload.is_some() {
+                // Only the first block with the key is taken; a repeat is an
+                // ordinary block.
+                elided = payload;
+                elide = None;
+            }
+            blocks.push(block);
             if reader.position() - start > max_len {
                 return Err(PsdError::InvalidData {
                     offset: before as u64,
@@ -320,7 +366,7 @@ impl AdditionalLayerInfo {
         }
         let content_end = reader.position();
         reader.skip(end - reader.position())?;
-        Ok((Self { blocks }, content_end))
+        Ok((Self { blocks }, content_end, elided))
     }
 
     /// Write all blocks with the given alignment (`padding`), for the
@@ -397,6 +443,42 @@ mod tests {
             TaggedBlock::read(&mut r, &header(Version::Psb), 4).unwrap(),
             block
         );
+    }
+
+    #[test]
+    fn eliding_takes_the_first_block_with_the_key_and_borrows_its_payload() {
+        let mut ali = AdditionalLayerInfo::new();
+        ali.push(TaggedBlock::new(TaggedBlockKey::LUNI, vec![1, 2, 3, 4]));
+        ali.push(TaggedBlock::new(TaggedBlockKey::LR16, vec![7; 6]));
+        ali.push(TaggedBlock::new(TaggedBlockKey::LR16, vec![8; 5]));
+        let mut w = BeWriter::new();
+        ali.write(&mut w, &header(Version::Psd), 4).unwrap();
+        let total = w.position();
+
+        let mut r = BeReader::new(w.as_slice());
+        let (back, end, payload) = AdditionalLayerInfo::read_eliding(
+            &mut r,
+            &header(Version::Psd),
+            total,
+            4,
+            Some(TaggedBlockKey::LR16),
+        )
+        .unwrap();
+        assert_eq!(payload, Some([7u8; 6].as_slice()));
+        assert_eq!(end, total);
+        assert_eq!(back.blocks.len(), 3);
+        assert!(back.blocks[1].data.is_empty());
+        // A repeat of the key is an ordinary block.
+        assert_eq!(back.blocks[2].data, vec![8; 5]);
+        assert_eq!(back.blocks[0], ali.blocks[0]);
+
+        // No key to elide: identical to a plain read.
+        let mut r = BeReader::new(w.as_slice());
+        let (plain, _, none) =
+            AdditionalLayerInfo::read_eliding(&mut r, &header(Version::Psd), total, 4, None)
+                .unwrap();
+        assert!(none.is_none());
+        assert_eq!(plain, ali);
     }
 
     #[test]

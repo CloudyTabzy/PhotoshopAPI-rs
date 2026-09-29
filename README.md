@@ -256,7 +256,8 @@ fn main() -> psd::core::Result<()> {
 
 The default reader decodes eagerly. A lazy read keeps each compressed payload
 until its channel is decoded or replaced, and writes untouched payloads with
-their original compression. `ChannelStore::get` returns `None` for a raw channel;
+their original compression, straight from where the document holds them: saving
+a lazy document needs no memory beyond the document itself. `ChannelStore::get` returns `None` for a raw channel;
 `is_raw` distinguishes it from an absent channel. The default 2 GiB decoded
 channel budget also applies when lazy channels are decoded later. The merged
 composite remains outside this read path.

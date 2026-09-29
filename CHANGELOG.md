@@ -12,6 +12,46 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-30
+
+Saving a lazily read document no longer copies its compressed channels, and a 16/32-bit
+document's layer data is never held twice while it is read. This changes a public type, so it
+is a minor version.
+
+### Changed (breaking)
+
+- `psd::core::ChannelData` and `ChannelImageData` carry a lifetime, and `ChannelData::data` is a
+  `Cow<'a, [u8]>` instead of a `Vec<u8>`. A parse still owns its payloads; a write stages the
+  payloads a lazy document keeps (`ReadOptions::with_raw_data`) by borrowing them, where it used to
+  clone every one. Code that only reads `channel.data` as a slice is unaffected. Code that builds
+  a `ChannelData` writes `ChannelData::owned(compression, vec)` (or `borrowed`), or `vec.into()`
+  for the field; code that needs a `Vec` calls `.into_owned()` or `.to_vec()`.
+  `LayerInfo::channel_image_data` is now `Vec<ChannelImageData<'a>>`.
+  Writing a lazy 8-bit document of 415 MB now peaks 2 MB above the document, where it peaked at
+  twice its size; a lazy 16-bit document of 241 MB, 2 MB above it, where it peaked at 482 MB.
+- `PhotoshopFile::read` returns the `Lr16`/`Lr32` block of a 16/32-bit document as an empty
+  placeholder. Its layers are parsed where they lie in the file, so the block's bytes are never
+  copied and the layer data exists once, parsed, instead of twice while reading. The block keeps
+  its position, and writing regenerates its content from `layer_info` as before. A nested block
+  that holds no layers is kept byte for byte.
+  Reading a lazy 16-bit document of 241 MB now peaks at 240 MB of heap, where it peaked at 480 MB.
+  `psd::LayeredFile::document_blocks` therefore has the block with empty data (0.8.6 did this
+  after the read; it now never has the bytes).
+
+### Fixed
+
+- The buffered writer (`PhotoshopFile::write`) and the streaming one now agree on a 16/32-bit
+  document that carries several `Lr16`/`Lr32` blocks: the layer data goes into the first and the
+  repeats are dropped. The buffered writer used to write a full copy of the layer data into each,
+  as upstream does, and only the streaming writer dropped them, so the two produced different files.
+
+### Added
+
+- `ChannelData::owned` and `ChannelData::borrowed`.
+- Tests that pin the memory behavior: a lazy document stages only borrowed payloads and rewrites
+  to identical bytes; a nested block is taken from the first `Lr16`/`Lr32` only; a block with no
+  layers survives a round trip; the streaming and buffered writers agree.
+
 ## [0.8.6] - 2026-09-30
 
 Less memory to write a 16-bit document, and to hold one after reading it.

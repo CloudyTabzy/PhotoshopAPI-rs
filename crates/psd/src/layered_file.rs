@@ -455,26 +455,6 @@ impl<T: BitDepth> LayeredFile<T> {
             .map(|icc| icc.data().to_vec())
             .unwrap_or_default();
         let mut layer_and_mask_info = file.layer_and_mask_info;
-        // A 16/32-bit document's layer data was parsed out of its `Lr16`/`Lr32`
-        // block, and the writer regenerates that block from the layer tree. Keep
-        // the block, which fixes where it is written, but not the copy of every
-        // compressed channel it holds: for a large document that is as much
-        // memory again as the file, kept for as long as the document lives.
-        if !layer_and_mask_info.layer_info.layer_records.is_empty() {
-            let nested_key = match header.depth {
-                CoreBitDepth::Sixteen => Some(TaggedBlockKey::LR16),
-                CoreBitDepth::ThirtyTwo => Some(TaggedBlockKey::LR32),
-                CoreBitDepth::One | CoreBitDepth::Eight => None,
-            };
-            if let (Some(key), Some(blocks)) = (
-                nested_key,
-                layer_and_mask_info.additional_layer_info.as_mut(),
-            ) {
-                if let Some(block) = blocks.to_mut().get_mut(key) {
-                    block.data = Vec::new();
-                }
-            }
-        }
 
         let mut document = Self {
             version: header.version,
@@ -587,7 +567,7 @@ impl<T: BitDepth> LayeredFile<T> {
     fn build_layer(
         &mut self,
         record: &LayerRecord,
-        channel_data: ChannelImageData,
+        channel_data: ChannelImageData<'_>,
         version: Version,
         options: ReadOptions,
         remaining_bitmap_memory: &mut Option<usize>,
@@ -687,7 +667,7 @@ impl<T: BitDepth> LayeredFile<T> {
                         key,
                         RawChannelData::new(
                             channel.compression,
-                            channel.data,
+                            channel.data.into_owned(),
                             width,
                             height,
                             version,
@@ -716,7 +696,7 @@ impl<T: BitDepth> LayeredFile<T> {
                                 key,
                                 RawChannelData::new(
                                     channel.compression,
-                                    channel.data,
+                                    channel.data.into_owned(),
                                     width,
                                     height,
                                     version,
@@ -1659,7 +1639,7 @@ impl<T: BitDepth> LayeredFile<T> {
         &'a self,
         children: &[LayerId],
         records: &mut Vec<LayerRecord<'a>>,
-        channel_data: &mut Vec<ChannelImageData>,
+        channel_data: &mut Vec<ChannelImageData<'a>>,
         index: &mut usize,
         total: usize,
         progress: &mut dyn FnMut(ProgressEvent<'_>),
@@ -1836,7 +1816,7 @@ impl<T: BitDepth> LayeredFile<T> {
         })
     }
 
-    fn build_divider_record(&self) -> Result<(LayerRecord<'static>, ChannelImageData)> {
+    fn build_divider_record(&self) -> Result<(LayerRecord<'static>, ChannelImageData<'static>)> {
         // The bounding-divider record is fixed-shape; build it directly with
         // owned blocks so no borrow of a temporary layer escapes.
         let bounds = Rect::default();
@@ -1854,7 +1834,7 @@ impl<T: BitDepth> LayeredFile<T> {
             });
             data.push(ChannelData {
                 compression,
-                data: payload,
+                data: payload.into(),
             });
         }
         // Photoshop names the divider in `luni` as well (upstream writes an
@@ -1896,7 +1876,7 @@ impl<T: BitDepth> LayeredFile<T> {
         layer: &'a Layer<T>,
         blocks: Option<Cow<'a, AdditionalLayerInfo>>,
         is_bottom_record: bool,
-    ) -> Result<(LayerRecord<'a>, ChannelImageData)> {
+    ) -> Result<(LayerRecord<'a>, ChannelImageData<'a>)> {
         let bounds = layer.bounds;
         let stub_channels = matches!(
             layer.kind,
@@ -2014,7 +1994,7 @@ impl<T: BitDepth> LayeredFile<T> {
                             message: "decode raw channels before changing their compression",
                         });
                     }
-                    (raw.compression, raw.payload.clone())
+                    (raw.compression, Cow::Borrowed(raw.payload.as_slice()))
                 } else {
                     let samples: &[T] = if key == ChannelKey::ALPHA && synthesize_alpha {
                         &opaque_alpha
@@ -2024,13 +2004,14 @@ impl<T: BitDepth> LayeredFile<T> {
                             .and_then(|channels| channels.get(key))
                             .unwrap_or(&[])
                     };
-                    compress_channel(
+                    let (compression, payload) = compress_channel(
                         samples,
                         rect.width().max(0) as usize,
                         rect.height().max(0) as usize,
                         self.version,
                         layer.write_compression(key, self.compression),
-                    )?
+                    )?;
+                    (compression, Cow::Owned(payload))
                 };
             channels.push(ChannelInfo {
                 id: CoreChannelId::from_index(key.index(), self.color_mode),

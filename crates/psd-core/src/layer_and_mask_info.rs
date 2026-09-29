@@ -10,7 +10,9 @@
 //! (4-byte aligned). 16- and 32-bit documents keep their layer data inside an
 //! `Lr16`/`Lr32` tagged block instead of the main `LayerInfo` (which is then a
 //! zero-length section); this port moves it into [`LayerInfo`] on read and
-//! regenerates the block on write, so callers always see one layer tree.
+//! regenerates the block on write, so callers always see one layer tree. The block
+//! itself is read as an empty placeholder that keeps its position, so the layer data
+//! is held once, parsed, and not a second time as raw bytes.
 //!
 //! Deviations from upstream:
 //! - Channel image data is stored as the raw *compressed* bytes (compression
@@ -100,7 +102,19 @@ impl<'a> LayerAndMaskInformation<'a> {
             return Ok(Self::default());
         }
 
-        let (layer_info, content_end) = LayerInfo::read_tracking_content_end(reader, header)?;
+        let (mut layer_info, content_end) = LayerInfo::read_tracking_content_end(reader, header)?;
+
+        // 16/32-bit documents keep their layers in an `Lr16`/`Lr32` block after
+        // an empty main section. That block is most of the file, so it is parsed
+        // where it lies and never copied: the block is kept with empty data (it
+        // fixes where the block is written, and the writer regenerates its
+        // content from the layer tree).
+        let nested_key = match header.depth {
+            BitDepth::Sixteen => Some(TaggedBlockKey::LR16),
+            BitDepth::ThirtyTwo => Some(TaggedBlockKey::LR32),
+            BitDepth::One | BitDepth::Eight => None,
+        }
+        .filter(|_| layer_info.layer_records.is_empty());
 
         // The global-mask info is optional in the wild: some writers end the
         // section right after the layer info, and some declare a layer-info
@@ -134,48 +148,32 @@ impl<'a> LayerAndMaskInformation<'a> {
 
             let remaining = end - reader.position();
             additional_layer_info = if remaining >= 12 {
-                Some(Cow::Owned(AdditionalLayerInfo::read(
-                    reader, header, remaining, 4,
-                )?))
+                let (mut blocks, _, nested) =
+                    AdditionalLayerInfo::read_eliding(reader, header, remaining, 4, nested_key)?;
+                if let (Some(key), Some(bytes)) = (nested_key, nested) {
+                    let mut sub = BeReader::new(bytes);
+                    let parsed = LayerInfo::read_content(&mut sub, header, bytes.len())?.0;
+                    if parsed.layer_records.is_empty() {
+                        // Nothing to regenerate a block from: keep it as it was.
+                        if let Some(block) = blocks.get_mut(key) {
+                            block.data = bytes.to_vec();
+                        }
+                    } else {
+                        layer_info = parsed;
+                    }
+                }
+                Some(Cow::Owned(blocks))
             } else {
                 reader.skip(remaining)?;
                 None
             };
         }
 
-        let mut result = Self {
+        Ok(Self {
             layer_info,
             global_layer_mask_info,
             additional_layer_info,
-        };
-        result.absorb_nested_layer_info(header)?;
-        Ok(result)
-    }
-
-    /// 16/32-bit documents store the layer tree inside an `Lr16`/`Lr32`
-    /// tagged block; parse it into [`Self::layer_info`] so callers see one
-    /// tree regardless of bit depth.
-    fn absorb_nested_layer_info(&mut self, header: &FileHeader) -> Result<()> {
-        if !self.layer_info.layer_records.is_empty() {
-            return Ok(());
-        }
-        let key = match header.depth {
-            BitDepth::Sixteen => TaggedBlockKey::LR16,
-            BitDepth::ThirtyTwo => TaggedBlockKey::LR32,
-            // 1-bit and 8-bit documents keep their records in the main
-            // section.
-            BitDepth::One | BitDepth::Eight => return Ok(()),
-        };
-        let Some(block) = self
-            .additional_layer_info
-            .as_ref()
-            .and_then(|ali| ali.get(key))
-        else {
-            return Ok(());
-        };
-        let mut sub = BeReader::new(&block.data);
-        self.layer_info = LayerInfo::read_content(&mut sub, header, block.data.len())?.0;
-        Ok(())
+        })
     }
 
     pub fn write(&self, writer: &mut BeWriter, header: &FileHeader) -> Result<()> {
@@ -214,10 +212,10 @@ impl<'a> LayerAndMaskInformation<'a> {
     /// that cannot be written, one whose length overflows a PSD field, fails
     /// before any of the section reaches `sink`.
     ///
-    /// One difference from `write`: when a 16/32-bit document carries several
-    /// `Lr16`/`Lr32` blocks, `write` regenerates the layer data into each of
-    /// them, and this writes it once, into the first, and drops the others.
-    /// A second copy of the layer tree can only be stale.
+    /// When a 16/32-bit document carries several `Lr16`/`Lr32` blocks, the layer
+    /// data is written once, into the first, and the others are dropped (as
+    /// `write` does): a second copy of the layer tree can only be stale.
+    /// Upstream writes the same layer data into each of them.
     pub(crate) fn write_to<W: Write>(&mut self, sink: &mut W, header: &FileHeader) -> Result<()> {
         let version = header.version;
         let records = &self.layer_info.layer_records;
@@ -357,21 +355,26 @@ impl<'a> LayerAndMaskInformation<'a> {
             .unwrap_or(&[]);
         let has_nested_block = nested_key.is_some_and(|key| blocks.iter().any(|b| b.key == key));
 
+        // The layer data goes into the first block with the key. A repeat can only
+        // be a stale second copy of the layer tree, so it is dropped.
+        let regenerating = nested_data.is_some();
+        let mut nested_data = nested_data;
         // New documents place the nested block first, like Photoshop does.
-        if let (Some(key), Some(data)) = (nested_key, &nested_data) {
-            if !has_nested_block {
-                TaggedBlock::new(key, data.clone()).write(writer, header, 4)?;
-            }
+        if let (Some(key), Some(data)) = (nested_key, nested_data.take_if(|_| !has_nested_block)) {
+            TaggedBlock::new(key, data).write(writer, header, 4)?;
         }
         for block in blocks {
-            match (nested_key, &nested_data) {
-                (Some(key), Some(data)) if block.key == key => {
-                    let mut replacement = block.clone();
-                    replacement.data = data.clone();
+            if regenerating && nested_key == Some(block.key) {
+                if let Some(data) = nested_data.take() {
+                    let replacement = TaggedBlock {
+                        signature: block.signature,
+                        key: block.key,
+                        data,
+                    };
                     replacement.write(writer, header, 4)?;
                 }
-                _ if is_emptied_layer_data(block, header) => {}
-                _ => block.write(writer, header, 4)?,
+            } else if !is_emptied_layer_data(block, header) {
+                block.write(writer, header, 4)?;
             }
         }
         Ok(())
@@ -383,7 +386,7 @@ impl<'a> LayerAndMaskInformation<'a> {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LayerInfo<'a> {
     pub layer_records: Vec<LayerRecord<'a>>,
-    pub channel_image_data: Vec<ChannelImageData>,
+    pub channel_image_data: Vec<ChannelImageData<'a>>,
     /// On-disk layer count was negative: the first alpha channel of the layer
     /// records holds the merged image's alpha (upstream drops this).
     pub has_merged_alpha: bool,
@@ -544,7 +547,7 @@ impl<'a> LayerInfo<'a> {
             for channel in &mut layer.channels {
                 sink.write_all(&channel.compression.as_raw().to_be_bytes())?;
                 sink.write_all(&channel.data)?;
-                channel.data = Vec::new();
+                channel.data = Cow::Borrowed(&[]);
             }
         }
         Ok(())
@@ -1401,13 +1404,18 @@ pub struct GlobalLayerMaskInfo {
 
 /// The compressed channel data of one layer, index aligned with the layer's
 /// [`LayerRecord::channels`].
+///
+/// Like [`LayerRecord`], it borrows what a document already holds so that
+/// staging a write does not copy it: a parse owns its payloads, a write may
+/// borrow them.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ChannelImageData {
-    pub channels: Vec<ChannelData>,
+pub struct ChannelImageData<'a> {
+    pub channels: Vec<ChannelData<'a>>,
 }
 
-impl ChannelImageData {
-    /// Read one layer's channels using the sizes declared in its record.
+impl<'a> ChannelImageData<'a> {
+    /// Read one layer's channels using the sizes declared in its record. The
+    /// payloads are copied out of the reader, so the result owns them.
     pub fn read(reader: &mut BeReader, record: &LayerRecord) -> Result<Self> {
         let mut channels = Vec::with_capacity(record.channels.len().min(64));
         for info in &record.channels {
@@ -1420,7 +1428,7 @@ impl ChannelImageData {
             if info.size == 0 {
                 channels.push(ChannelData {
                     compression: Compression::Raw,
-                    data: Vec::new(),
+                    data: Cow::Borrowed(&[]),
                 });
                 continue;
             }
@@ -1432,7 +1440,7 @@ impl ChannelImageData {
                 reader.skip(1)?;
                 channels.push(ChannelData {
                     compression: Compression::Raw,
-                    data: Vec::new(),
+                    data: Cow::Borrowed(&[]),
                 });
                 continue;
             }
@@ -1447,7 +1455,7 @@ impl ChannelImageData {
             })?;
             channels.push(ChannelData {
                 compression,
-                data: reader.take(payload_len)?.to_vec(),
+                data: Cow::Owned(reader.take(payload_len)?.to_vec()),
             });
         }
         Ok(Self { channels })
@@ -1466,10 +1474,30 @@ impl ChannelImageData {
 
 /// One channel's compressed payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChannelData {
+pub struct ChannelData<'a> {
     pub compression: Compression,
-    /// Compressed bytes, excluding the 2-byte compression marker.
-    pub data: Vec<u8>,
+    /// Compressed bytes, excluding the 2-byte compression marker. Owned by a
+    /// parse; borrowed when a write stages a payload that a document keeps
+    /// compressed (a lazy read), so that writing does not copy it.
+    pub data: Cow<'a, [u8]>,
+}
+
+impl<'a> ChannelData<'a> {
+    /// A channel that owns its payload.
+    pub fn owned(compression: Compression, data: Vec<u8>) -> Self {
+        Self {
+            compression,
+            data: Cow::Owned(data),
+        }
+    }
+
+    /// A channel that borrows its payload.
+    pub fn borrowed(compression: Compression, data: &'a [u8]) -> Self {
+        Self {
+            compression,
+            data: Cow::Borrowed(data),
+        }
+    }
 }
 
 /// Convenience helper for consumers that need to know how many bytes a
@@ -1825,11 +1853,11 @@ mod tests {
                 channels: vec![
                     ChannelData {
                         compression: Compression::Raw,
-                        data: vec![0; 8],
+                        data: vec![0; 8].into(),
                     },
                     ChannelData {
                         compression: Compression::Rle,
-                        data: vec![1, 2, 3, 4],
+                        data: vec![1, 2, 3, 4].into(),
                     },
                 ],
             }],
@@ -1856,11 +1884,11 @@ mod tests {
                 channels: vec![
                     ChannelData {
                         compression: Compression::Raw,
-                        data: vec![0; 8],
+                        data: vec![0; 8].into(),
                     },
                     ChannelData {
                         compression: Compression::Raw,
-                        data: vec![0; 4],
+                        data: vec![0; 4].into(),
                     },
                 ],
             }],
@@ -1878,14 +1906,15 @@ mod tests {
         let back = LayerAndMaskInformation::read(&mut r, &header(BitDepth::Sixteen)).unwrap();
         assert_eq!(back.layer_info, section.layer_info);
         assert_eq!(back.global_layer_mask_info, section.global_layer_mask_info);
-        // The nested block was synthesized with the layer content.
+        // The nested block was written with the layer content, and reads back as
+        // a placeholder: its layers are in `layer_info`, not copied a second time.
         let block = back
             .additional_layer_info
             .as_ref()
             .unwrap()
             .get(TaggedBlockKey::LR16)
             .unwrap();
-        assert!(!block.data.is_empty());
+        assert!(block.data.is_empty());
 
         // A second round-trip of the parsed form is stable.
         let mut w = BeWriter::new();
@@ -1893,6 +1922,70 @@ mod tests {
         let mut r = BeReader::new(w.as_slice());
         let again = LayerAndMaskInformation::read(&mut r, &header(BitDepth::Sixteen)).unwrap();
         assert_eq!(again, back);
+    }
+
+    #[test]
+    fn a_nested_block_with_no_layers_keeps_its_bytes() {
+        // Nothing parses out of it, so nothing can regenerate it: it must come
+        // back as it was, not as an empty placeholder.
+        let mut ali = AdditionalLayerInfo::new();
+        ali.push(TaggedBlock::new(TaggedBlockKey::LR16, vec![0, 0, 0, 0]));
+        ali.push(TaggedBlock::new(TaggedBlockKey::LUNI, vec![1, 2, 3, 4]));
+        let section = LayerAndMaskInformation {
+            layer_info: LayerInfo::default(),
+            global_layer_mask_info: GlobalLayerMaskInfo::default(),
+            additional_layer_info: Some(Cow::Owned(ali.clone())),
+        };
+        let mut w = BeWriter::new();
+        section.write(&mut w, &header(BitDepth::Sixteen)).unwrap();
+        let mut r = BeReader::new(w.as_slice());
+        let back = LayerAndMaskInformation::read(&mut r, &header(BitDepth::Sixteen)).unwrap();
+        assert!(back.layer_info.layer_records.is_empty());
+        assert_eq!(back.additional_layer_info.as_deref(), Some(&ali));
+    }
+
+    #[test]
+    fn a_repeated_nested_block_is_written_once() {
+        // The layer data goes into the first `Lr16`; a repeat could only be a
+        // stale second copy of it, so it is dropped, and the blocks after it stay.
+        let info = LayerInfo {
+            layer_records: vec![sample_record()],
+            channel_image_data: vec![ChannelImageData {
+                channels: vec![ChannelData::owned(Compression::Raw, vec![0; 8])],
+            }],
+            has_merged_alpha: false,
+        };
+        let mut ali = AdditionalLayerInfo::new();
+        ali.push(TaggedBlock::new(TaggedBlockKey::LR16, Vec::new()));
+        ali.push(TaggedBlock::new(TaggedBlockKey::LR16, vec![9, 9, 9, 9]));
+        ali.push(TaggedBlock::new(TaggedBlockKey::LUNI, vec![1, 2, 3, 4]));
+        let mut section = LayerAndMaskInformation {
+            layer_info: info,
+            global_layer_mask_info: GlobalLayerMaskInfo::default(),
+            additional_layer_info: Some(Cow::Owned(ali)),
+        };
+        section.layer_info.layer_records[0].channels = vec![ChannelInfo {
+            id: ChannelId::Red,
+            index: 0,
+            size: 10,
+        }];
+        let mut w = BeWriter::new();
+        section.write(&mut w, &header(BitDepth::Sixteen)).unwrap();
+        let mut r = BeReader::new(w.as_slice());
+        let back = LayerAndMaskInformation::read(&mut r, &header(BitDepth::Sixteen)).unwrap();
+        assert_eq!(back.layer_info.layer_records.len(), 1);
+        let blocks = &back.additional_layer_info.as_ref().unwrap().blocks;
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].key, TaggedBlockKey::LR16);
+        assert!(blocks[0].data.is_empty());
+        assert_eq!(blocks[1].key, TaggedBlockKey::LUNI);
+
+        // The streaming writer agrees with the buffered one.
+        let mut streamed = Vec::new();
+        section
+            .write_to(&mut streamed, &header(BitDepth::Sixteen))
+            .unwrap();
+        assert_eq!(streamed, w.as_slice());
     }
 
     #[test]

@@ -57,7 +57,7 @@ fn channel_payloads(bytes: &[u8]) -> Vec<Vec<(Compression, Vec<u8>)>> {
             layer
                 .channels
                 .iter()
-                .map(|channel| (channel.compression, channel.data.clone()))
+                .map(|channel| (channel.compression, channel.data.to_vec()))
                 .collect()
         })
         .collect()
@@ -462,7 +462,7 @@ fn empty_real_user_mask_channel_does_not_fail_the_read() {
     record.channels[position].size = 2;
     layer_info.channel_image_data[0].channels[position] = psd::core::ChannelData {
         compression: Compression::Raw,
-        data: Vec::new(),
+        data: Vec::new().into(),
     };
 
     let mut writer = BeWriter::new();
@@ -499,7 +499,7 @@ fn a_corrupt_channel_reads_as_a_zero_filled_channel() {
     let channel_data = &mut file.layer_and_mask_info.layer_info.channel_image_data[0].channels[0];
     *channel_data = psd::core::ChannelData {
         compression: Compression::Zip,
-        data: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33],
+        data: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33].into(),
     };
     file.layer_and_mask_info.layer_info.layer_records[0].channels[0].size =
         channel_data.data.len() as u64 + 2;
