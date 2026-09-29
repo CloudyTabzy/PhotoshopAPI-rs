@@ -52,7 +52,7 @@ fn main() {
     let mut bpp: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(3);
     let path = args.next();
 
-    let mut filtered = if let Some(path) = &path {
+    let filtered = if let Some(path) = &path {
         let (idat, w, h, b) = read_png(path);
         (width, height, bpp) = (w, h, b);
         let expected = (w * b + 1) * h;

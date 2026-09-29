@@ -1,7 +1,8 @@
 # psd-png
 
-A streaming PNG decoder whose only dependency is `fearless_simd`, built to decode smart-object rasters for
-PhotoshopAPI-rs, the Rust port of PhotoshopAPI.
+A streaming PNG decoder with portable SIMD kernels, built to decode smart-object rasters for
+PhotoshopAPI-rs, the Rust port of PhotoshopAPI. Its only dependencies are `fearless_simd` and the
+build-time `#[simd]` macro crate that goes with it, and `crc32fast` for the chunk checksum.
 
 `decode_to` hands out one reconstructed scanline at a time while holding only DEFLATE's 32 KiB
 match window, a segment of filtered rows, and a few rows of headroom — a few hundred kilobytes
@@ -60,8 +61,8 @@ which contributed:
 
 - the complete PNG format layer — every colour type, every bit depth, Adam7 on read, chunk
   parsing, ancillary-chunk retention, the 512 MiB ceiling and the fallible allocation behind it;
-- the DEFLATE codec, the CRC-32 and Adler-32 implementations with their SIMD paths, and the
-  scanline filters, forward and reverse.
+- the DEFLATE codec, the CRC-32 and Adler-32 implementations, and the scanline filters,
+  forward and reverse. (The checksums have since been replaced; see below.)
 
 The PhotoshopAPI-rs port team added:
 
@@ -179,9 +180,11 @@ leaves the bit buffer and output cursor in registers. Resumability costs nothing
 does not use it: the segmented loop is a const-generic instantiation, and the ordinary decode
 never enters it.
 
-**Checksums use the hardware.** Adler-32 has an AArch64 NEON path; CRC-32 uses the AArch64 CRC
-instructions where present and slice-by-16 otherwise. Both fall back to portable code, and every
-implementation is tested against the same reference.
+**Checksums use the hardware.** CRC-32 is `crc32fast`'s: carry-less multiplication (PCLMULQDQ,
+PMULL) where the CPU has it, at 60-80 GB/s, and a slice-by-16 table walk elsewhere. Adler-32 is a
+portable vector kernel written against `fearless_simd`, run on every target that has a vector
+unit, at about 19 GB/s on AVX2. Both fall back to portable code, and every implementation is
+tested against the same reference.
 
 **Chunk CRCs are checked; the Adler-32 is not, by default.** The Adler-32 inside the compressed
 stream covers the same bytes the chunk CRC already covered, so checking one catches the same
@@ -194,13 +197,17 @@ without recomputing its checksum.
 
 ## Safety
 
-Safe Rust apart from the inherited narrow places, each with the invariant that justifies it
-written next to it: the literal stores and match reads and copies in the inflate loop, the bit
-writer's eight-byte flush, the SIMD checksum paths, the SIMD `Paeth` filter, and the fallible
-zeroed allocation the decoder sizes its buffers with. Everything else — chunk parsing, filtering,
-conversion — is bounds-checked. Malformed input is a tested case: the suite feeds truncated
-files, single-bit corruptions at every byte, and thousands of random byte strings through the
-decoder, and requires errors rather than panics.
+Safe Rust apart from one `unsafe` block: the sixteen-byte pass loop of the inflate match copy.
+It sits inside a function that checks the whole range it can touch before the loop starts, so the
+function is sound for any arguments, and a bug in its caller is a panic and not an out-of-bounds
+write. The crate root denies `unsafe_code` and that one function allows it by name, so a second
+block anywhere fails the build. The filter, conversion and Adler-32 kernels are written against
+`fearless_simd`'s portable vectors and contain no `unsafe`; the CRC-32's carry-less multiply is
+`crc32fast`'s. Everything else — the literal stores of the inflate loop, chunk parsing,
+filtering, conversion — is bounds-checked. The decoder's buffers are allocated with a probe followed by `vec!`, which is not
+the abort-free guarantee a direct `alloc_zeroed` gave: see the changelog. Malformed input is a
+tested case: the suite feeds truncated files, single-bit corruptions at every byte, and thousands
+of random byte strings through the decoder, and requires errors rather than panics.
 
 ## Testing
 

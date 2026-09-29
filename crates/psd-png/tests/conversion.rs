@@ -127,6 +127,43 @@ fn sixteen_bit_rgb_converts_by_high_byte_and_compares_at_full_depth() {
     assert_eq!(grey_alpha.to_rgba8().unwrap(), [0x11, 0x11, 0x11, 0x33]);
 }
 
+/// Rows wide enough to fill the SIMD kernels' register blocks, with a `tRNS` key that recurs
+/// at every position within a block. The expectations are worked out from the samples alone
+/// rather than from the crate's own scalar path, which is what the kernels are pinned to
+/// elsewhere: a kernel that put the transparency on the wrong pixel once passed every parity
+/// test over random rows, because random rows almost never contain the key.
+#[test]
+fn a_transparency_key_lands_on_the_pixels_that_match_it_in_wide_rows() {
+    for width in [1u32, 2, 7, 8, 9, 15, 16, 17, 40, 67] {
+        // 16-bit grey: every third pixel repeats the key, the others are distinct samples.
+        let sample16 = |x: u32| if x % 3 == 1 { 0x1234u16 } else { 0x2000 + 0x0111 * x as u16 };
+        let mut grey16 = info(width, 1, ColorType::Grayscale, BitDepth::Sixteen);
+        grey16.transparency = Some(vec![0x12, 0x34]);
+        let data: Vec<u8> = (0..width).flat_map(|x| sample16(x).to_be_bytes()).collect();
+        let want: Vec<u8> = (0..width)
+            .flat_map(|x| {
+                let sample = sample16(x);
+                let high = (sample >> 8) as u8;
+                [high, high, high, if sample == 0x1234 { 0 } else { 255 }]
+            })
+            .collect();
+        assert_eq!(image(grey16, data).to_rgba8().unwrap(), want, "16-bit grey, width {width}");
+
+        // 8-bit grey, the same shape at the depth whose kernel reads one byte per pixel.
+        let sample8 = |x: u32| if x % 3 == 1 { 0x5Au8 } else { 0x60 + x as u8 };
+        let mut grey8 = info(width, 1, ColorType::Grayscale, BitDepth::Eight);
+        grey8.transparency = Some(vec![0x00, 0x5A]);
+        let data: Vec<u8> = (0..width).map(sample8).collect();
+        let want: Vec<u8> = (0..width)
+            .flat_map(|x| {
+                let sample = sample8(x);
+                [sample, sample, sample, if sample == 0x5A { 0 } else { 255 }]
+            })
+            .collect();
+        assert_eq!(image(grey8, data).to_rgba8().unwrap(), want, "8-bit grey, width {width}");
+    }
+}
+
 /// Palettes at every depth a PNG allows an indexed image to use, since the index is read
 /// from a differently packed row each time.
 #[test]

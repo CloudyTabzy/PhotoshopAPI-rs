@@ -797,8 +797,9 @@ impl Inflater {
         hook: &mut H,
         pause: &mut Option<SegmentPause>,
     ) -> Result<(usize, usize), InflateError> {
-        // `decode_block`'s unchecked stores rely on this: every write it makes lands below
-        // `limit + OUTPUT_SLACK`.
+        // `decode_block` writes speculatively past `limit`, always below `limit +
+        // OUTPUT_SLACK`. Its stores are checked, so this cannot cause an out-of-bounds write;
+        // it is what keeps a valid stream from tripping one.
         assert!(
             limit <= output.len().saturating_sub(OUTPUT_SLACK),
             "limit must leave OUTPUT_SLACK in the output buffer"
@@ -1058,52 +1059,74 @@ impl Inflater {
         Ok(())
     }
 
-    /// Writes the one or two literal bytes an entry carries, without re-checking bounds.
+    /// Writes the one or two literal bytes an entry carries, as one halfword store.
     ///
-    /// # Safety
-    /// `pos + 2 <= output.len()` must hold. The decode loop establishes this by refusing to
-    /// enter an iteration unless `pos <= limit`, where `limit + OUTPUT_SLACK <= output.len()`,
-    /// and by advancing `pos` by at most six over the literals it then writes speculatively.
+    /// Bounds-checked. The decode loop keeps `pos + 2 <= output.len()` by refusing to enter an
+    /// iteration unless `pos <= limit`, where `limit + OUTPUT_SLACK <= output.len()`, and by
+    /// advancing `pos` by at most six over the literals it then writes speculatively, so the
+    /// check never fires on a stream the decoder accepts. It costs nothing measurable on the
+    /// literal path: the earlier form skipped it with `unsafe` and measured the same.
     #[inline(always)]
-    unsafe fn store_literals(output: &mut [u8], pos: usize, entry: u32) {
-        unsafe {
-            debug_assert!(pos + 2 <= output.len());
-            // One unaligned halfword rather than two byte stores. Written separately the pair
-            // never gets merged, and the second store's address has to be materialized on its
-            // own instead of folding into the first store's register offset.
-            let target = output.as_mut_ptr().add(pos);
-            let pair = ((entry >> 16) as u16).to_le_bytes();
-            target.cast::<[u8; 2]>().write_unaligned(pair);
-        }
+    fn store_literals(output: &mut [u8], pos: usize, entry: u32) {
+        let pair = ((entry >> 16) as u16).to_le_bytes();
+        output[pos..pos + 2].copy_from_slice(&pair);
     }
 
-    /// Copies sixteen bytes within `output`, from `source` to `dest`.
+    /// Appends a `length`-byte match to `output[..pos]`, copied from `distance` bytes back.
     ///
-    /// The ranges may overlap: the read completes into a register before the write starts,
-    /// which is exactly the semantics the overlapping-match loop below relies on. Written as
-    /// a fixed-size read and write so it stays a register pair rather than becoming a call
-    /// to `memmove`, which would spill the whole decode loop around it.
+    /// The bytes are copied sixteen at a time, so a match writes up to fifteen bytes past its
+    /// end: scratch that the next symbol overwrites or [`OUTPUT_SLACK`] holds. When the
+    /// distance is shorter than a sixteen-byte step, each pass extends the correctly filled
+    /// prefix by `distance` bytes and the run resolves itself after `ceil(length / distance)`
+    /// passes, which is the overlapping-copy semantics LZ77 requires.
     ///
-    /// # Safety
-    /// `source + 16 <= output.len()` and `dest + 16 <= output.len()`.
+    /// This is the decoder's one function that steps outside safe Rust, and it is sound for
+    /// any arguments: a single up-front check covers the whole range every pass can touch,
+    /// `pos - distance .. pos + length + 15`, so the passes need none of their own. Checked per
+    /// pass, the bounds tests measured 4-20% slower on the highly compressible streams whose
+    /// matches are long; checked once per match they cost a handful of instructions on a path
+    /// that takes ten or more cycles anyway. The caller has already established the same
+    /// facts, which the optimiser cannot see through `limit`; here the check is real, and a
+    /// bug elsewhere becomes a panic and not an out-of-bounds write.
+    ///
+    /// # Panics
+    /// If `distance` is zero or exceeds `pos`, or the range does not fit in `output`.
+    #[allow(unsafe_code, reason = "the crate's one `unsafe` block, guarded by the check above")]
     #[inline(always)]
-    unsafe fn copy16(output: &mut [u8], source: usize, dest: usize) {
-        unsafe {
-            debug_assert!(source + 16 <= output.len() && dest + 16 <= output.len());
-            let chunk = output.as_ptr().add(source).cast::<[u8; 16]>().read_unaligned();
-            output.as_mut_ptr().add(dest).cast::<[u8; 16]>().write_unaligned(chunk);
-        }
-    }
+    fn copy_match(output: &mut [u8], pos: usize, distance: usize, length: usize) {
+        let end = pos.checked_add(length).and_then(|end| end.checked_add(15));
+        assert!(
+            distance != 0 && distance <= pos && end.is_some_and(|end| end <= output.len()),
+            "match range outside the output buffer"
+        );
 
-    /// Writes sixteen bytes at `dest`.
-    ///
-    /// # Safety
-    /// `dest + 16 <= output.len()`.
-    #[inline(always)]
-    unsafe fn store16(output: &mut [u8], dest: usize, value: [u8; 16]) {
-        unsafe {
-            debug_assert!(dest + 16 <= output.len());
-            output.as_mut_ptr().add(dest).cast::<[u8; 16]>().write_unaligned(value);
+        if distance == 1 {
+            // Byte runs are the most common match in filtered image data. Both fills are
+            // safe code; the assertion above has already put `pos + length + 15` in range.
+            let byte = output[pos - 1];
+            if length <= 16 {
+                output[pos..pos + 16].fill(byte);
+            } else {
+                output[pos..pos + length].fill(byte);
+            }
+            return;
+        }
+
+        let source = pos - distance;
+        let step = distance.min(16);
+        let base = output.as_mut_ptr();
+        let mut offset = 0;
+        while offset < length {
+            // SAFETY: the assertion above gives `source + offset + 16 <= pos + offset + 16 <=
+            // pos + length + 15 + 1 <= output.len()` for every `offset < length`, so both the
+            // read and the write are in bounds. Each reads into a register before it writes,
+            // which is what an overlapping source needs, and written as fixed-size accesses
+            // they stay a register pair rather than becoming a `memmove` call.
+            unsafe {
+                let chunk = base.add(source + offset).cast::<[u8; 16]>().read_unaligned();
+                base.add(pos + offset).cast::<[u8; 16]>().write_unaligned(chunk);
+            }
+            offset += step;
         }
     }
 
@@ -1120,8 +1143,8 @@ impl Inflater {
     ///
     /// `limit` is where output stops: the end of the buffer less [`OUTPUT_SLACK`] for a
     /// one-shot decode, and the caller's budget for a segmented one. The caller guarantees
-    /// `limit + OUTPUT_SLACK <= output.len()`, which is what the unchecked stores below rely
-    /// on.
+    /// `limit + OUTPUT_SLACK <= output.len()`, which is what keeps the stores below inside
+    /// the buffer for every stream the decoder accepts.
     ///
     /// With `SEGMENTED` the two output-limit checks pause instead of erroring: the bit
     /// reader and the cursor are stored in `pause` and the caller resumes from them after
@@ -1200,18 +1223,19 @@ impl Inflater {
                     let code_bits2 = entry2 & 0xff;
                     let code_bits3 = entry3 & 0xff;
 
-                    // SAFETY: `pos <= limit` was checked above and `limit + OUTPUT_SLACK <=
-                    // output.len()`, so `pos + 2 <= output.len() - 14`. Each store below advances `pos` by at most two and
-                    // there are at most three of them, keeping every access in bounds.
-                    unsafe { Self::store_literals(output, pos, entry) };
+                    // `pos <= limit` was checked above and `limit + OUTPUT_SLACK <=
+                    // output.len()`, so `pos + 2 <= output.len() - 14`. Each store below
+                    // advances `pos` by at most two and there are at most three of them, so
+                    // none of the checks inside `store_literals` can fail.
+                    Self::store_literals(output, pos, entry);
                     pos += ((entry >> 8) & 0xf) as usize;
 
                     if entry2 & FLAG_LITERAL != 0 {
-                        unsafe { Self::store_literals(output, pos, entry2) };
+                        Self::store_literals(output, pos, entry2);
                         pos += ((entry2 >> 8) & 0xf) as usize;
 
                         if entry3 & FLAG_LITERAL != 0 {
-                            unsafe { Self::store_literals(output, pos, entry3) };
+                            Self::store_literals(output, pos, entry3);
                             pos += ((entry3 >> 8) & 0xf) as usize;
 
                             r.consume(code_bits + code_bits2 + code_bits3);
@@ -1252,8 +1276,7 @@ impl Inflater {
                         0..=255 => {
                             r.consume(secondary_bits);
                             r.refill();
-                            // SAFETY: `pos <= limit`, so one byte is in bounds.
-                            unsafe { output.as_mut_ptr().add(pos).write(symbol as u8) };
+                            output[pos] = symbol as u8;
                             pos += 1;
                             entry = litlen[r.peek(LITLEN_TABLE_BITS) as usize];
                             continue;
@@ -1330,41 +1353,10 @@ impl Inflater {
                     break 'block Err(InflateError::OutputOverflow);
                 }
 
-                // Every access below stays inside the buffer: `pos + length <= limit` was
-                // just checked and the buffer carries `OUTPUT_SLACK` bytes beyond `limit`,
-                // so writing a full 16-byte block at any offset below `pos + length` is in
-                // bounds, as is reading one from the strictly earlier `source`.
-                let source = pos - distance;
-                if distance == 1 {
-                    // Byte runs are the most common match in filtered image data.
-                    // SAFETY: `source < pos <= limit` by the two checks above, so the byte
-                    // is inside the buffer. Indexing keeps the check: `limit` is an opaque
-                    // parameter and `pos + length` a wrapping add as far as the compiler
-                    // can tell, so it cannot rebuild the invariant the note above states.
-                    // The panic edge also spills `limit` back onto the hottest literal path.
-                    let byte = unsafe { *output.get_unchecked(source) };
-                    if length <= 16 {
-                        // SAFETY: the slack window makes a full block write in bounds.
-                        unsafe { Self::store16(output, pos, [byte; 16]) };
-                    } else {
-                        output[pos..pos + length].fill(byte);
-                    }
-                } else {
-                    // Copy a fixed 16 bytes at a time. When the distance is shorter than the
-                    // step, each pass extends the correctly-filled prefix by `distance`
-                    // bytes, so the run resolves itself after `ceil(length / distance)`
-                    // passes.
-                    let step = distance.min(16);
-                    let mut offset = 0;
-                    loop {
-                        // SAFETY: see the note above the `distance == 1` branch.
-                        unsafe { Self::copy16(output, source + offset, pos + offset) };
-                        offset += step;
-                        if offset >= length {
-                            break;
-                        }
-                    }
-                }
+                // `pos + length <= limit` was just checked and the buffer carries
+                // `OUTPUT_SLACK` bytes beyond `limit`, so the copy's own range check, which
+                // does not depend on this reasoning, passes for every stream accepted here.
+                Self::copy_match(output, pos, distance, length);
                 pos += length;
             }
         };
@@ -1663,5 +1655,71 @@ mod tests {
         }
         assert!(checked > 0, "no vectors found in {}", dir.display());
         eprintln!("checked {checked} streams");
+    }
+
+    /// The match copy must reproduce the byte-at-a-time definition of an LZ77 copy for every
+    /// distance and length, including the distances shorter than its sixteen-byte step, where
+    /// each pass depends on the bytes the previous one wrote. Bytes past the match are
+    /// scratch by contract and are not compared.
+    #[test]
+    fn copy_match_matches_the_byte_at_a_time_definition() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut history = Vec::new();
+        for _ in 0..600 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            history.push((state >> 24) as u8);
+        }
+
+        for distance in [1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 100, 257, 500] {
+            for length in [3usize, 4, 5, 15, 16, 17, 18, 31, 32, 33, 64, 100, 257, 258] {
+                let pos = 520;
+                let mut got = history.clone();
+                got.resize(pos + 258 + OUTPUT_SLACK, 0xAA);
+                let mut want = got.clone();
+
+                for i in 0..length {
+                    want[pos + i] = want[pos + i - distance];
+                }
+                Inflater::copy_match(&mut got, pos, distance, length);
+                assert_eq!(
+                    got[..pos + length],
+                    want[..pos + length],
+                    "distance {distance}, length {length}"
+                );
+            }
+        }
+    }
+
+    /// A match whose range does not fit is refused before any byte is written, not partly
+    /// performed: the copy is a safe function, and its safety is this check.
+    #[test]
+    fn copy_match_refuses_a_range_outside_the_buffer() {
+        let original: Vec<u8> = (0..64u8).collect();
+        let refused = [
+            // Distance zero, and further back than the start of the output.
+            (32usize, 0usize, 4usize),
+            (8, 9, 4),
+            // The last pass would write past the end: `pos + length + 15 > len`.
+            (60, 3, 4),
+            (49, 3, 1),
+            // Arithmetic that would wrap.
+            (32, 4, usize::MAX),
+            (usize::MAX, 4, 4),
+        ];
+        for (pos, distance, length) in refused {
+            let mut buffer = original.clone();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Inflater::copy_match(&mut buffer, pos, distance, length);
+            }));
+            assert!(outcome.is_err(), "pos {pos}, distance {distance}, length {length}");
+            assert_eq!(buffer, original, "a refused match must not write");
+        }
+
+        // The tightest range that fits: `pos + length + 15 == len`.
+        let mut buffer = original.clone();
+        Inflater::copy_match(&mut buffer, 46, 3, 3);
+        assert_eq!(buffer[46..49], [43, 44, 45]);
     }
 }

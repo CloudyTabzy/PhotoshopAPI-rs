@@ -6,6 +6,93 @@ no `repository` URL, so no version headings carry compare links.
 
 ## [Unreleased]
 
+### Fixed
+
+- **16-bit greyscale with a `tRNS` key, decoded to RGBA8, made the wrong pixels
+  transparent.** The portable kernel for that shape gathered each pixel's alpha from the
+  compare mask one byte per pixel, but the 16-bit compare leaves two bytes per pixel, so
+  output pixel *n* of every eight took the mask of pixel *n* / 2: a keyed pixel in the first
+  half of a block turned pixels 2*j* and 2*j* + 1 transparent instead of itself, and one in
+  the second half turned none. Only rows that contain the key were affected, and only where
+  the kernel runs (not under `PSD_PNG_FORCE_SCALAR=1`, on bare SSE2, or on the scalar
+  backend). The 0.5.0 port introduced it; the SSE2 kernel it replaced was correct. The
+  parity tests missed it because random rows almost never contain a given 16-bit key; they
+  now plant the key, and fail on the old code on every backend.
+
+### Changed
+
+- **The inflate loop is safe Rust apart from one block.** It carried thirteen `unsafe` sites: a
+  halfword literal store, a byte read, two sixteen-byte block helpers and their call sites,
+  each resting on the caller's `pos <= limit` reasoning. The literal stores are now ordinary
+  bounds-checked slice writes, which measured the same as the unchecked form on literal-heavy
+  streams (the `noise`, `photo` and `mixed` classes that dominate real decode time). The match
+  copy is one function that is sound for any arguments: it checks the whole range every pass
+  can touch, `pos - distance .. pos + length + 15`, once per match, and keeps a single
+  `unsafe` block for the sixteen-byte pass loop. So a bug in the caller's reasoning is now a
+  panic and not an out-of-bounds write. Checking per pass instead cost 4-20% on the inflate
+  stage of highly compressible streams, and `copy_within` 15-27%, which is why the one block
+  stays. Measured against the previous build with alternating runs: summed inflate time
+  -0.1%, every stream within about 2%; whole-PNG decode summed +0.0%, `rgba8_mixed` about
+  +2% (3.79 to 3.88 ms).
+- **Adler-32 is a portable vector kernel, 5.7 times faster, with no `unsafe`.** It replaces the
+  scalar loop everywhere but aarch64 and the hand-written NEON module there, whose five
+  `unsafe` blocks could not be run or tested off that architecture. The new kernel is one
+  source against `fearless_simd`'s vectors, run on every target with a vector unit, and its
+  tests run it on each x86 backend the machine has as well as against the scalar path. On
+  x86-64 with AVX2 it runs at 19.4 GB/s against 3.4 GB/s, so a `Checks::Full` decode pays
+  about 0.4 ms instead of 2.4 ms per 8 MB of output. The hand-tuned `simd-adler32` still
+  reaches 60-70 GB/s; the gap only shows under `Checks::Full`, which is why the kernel stops
+  where it does. The kernel works in 32-byte steps with the weights applied once per step and
+  the running-`a` term carried in a vector, every lane sized to stay under the same `NMAX`
+  bound as the scalar recurrence; a test runs a full block of saturated bytes from the largest
+  possible starting pair on every backend.
+- **The crate denies `unsafe_code`,** with an `allow` naming the one function (the inflate match
+  copy) that owns the crate's only `unsafe` block, so a second one anywhere fails the build.
+- **The CRC-32 is `crc32fast`'s, and the crate has a third dependency for it.** The chunk CRC
+  runs over every compressed byte of a default decode, and the crate's own slice-by-16 ran at
+  3.2 GB/s against 60-80 GB/s for a carry-less-multiply CRC (PCLMULQDQ on x86, PMULL on
+  aarch64), which safe code and `fearless_simd` cannot reach. On well-compressed images that
+  was the 2-5% the stage profile showed; on poorly compressible ones it was most of the
+  decode. Whole-PNG decode on this machine, summed over the 16 fixtures: -11.9%, with
+  `rgba16` -65%, `rgb16` -55%, `rgba8_noise` -54%, `gray16` -40% and the well-compressed
+  photographs and gradients unchanged. The hand-written aarch64 CRC-instruction path, which
+  could not be tested off that architecture, is gone with the rest of the CRC code. The
+  `unsafe` the carry-less multiply needs stays inside `crc32fast`, which is MIT OR Apache-2.0
+  and depends only on `cfg-if`. `Crc32::new` is no longer a `const fn`.
+- **The decoder's buffer allocation is safe code.** It called `alloc_zeroed` and
+  `Vec::from_raw_parts` directly so that an allocation the system refuses became an error and
+  not an abort, while keeping the operating system's free zero pages. It now probes with
+  `try_reserve_exact`, gives the reservation straight back, and allocates with `vec![0; n]`,
+  which is the same `alloc_zeroed` underneath: whole-image decode measured the same (0.88x
+  the `png` crate on both builds, individual files within 1-3%). Zeroing by hand
+  (`try_reserve_exact` and `resize`) was the obvious safe form and cost 4-14%, which is why it
+  was not used. **This is a weaker guarantee than before.** A refusal the probe sees is still
+  an `OutOfMemory` error, but if the memory is taken by something else between the probe and
+  the allocation, `vec!` aborts. That needs the process to be out of memory to within one
+  buffer while the probe still succeeded, which is not the case the decompression-size limit
+  exists for. Getting the old guarantee back needs an `unsafe` allocation.
+- New `inflate_micro` benchmark: pure DEFLATE decode into a preallocated buffer, checksum
+  off, against `fdeflate` doing the same. The earlier `bench -- inflate` comparison timed a
+  whole-stream call with the Adler-32 on (this crate's runs at 3.4 GB/s) while the reference
+  grew its output from 1 KiB, which made the decoder look 15% slower than `fdeflate`; on the
+  like-for-like measurement it is 1.13-2.2x faster on every fixture. `checksum_micro`
+  compares the CRC-32 and Adler-32 against `crc32fast` and `simd-adler32`.
+- The parity tests run every kernel once per backend the machine supports, not only the
+  one `dispatch!` reaches: on an AVX2 machine the SSE2 and SSE4.2 lowerings of the same
+  source were never executed. A test cross-checks the backend list against the standard
+  library's CPU detection, so a backend cannot drop out and leave its tests vacuous, and
+  the conversion tests now expect the same backends the facade routes to.
+- Big-endian targets take the scalar path. The kernels bitcast between lane widths and read
+  a big-endian PNG sample as a native lane, which assumes little-endian lane layout.
+- The `Rgb` → `Rgba` widening and the indexed copy decline, instead of reporting a row
+  converted, when the target is not a whole number of pixels or (indexed) the channel count
+  is not 3 or 4. Callers never pass either today.
+- The facade and the kernels take the backend from one `Level::new()` value rather than a
+  private cache beside `fearless_simd`'s own.
+- Documentation states the crate's dependencies as they are: `fearless_simd`, its build-time
+  `#[simd]` macro crate and `crc32fast`, not `fearless_simd` alone, and not "nothing outside
+  the standard library".
+
 ## [0.5.0] - 2026-09-29
 
 ### Changed
@@ -13,7 +100,8 @@ no `repository` URL, so no version headings carry compare links.
 - **The SIMD kernels are portable.** The hand-written SSE2 `Paeth` kernel and the SSE2
   conversion kernels were replaced by one source written against `fearless_simd`'s portable
   vectors, compiled at run time for SSE2, SSE4.2, AVX2, AVX-512, NEON or wasm SIMD with the
-  scalar paths as the fallback. This gives the crate its only dependency, and it ends the
+  scalar paths as the fallback. This gives the crate two dependencies, `fearless_simd` and
+  its `#[simd]` macro crate, and it ends the
   kernels' x86-64-only status: the filter and conversion kernels now run on ARM and on the
   web, where every target previously took the scalar path. Measured in one harness against
   the SSE2 kernels they replace: 2–8% faster on `Paeth` workloads; against the scalar

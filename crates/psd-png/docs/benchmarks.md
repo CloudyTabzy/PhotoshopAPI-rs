@@ -323,6 +323,40 @@ Baseline figures, for orientation rather than as a current claim.
 Decode lands within ±10% of the `png` + `fdeflate` stack on every class, and the baseline
 already won the port's dominant class before any of the work in this document.
 
+### Inflate and the checksums, like for like (2026-09-29)
+
+The harness's `bench -- inflate` mode puts this decoder about 15% behind `fdeflate` (0.85x
+summed), and that comparison is not like for like: the decoder's side times a whole-stream
+call with the Adler-32 on (then 3.4 GB/s), and `fdeflate`'s side grows its output from 1 KiB.
+`inflate_micro` decodes into a buffer allocated once, outside the timed body, with the
+checksum off on both sides, over the IDAT streams of the 28 fixtures:
+
+| class (fixtures) | psd-png / fdeflate |
+|---|---:|
+| noise, incompressible (`noise_*`) | 1.13-1.14x |
+| photographic (`photo_*`, `rgb8_photo_2048`, `rgba8_photo_3840x2400`) | 1.16-1.51x |
+| mixed content (`rgba8_mixed_1024`) | 1.33x |
+| gradients and interface graphics (`gradient_*`, `ui_*`, palettes, greyscale) | 1.5-2.1x |
+| **summed best times, 28 streams** | **1.25x** (51.5 ms against 64.2 ms) |
+
+The two checksums against `crc32fast` and `simd-adler32`, over buffers of 1 KiB to 4 MiB
+(`checksum_micro`):
+
+| checksum | psd-png | reference | ratio |
+|---|---:|---:|---:|
+| CRC-32 | `crc32fast` | 60-80 GB/s | 1.0x |
+| Adler-32, portable `fearless_simd` kernel (AVX2) | 19.4 GB/s | 60-70 GB/s | 0.3x |
+
+The CRC-32 was this crate's own slice-by-16 at 3.2 GB/s until it was replaced by `crc32fast`,
+and that was the largest single cost the profile above understates: it runs over the
+*compressed* bytes, so "2-5% of decode" held for well-compressed images and not for poorly
+compressible ones. Whole-PNG decode of the 16 fixtures in `tmp/large` and `tmp/convert`
+(`convert_bench`, alternating runs, per-file minimum) went from 102.6 ms to 90.4 ms summed:
+`rgba16` -65%, `rgb16` -55%, `rgba8_noise` -54%, `gray16` -40%, `palette8` -22%, and no change
+on the well-compressed photographs and gradients. The Adler-32 only runs under
+`Checks::Full`. The inflate loop itself is safe apart from one block, at parity with the
+previous unsafe form (`TODO.md` section G records the variants that were not).
+
 ## Where the remaining time is
 
 The plumbing is no longer where the time is. For the port's class, streaming costs 3–4%
