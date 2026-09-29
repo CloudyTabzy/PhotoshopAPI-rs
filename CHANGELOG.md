@@ -12,6 +12,40 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.6.26] - 2026-09-29
+
+### Fixed
+
+- A 16-bit greyscale PNG with a `tRNS` key, decoded to 8-bit RGBA (the `image` feature's
+  smart-object and linked-data path), made the wrong pixels transparent: in each block of eight
+  pixels a keyed pixel in the first half turned its neighbours transparent instead of itself,
+  and one in the second half turned none. Only rows that contain the key were affected. The
+  portable kernel introduced in 0.6.25 had it; the parity tests missed it because random rows
+  almost never contain a given 16-bit key, and they now plant the key.
+
+### Changed
+
+- `psd-png` 0.5.x, subtree-synced (`263c5ac`). The decoder's `unsafe` went from 22 blocks to
+  one, in the inflate match copy, inside a function that checks its whole range first and is
+  sound for any arguments; `#![deny(unsafe_code)]` keeps it the only one. Measured against the
+  previous build with alternating runs, inflate is at parity (summed -0.1%, every stream within
+  about 2%) and against `fdeflate`, decoding into a preallocated buffer with checksums off, it
+  is 1.13-2.2x faster on every fixture.
+- The chunk CRC-32 is `crc32fast`'s: carry-less multiplication where the CPU has it, 60-80 GB/s
+  against 3.2 GB/s for the crate's own slice-by-16. It runs over every compressed byte of a
+  default decode, so it was most of the decode of poorly compressible PNGs: whole-image decode
+  over the crate's 16 fixtures is 11.9% faster in total, with 16-bit RGBA -65%, 16-bit RGB -55%,
+  noise -54% and 16-bit grey -40%, and well-compressed images unchanged.
+  **`crc32fast` is now a permanent dependency of `psd-png`** (MIT OR Apache-2.0, depending only
+  on `cfg-if`), which also removes the hand-written aarch64 CRC path that could not be tested
+  off that architecture.
+- The zlib Adler-32 is a portable vector kernel, 3.4 to 19.4 GB/s on AVX2, replacing a scalar
+  loop and a hand-written aarch64 NEON module; it is only computed under `Checks::Full`.
+- The decoder's buffer allocation is safe code: it probes with `try_reserve_exact` and then
+  allocates with `vec![0; n]`. This is a weaker guarantee than the direct fallible allocation it
+  replaces: a refusal the probe sees is still an `OutOfMemory` error, but if the memory is taken
+  between the probe and the allocation the process aborts.
+
 ## [0.6.25] - 2026-09-29
 
 ### Changed
@@ -302,9 +336,8 @@ v0.9.1 that this project ports.
   16-bit run-length-encoded samples and run-length-encoded indexed patterns.
   Fixture suites are hand-built through `psd-core`'s own writers: 20 tests
   covering every colour model, group nesting, both sample compressions, the
-  pattern channel list, and the malformed-input rejections. (Resolves the
-  scope decision in TODO item 8: the formats live in their own crate and do
-  not expand the PSD ones.)
+  pattern channel list, and the malformed-input rejections. (The formats
+  live in their own crate and do not expand the PSD ones.)
 
 ## [0.6.11] - 2026-09-28
 
