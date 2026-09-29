@@ -12,6 +12,19 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-30
+
+### Changed
+
+- A document read from disk holds its ICC profile once. `LayeredFile::icc_profile` was a copy of
+  the profile in the `image_resources` ICC block, so both stayed in memory for the document's
+  lifetime (and a save cloned both again). A read now moves the profile into `icc_profile` and
+  leaves the block in `image_resources` as an empty placeholder that keeps its position, so a
+  document that had an ICC block still writes it in the same place. `icc_profile` was already
+  what a save writes; the resource block's copy could only go stale if it was edited.
+  `ImageResources::take_icc_profile` does the move. Code that read the profile from
+  `document.image_resources.icc_profile()` should read `document.icc_profile` instead.
+
 ## [0.9.0] - 2026-09-30
 
 Saving a lazily read document no longer copies its compressed channels, and a 16/32-bit

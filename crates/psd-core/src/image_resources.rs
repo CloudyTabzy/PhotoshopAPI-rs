@@ -142,6 +142,16 @@ impl ImageResources {
         })
     }
 
+    /// Move the profile bytes out of the first `ICCProfile` block, leaving an
+    /// empty block where it was so the section keeps its layout. `None` when
+    /// there is no such block.
+    pub fn take_icc_profile(&mut self) -> Option<Vec<u8>> {
+        self.blocks.iter_mut().find_map(|block| match block {
+            ResourceBlock::IccProfile(icc) => Some(std::mem::take(&mut icc.data)),
+            _ => None,
+        })
+    }
+
     /// Replace the first `ResolutionInfo` block, or append one.
     pub fn set_resolution_info(&mut self, info: ResolutionInfoBlock) {
         for block in &mut self.blocks {
@@ -405,6 +415,40 @@ mod tests {
         assert_eq!(&bytes[18..20], &32767u16.to_be_bytes()); // 0.5 * 65535 truncated
         assert_eq!(&bytes[20..22], &1u16.to_be_bytes()); // ppi
         assert_eq!(&bytes[22..24], &2u16.to_be_bytes()); // cm
+    }
+
+    #[test]
+    fn taking_the_icc_profile_leaves_an_empty_block_in_place() {
+        let mut resources = ImageResources::new();
+        resources.push(ResourceBlock::Raw(RawResourceBlock {
+            id: 1005,
+            name: PascalString::new("", 2),
+            data: vec![1, 2],
+        }));
+        resources.push(ResourceBlock::IccProfile(IccProfileBlock::new(vec![
+            0xAA, 0xBB, 0xCC,
+        ])));
+        resources.push(ResourceBlock::Raw(RawResourceBlock {
+            id: 1060,
+            name: PascalString::new("", 2),
+            data: vec![3],
+        }));
+
+        assert_eq!(resources.take_icc_profile(), Some(vec![0xAA, 0xBB, 0xCC]));
+        // The block is still there, between its neighbours, and empty.
+        assert!(matches!(
+            resources.blocks(),
+            [
+                ResourceBlock::Raw(_),
+                ResourceBlock::IccProfile(icc),
+                ResourceBlock::Raw(_)
+            ] if icc.data().is_empty()
+        ));
+        // Putting a profile back fills that block rather than adding another.
+        resources.set_icc_profile(IccProfileBlock::new(vec![0xAA, 0xBB, 0xCC]));
+        assert_eq!(resources.blocks().len(), 3);
+        assert_eq!(resources.icc_profile().unwrap().data(), [0xAA, 0xBB, 0xCC]);
+        assert_eq!(ImageResources::new().take_icc_profile(), None);
     }
 
     #[test]

@@ -227,11 +227,15 @@ pub struct LayeredFile<T: BitDepth> {
     pub source_depth: u16,
     /// Document resolution in dots per inch.
     pub dpi: f32,
-    /// Raw ICC profile bytes (empty = no profile).
+    /// Raw ICC profile bytes (empty = no profile). This is the document's only
+    /// copy: a read moves the profile here out of `image_resources`, and a save
+    /// writes it back into the resource block.
     pub icc_profile: Vec<u8>,
     /// Palette/toning data, preserved verbatim.
     pub color_mode_data: ColorModeData,
-    /// Document image resources, preserved (DPI/ICC are refreshed on write).
+    /// Document image resources, preserved (DPI is refreshed on write). Its ICC
+    /// block, when the file had one, is an empty placeholder that keeps the
+    /// block's position; the profile itself is [`icc_profile`](Self::icc_profile).
     pub image_resources: ImageResources,
     /// Undocumented legacy section, preserved verbatim.
     pub global_layer_mask_info: GlobalLayerMaskInfo,
@@ -444,16 +448,16 @@ impl<T: BitDepth> LayeredFile<T> {
             });
         }
 
-        let dpi = file
-            .image_resources
+        let mut image_resources = file.image_resources;
+        let dpi = image_resources
             .resolution_info()
             .map(|info| info.horizontal_resolution.to_f32())
             .unwrap_or(72.0);
-        let icc_profile = file
-            .image_resources
-            .icc_profile()
-            .map(|icc| icc.data().to_vec())
-            .unwrap_or_default();
+        // The profile moves out of its resource block, which stays as an empty
+        // placeholder that keeps its place among the resources. `icc_profile` is
+        // what a save writes, so a copy left in the block would only sit in memory
+        // beside it, and could disagree with it.
+        let icc_profile = image_resources.take_icc_profile().unwrap_or_default();
         let mut layer_and_mask_info = file.layer_and_mask_info;
 
         let mut document = Self {
@@ -466,7 +470,7 @@ impl<T: BitDepth> LayeredFile<T> {
             dpi,
             icc_profile,
             color_mode_data: file.color_mode_data,
-            image_resources: file.image_resources,
+            image_resources,
             global_layer_mask_info: layer_and_mask_info.global_layer_mask_info,
             document_blocks: layer_and_mask_info
                 .additional_layer_info

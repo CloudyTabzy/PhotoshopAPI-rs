@@ -247,3 +247,29 @@ fn a_lazy_document_writes_its_compressed_channels_without_copying_them() {
         }
     }
 }
+
+#[test]
+fn a_read_document_holds_its_icc_profile_once() {
+    let profile: Vec<u8> = (0..2049u32).map(|i| (i % 251) as u8).collect();
+    let mut document = synthetic::<u8>(16, 2);
+    document.icc_profile = profile.clone();
+    let written = document.to_bytes().unwrap();
+
+    let back = LayeredFile::<u8>::from_bytes(&written).unwrap();
+    assert_eq!(back.icc_profile, profile);
+    // The resource block stays, keeping its place, but does not hold a second copy.
+    let block = back.image_resources.icc_profile().expect("the block stays");
+    assert!(block.data().is_empty());
+    // The save writes the profile back into the block, and reads identically.
+    assert_eq!(back.to_bytes().unwrap(), written);
+
+    // Clearing the profile removes the block; setting one adds it back.
+    let mut cleared = back;
+    cleared.icc_profile.clear();
+    let without = cleared.to_bytes().unwrap();
+    let reread = LayeredFile::<u8>::from_bytes(&without).unwrap();
+    assert!(reread.icc_profile.is_empty());
+    assert!(reread.image_resources.icc_profile().is_none());
+    cleared.icc_profile = profile.clone();
+    assert_eq!(cleared.to_bytes().unwrap(), written);
+}
