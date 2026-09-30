@@ -12,6 +12,28 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-09-30
+
+### Added
+
+- `LayeredFile::duplicate_layer`: copy a layer — with its subtree, group divider, mask,
+  effects, text and every preserved block — directly above the original, the way Photoshop's
+  Duplicate Layer does. The copy gets a fresh `lyid` when the original's is taken.
+- `LayeredFile::copy_layer_from`: copy a layer from another document into this one, on top.
+  The copy owns its data, so the source document does not have to outlive it, and layer ids
+  are made unique against the destination. Document-level data a layer only *references* (a
+  smart object's linked file, a pattern) is not copied — the same shape as a Photoshop
+  duplicate, which also leaves the reference pointing at the original.
+- The layer-id guard now sits in the one place every detached-tree insertion passes through
+  (`allocate_tree`), so a tree re-inserted after its id was taken again is covered too.
+
+### Tests
+
+- A duplicate lands directly above its original, in the same parent, with the pixels and a
+  fresh id, and both survive a write; a duplicated group brings its subtree; a layer and a
+  group copied between documents arrive on top, leave the source untouched, and keep the
+  destination's ids unique.
+
 ## [0.9.4] - 2026-09-30
 
 ### Added

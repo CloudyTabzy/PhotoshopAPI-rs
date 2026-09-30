@@ -278,6 +278,43 @@ impl<T: BitDepth> LayeredFile<T> {
         Ok(id)
     }
 
+    /// Copy a layer — with its subtree, group divider, mask, effects, text and
+    /// every preserved block — directly above the original, returning the
+    /// copy's id.
+    ///
+    /// The copy gets a fresh `lyid` when the original had one, since Photoshop
+    /// expects layer ids to be unique. Smart-object and linked-file *references*
+    /// come along as they are; the document-level blocks they point at are not
+    /// copied, exactly as in Photoshop's own "Duplicate Layer".
+    pub fn duplicate_layer(&mut self, id: LayerId) -> Result<LayerId> {
+        let parent = self.parent(id);
+        let tree = self.clone_tree(id)?;
+        let children = self.children(parent).ok_or_else(unknown_layer)?;
+        let position = children
+            .iter()
+            .position(|&child| child == id)
+            .ok_or_else(unknown_layer)?;
+        // The real-layer index of the original; the copy goes above it.
+        let above = children[..=position]
+            .iter()
+            .filter(|&&child| !self.is_divider(child))
+            .count();
+        self.insert_layer_tree(parent, Some(above), tree)
+    }
+
+    /// Copy a layer (with its subtree) from another document into this one, on
+    /// top, returning the new id.
+    ///
+    /// The copy owns its data, so the source document does not have to outlive
+    /// it. Layer ids are made unique against this document. Document-level data
+    /// a layer only *references* — a smart object's linked file, a pattern — is
+    /// not copied; bring it over with the same layer from a document that has
+    /// it, or relink afterwards.
+    pub fn copy_layer_from(&mut self, source: &LayeredFile<T>, id: LayerId) -> Result<LayerId> {
+        let tree = source.clone_tree(id)?;
+        self.insert_layer_tree(None, None, tree)
+    }
+
     /// Insert a single layer; see [`insert_layer_tree`](Self::insert_layer_tree).
     pub fn insert_layer(
         &mut self,
@@ -418,7 +455,38 @@ impl<T: BitDepth> LayeredFile<T> {
         LayerTree { layer, children }
     }
 
+    /// A detached copy of `id`'s subtree, shaped like [`take_tree`]'s result:
+    /// the group's child ids are dropped (they only mean something inside a
+    /// document) and the dividers between them are left behind, since a group
+    /// gets one synthesized on write.
+    fn clone_tree(&self, id: LayerId) -> Result<LayerTree<T>> {
+        let layer = self.layer(id).ok_or_else(unknown_layer)?;
+        let children: Vec<LayerId> = layer
+            .group()
+            .map(|group| group.children.clone())
+            .unwrap_or_default();
+        let mut tree = LayerTree::new(layer.clone());
+        for child in children {
+            if self.is_divider(child) {
+                continue;
+            }
+            tree.children.push(self.clone_tree(child)?);
+        }
+        Ok(tree)
+    }
+
+    /// Whether `id` names a section divider.
+    fn is_divider(&self, id: LayerId) -> bool {
+        self.layer(id)
+            .is_some_and(|layer| matches!(layer.kind, LayerKind::SectionDivider(_)))
+    }
+
     /// Push a detached tree into fresh slots, returning its root id.
+    ///
+    /// This is the one place every detached-tree insertion passes through, so
+    /// the layer-id guard lives here: a duplicate, a cross-document copy, or a
+    /// re-inserted tree whose id was taken again while it was detached all get
+    /// fresh ids where they collide.
     fn allocate_tree(&mut self, tree: LayerTree<T>) -> LayerId {
         let LayerTree {
             mut layer,
@@ -427,6 +495,7 @@ impl<T: BitDepth> LayeredFile<T> {
         if let Some(group) = layer.group_mut() {
             group.children.clear();
         }
+        self.ensure_unique_layer_id(&mut layer);
         self.slots_mut().push(Some(layer));
         let id = self.slots().len() - 1;
         let child_ids: Vec<LayerId> = children
@@ -633,5 +702,170 @@ mod tests {
         document.insert_layer_tree(None, None, tree).unwrap();
         let reread = LayeredFile::<u8>::from_bytes(&document.to_bytes().unwrap()).unwrap();
         assert!(reread.find_layer("Outer/Inner/Leaf").is_some());
+    }
+
+    /// A duplicate lands directly above its original, carries the pixels and
+    /// blocks, and gets a fresh id; the document still round-trips.
+    #[test]
+    fn duplicating_a_layer_places_a_copy_above_it() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/documents/Groups/Groups_8bit.psd"
+        );
+        let mut document = LayeredFile::<u8>::read(path).unwrap();
+        let id = document.find_layer("Group/GroupedLayer").unwrap();
+        let original_id = document.layer(id).unwrap().layer_id();
+        let pixels = document.layer(id).unwrap().channels().cloned();
+
+        let copy = document.duplicate_layer(id).unwrap();
+        assert_ne!(copy, id);
+        let parent = document.parent(id);
+        assert_eq!(
+            document.parent(copy),
+            parent,
+            "the copy stays in the same parent"
+        );
+        assert_eq!(document.layer(copy).unwrap().name, "GroupedLayer");
+        assert_eq!(
+            document.layer(copy).unwrap().channels().cloned(),
+            pixels,
+            "the copy carries the pixels"
+        );
+        assert_ne!(
+            document.layer(copy).unwrap().layer_id(),
+            original_id,
+            "the copy gets a fresh id"
+        );
+        assert_eq!(document.layer(id).unwrap().layer_id(), original_id);
+
+        // The copy sits directly above the original in file order.
+        let children = document.children(parent).unwrap().to_vec();
+        let physical = |id: LayerId| children.iter().position(|&child| child == id).unwrap();
+        assert_eq!(physical(copy), physical(id) + 1, "directly above");
+
+        // Both copies survive a write; ids change on re-read, so match by name.
+        let back = LayeredFile::<u8>::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        let grouped: Vec<LayerId> = back
+            .flatten()
+            .into_iter()
+            .filter(|&id| back.layer(id).unwrap().name == "GroupedLayer")
+            .collect();
+        assert_eq!(grouped.len(), 2, "the original and its copy");
+        assert_eq!(
+            back.parent(grouped[0]),
+            back.parent(grouped[1]),
+            "both sit in the same group"
+        );
+    }
+
+    /// Duplicating a group brings its whole subtree, and the copy's divider is
+    /// synthesized on write, so both groups survive a round trip.
+    #[test]
+    fn duplicating_a_group_copies_its_subtree() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/documents/Groups/Groups_8bit.psd"
+        );
+        let mut document = LayeredFile::<u8>::read(path).unwrap();
+        let group = document.find_layer("GroupTopLevel/GroupNested").unwrap();
+        let children_before = names(&document, Some(group));
+
+        let copy = document.duplicate_layer(group).unwrap();
+        assert_eq!(document.layer(copy).unwrap().name, "GroupNested");
+        assert_eq!(names(&document, Some(copy)), children_before);
+        assert_eq!(document.parent(copy), document.parent(group));
+
+        let back = LayeredFile::<u8>::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        let copies: Vec<&str> = back
+            .flatten()
+            .into_iter()
+            .filter(|&id| back.layer(id).unwrap().name == "GroupNested")
+            .map(|_| "GroupNested")
+            .collect();
+        assert_eq!(copies.len(), 2, "both groups survive the write");
+        // The copied group's children came along.
+        let copied = back
+            .flatten()
+            .into_iter()
+            .filter(|&id| back.layer(id).unwrap().name == "GroupNested")
+            .map(|id| names(&back, Some(id)))
+            .find(|names| names != &children_before);
+        assert!(
+            copied.is_none(),
+            "both copies carry the same children: {copied:?}"
+        );
+    }
+
+    /// A layer copied from another document arrives on top, owns its data, and
+    /// leaves the source untouched.
+    #[test]
+    fn copying_a_layer_between_documents() {
+        let groups = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/documents/Groups/Groups_8bit.psd"
+        );
+        let source = LayeredFile::<u8>::read(groups).unwrap();
+        let id = source.find_layer("Group/GroupedLayer").unwrap();
+        let source_ids: Vec<u32> = source
+            .flatten()
+            .into_iter()
+            .filter_map(|id| source.layer(id).unwrap().layer_id())
+            .collect();
+
+        let mut target = LayeredFile::<u8>::new(ColorMode::Rgb, 8, 8).unwrap();
+        let copy = target.copy_layer_from(&source, id).unwrap();
+        assert_eq!(target.layer(copy).unwrap().name, "GroupedLayer");
+        assert_eq!(target.children(None).unwrap().len(), 1, "arrives on top");
+        assert_eq!(
+            target.layer(copy).unwrap().channels(),
+            source.layer(id).unwrap().channels()
+        );
+
+        // A group comes over with its subtree.
+        let group = source.find_layer("Group").unwrap();
+        let copied_group = target.copy_layer_from(&source, group).unwrap();
+        assert_eq!(names(&target, Some(copied_group)), ["GroupedLayer"]);
+
+        // The source is untouched, and its ids are still unique there.
+        assert_eq!(
+            source
+                .flatten()
+                .into_iter()
+                .filter_map(|id| source.layer(id).unwrap().layer_id())
+                .collect::<Vec<_>>(),
+            source_ids
+        );
+
+        // Copying the same layer twice gives two unique ids in the target.
+        let second = target.copy_layer_from(&source, id).unwrap();
+        let ids: Vec<u32> = target
+            .flatten()
+            .into_iter()
+            .filter_map(|id| target.layer(id).unwrap().layer_id())
+            .collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(ids.len(), unique.len(), "ids are unique: {ids:?}");
+        assert_ne!(copy, second);
+
+        // Everything arrives after a write (a copied group gains its divider
+        // record there, so counts differ by design).
+        let back = LayeredFile::<u8>::from_bytes(&target.to_bytes().unwrap()).unwrap();
+        let copied_names: Vec<String> = back
+            .flatten()
+            .into_iter()
+            .map(|id| back.layer(id).unwrap().name.clone())
+            .filter(|name| name != "</Layer group>")
+            .collect();
+        assert_eq!(
+            copied_names
+                .iter()
+                .filter(|name| *name == "GroupedLayer")
+                .count(),
+            3,
+            "two copies plus the one inside the copied group: {copied_names:?}"
+        );
+        assert!(back.find_layer("Group/GroupedLayer").is_some());
     }
 }

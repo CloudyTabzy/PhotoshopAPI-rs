@@ -983,7 +983,12 @@ impl<T: BitDepth> LayeredFile<T> {
     }
 
     /// Give `layer` a fresh `lyid` when its own is already taken.
-    fn ensure_unique_layer_id(&mut self, layer: &mut Layer<T>) {
+    ///
+    /// Called from every insertion path (`add_layer`, `add_layer_to_group`, and
+    /// `allocate_tree` for detached trees), so a clone or a copy from another
+    /// document cannot repeat an id. A document read from disk never passes
+    /// through here, so its own ids round-trip untouched.
+    pub(crate) fn ensure_unique_layer_id(&mut self, layer: &mut Layer<T>) {
         let Some(existing) = layer.layer_id() else {
             return;
         };
