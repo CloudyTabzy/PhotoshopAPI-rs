@@ -966,6 +966,10 @@ impl<T: BitDepth> Layer<T> {
     }
 
     /// Whether every property of the layer is locked (`lspf` "lock all").
+    ///
+    /// This is the layer's own flag, as the file records it. Photoshop also
+    /// treats a layer as locked when an ancestor group is locked, a state the
+    /// format does not store anywhere: walk the parents for that reading.
     pub fn is_locked(&self) -> bool {
         self.protection_flags() & LOCK_ALL != 0
     }
@@ -1032,6 +1036,10 @@ impl<T: BitDepth> Layer<T> {
     }
 
     /// Display color in the layers panel (`lclr`); `None` when absent.
+    ///
+    /// This is the layer's own value. Photoshop lets descendants inherit a
+    /// group's label when their own is absent, which the format does not
+    /// record either: walk the parents for that reading.
     pub fn display_color(&self) -> LayerColor {
         self.blocks
             .get(TaggedBlockKey::LCLR)
