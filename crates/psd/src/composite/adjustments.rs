@@ -726,7 +726,8 @@ fn gradient_map(color: [f32; 3], settings: &GradientMap) -> [f32; 3] {
     super::effects::gradient_sample(&gradient, luminance(color))
 }
 
-/// A fill layer's content: solid color or gradient over the whole canvas.
+/// A fill layer's content: solid color, gradient or pattern over the whole
+/// canvas, with the layer's masks.
 pub fn fill_content<T: BitDepth>(
     compositor: &Compositor<'_, T>,
     layer: &Layer<T>,
@@ -735,7 +736,7 @@ pub fn fill_content<T: BitDepth>(
     let Some(block) = blocks.iter().find(|block| {
         matches!(
             block.kind,
-            AdjustmentKind::SolidColor | AdjustmentKind::GradientFill
+            AdjustmentKind::SolidColor | AdjustmentKind::GradientFill | AdjustmentKind::PatternFill
         )
     }) else {
         return Ok(None);
@@ -749,13 +750,37 @@ pub fn fill_content<T: BitDepth>(
         compositor.document.height as i32,
         compositor.document.width as i32,
     );
+    let Some(mut content) =
+        paint_content(compositor, layer, &settings.descriptor, block.kind, rect)
+    else {
+        return Ok(None);
+    };
+    // A shape's path is part of its content (`shapes`); a plain fill layer
+    // takes every mask as coverage.
+    if compositor.has_vector_path(layer) {
+        content.mask = compositor.user_mask_plane(layer, rect);
+        content = compositor.shape_content(layer, content);
+    } else {
+        content.mask = compositor.mask_plane(layer, rect);
+    }
+    Ok(Some(content))
+}
+
+/// One paint (solid, gradient or pattern) over `rect`, from the descriptor a
+/// fill layer or a vector stroke carries.
+pub(super) fn paint_content<T: BitDepth>(
+    compositor: &Compositor<'_, T>,
+    layer: &Layer<T>,
+    descriptor: &Descriptor,
+    kind: AdjustmentKind,
+    rect: Rect,
+) -> Option<Content> {
     let mut content = Content::new(rect);
     let width = content.width();
     let height = content.height();
-    match block.kind {
+    match kind {
         AdjustmentKind::SolidColor => {
-            let color = settings
-                .descriptor
+            let color = descriptor
                 .get("Clr ")
                 .and_then(descriptor_rgb)
                 .unwrap_or([0.0, 0.0, 0.0]);
@@ -767,12 +792,10 @@ pub fn fill_content<T: BitDepth>(
             }
         }
         AdjustmentKind::GradientFill => {
-            let gradient = settings
-                .descriptor
+            let gradient = descriptor
                 .get("Grad")
                 .and_then(descriptor_descriptor)
                 .and_then(psd_core::Gradient::from_descriptor);
-            let descriptor = &settings.descriptor;
             let enumerated = |key: &str| {
                 descriptor
                     .get(key)
@@ -805,12 +828,21 @@ pub fn fill_content<T: BitDepth>(
                         )
                     }),
             };
-            let span = Span {
-                left: rect.left as f32,
-                top: rect.top as f32,
-                width: width as f32,
-                height: height as f32,
-            };
+            // "Align with Layer" spans the shape's own bounds (the canvas for a
+            // plain fill layer).
+            let aligned = descriptor
+                .get("Algn")
+                .and_then(DescriptorValue::as_bool)
+                .unwrap_or(true);
+            let span = compositor
+                .shape_span(layer)
+                .filter(|_| aligned)
+                .unwrap_or(Span {
+                    left: rect.left as f32,
+                    top: rect.top as f32,
+                    width: width as f32,
+                    height: height as f32,
+                });
             if let Some(ramp) = ramp {
                 for y in 0..height {
                     for x in 0..width {
@@ -831,8 +863,43 @@ pub fn fill_content<T: BitDepth>(
                 }
             }
         }
-        _ => return Ok(None),
+        AdjustmentKind::PatternFill => {
+            let reference = descriptor
+                .get("Ptrn")
+                .and_then(descriptor_descriptor)
+                .and_then(psd_core::PatternRef::from_descriptor);
+            let phase = descriptor
+                .get("phase")
+                .and_then(descriptor_descriptor)
+                .map(|phase| {
+                    psd_core::Offset::percent(
+                        descriptor_number(phase, "Hrzn").unwrap_or(0.0),
+                        descriptor_number(phase, "Vrtc").unwrap_or(0.0),
+                    )
+                });
+            let context = compositor.effect_context(layer, rect);
+            let sampler = context.sampler(
+                reference.as_ref(),
+                descriptor_number(descriptor, "Scl "),
+                descriptor_number(descriptor, "Angl"),
+                descriptor.get("Algn").and_then(DescriptorValue::as_bool),
+                phase,
+            );
+            if let Some(sampler) = sampler {
+                for y in 0..height {
+                    for x in 0..width {
+                        let (color, alpha) =
+                            sampler.sample(rect.left + x as i32, rect.top + y as i32);
+                        let index = y * width + x;
+                        content.color[0][index] = color[0];
+                        content.color[1][index] = color[1];
+                        content.color[2][index] = color[2];
+                        content.alpha[index] = alpha;
+                    }
+                }
+            }
+        }
+        _ => return None,
     }
-    content.mask = compositor.mask_plane(layer, rect);
-    Ok(Some(content))
+    Some(content)
 }

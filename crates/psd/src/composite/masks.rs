@@ -43,7 +43,7 @@ impl<T: BitDepth> Compositor<'_, T> {
             .unwrap_or_default()
     }
 
-    fn user_mask_plane(&self, layer: &Layer<T>, rect: Rect) -> Option<Vec<f32>> {
+    pub(super) fn user_mask_plane(&self, layer: &Layer<T>, rect: Rect) -> Option<Vec<f32>> {
         let record = layer.mask_record()?;
         if record.flags.disabled() {
             return None;
@@ -95,6 +95,32 @@ impl<T: BitDepth> Compositor<'_, T> {
             apply_density(&mut plane, density);
         }
         Some(crop(&plane, working, rect))
+    }
+
+    /// The bounds of a shape layer's path (pixels with any coverage, before
+    /// feather and density), for "Align with Layer". `None` without a path.
+    pub(super) fn shape_span(&self, layer: &Layer<T>) -> Option<super::ramp::Span> {
+        let mask = layer.vector_mask().ok()??;
+        let (width, height) = (self.document.width, self.document.height);
+        let canvas = Rect::new(0, 0, height as i32, width as i32);
+        let plane = rasterize_path(&mask.path, width, height, canvas);
+        let (mut left, mut top, mut right, mut bottom) = (usize::MAX, usize::MAX, 0, 0);
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                if plane[y * width as usize + x] > 0.0 {
+                    left = left.min(x);
+                    right = right.max(x + 1);
+                    top = top.min(y);
+                    bottom = bottom.max(y + 1);
+                }
+            }
+        }
+        (left != usize::MAX).then(|| super::ramp::Span {
+            left: left as f32,
+            top: top as f32,
+            width: (right - left) as f32,
+            height: (bottom - top) as f32,
+        })
     }
 
     fn vector_mask_plane(&self, layer: &Layer<T>, rect: Rect) -> Option<Vec<f32>> {

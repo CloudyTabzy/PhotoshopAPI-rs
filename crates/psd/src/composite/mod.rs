@@ -33,11 +33,15 @@
 //! math is exact.
 
 mod adjustments;
+mod bevel;
 mod blend;
+mod contour;
 mod effects;
 mod masks;
 mod paths;
 mod ramp;
+mod shapes;
+mod stroke;
 mod tile;
 
 use psd_core::{BlendMode, ColorMode, LayerBlendingRanges, Result};
@@ -388,6 +392,7 @@ impl<T: BitDepth> Compositor<'_, T> {
         // it, outer effects composite below.
         let mut outer: Vec<effects::OuterPlane> = Vec::new();
         let mut strokes: Vec<effects::StrokePlane> = Vec::new();
+        let mut bevel: Vec<effects::OuterPlane> = Vec::new();
         // Interior effects paint over the canvas after the layer, with their
         // own blend modes, when the layer's mode or fill opacity would
         // otherwise change them (Blend Interior Effects as Group is off).
@@ -420,6 +425,10 @@ impl<T: BitDepth> Compositor<'_, T> {
                     }
                 }
                 strokes = effects::build_strokes(&content, &shape, &effects, canvas_rect);
+                // Bevel and emboss shade from the layer's own matte, before any
+                // stroke knockout, and composite over everything else.
+                let context = self.effect_context(layer, canvas_rect);
+                bevel = bevel::build(&content, &coverage, &effects, &context);
                 // Without overprint a stroke's band knocks the layer's own
                 // content out.
                 for plane in &strokes {
@@ -484,6 +493,18 @@ impl<T: BitDepth> Compositor<'_, T> {
         }
         for plane in strokes.iter().filter(|plane| plane.above_content()) {
             self.draw_stroke(plane, canvas, layer);
+        }
+        for plane in &bevel {
+            self.blend_content(
+                &plane.content,
+                canvas,
+                layer,
+                None,
+                plane.blend_mode,
+                self.opacity(layer, false),
+                None,
+                false,
+            );
         }
 
         // The clip base coverage a clipped layer above sees is the layer's own
@@ -1031,8 +1052,10 @@ impl<T: BitDepth> Compositor<'_, T> {
     }
 
     fn is_fill_layer(&self, layer: &Layer<T>) -> bool {
+        // A solid, gradient or pattern fill layer, or a shape layer, which
+        // Photoshop stores as a fill layer with a vector mask and no pixels.
         match &layer.kind {
-            LayerKind::Adjustment(_) => layer
+            LayerKind::Adjustment(_) | LayerKind::Shape(_) => layer
                 .adjustments()
                 .map(|blocks| {
                     blocks.iter().any(|block| {
@@ -1045,7 +1068,6 @@ impl<T: BitDepth> Compositor<'_, T> {
                     })
                 })
                 .unwrap_or(false),
-            LayerKind::Shape(_) => false,
             _ => false,
         }
     }

@@ -121,6 +121,9 @@ pub fn padded_rect(rect: &Rect, effects: &LayerEffects) -> Rect {
     for stroke in effects.strokes.iter().filter(|s| enabled(s.enabled)) {
         grow(stroke.size.unwrap_or(0.0));
     }
+    if let Some(bevel) = effects.bevel.as_ref().filter(|b| enabled(b.enabled)) {
+        grow(super::bevel::padding(bevel));
+    }
     out
 }
 
@@ -420,7 +423,7 @@ pub(crate) struct EffectContext<'a> {
 
 impl EffectContext<'_> {
     /// The tile sampler for a pattern reference, placed.
-    fn sampler(
+    pub(super) fn sampler(
         &self,
         pattern: Option<&psd_core::PatternRef>,
         scale: Option<f64>,

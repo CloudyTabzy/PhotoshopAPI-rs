@@ -3,6 +3,7 @@
 //! Every `.psd`/`.psb` under `fixtures/` runs through the same named checks:
 //!
 //! - `read`: an eager read at the header's bit depth.
+//! - `composite`: the compositor flattens the document to the canvas size.
 //! - `views`: every on-demand view parses (effects, adjustments, vector data,
 //!   artboards, smart objects, linked layers, document paths, and artboard
 //!   settings).
@@ -29,7 +30,7 @@ use psd::{BitDepth, ChannelStore, LayerKind, LayeredFile};
 /// `relative/path.psd:check` entries that are known to fail today.
 const KNOWN_FAILURES: &[&str] = &[];
 
-const CHECKS: [&str; 4] = ["read", "views", "roundtrip", "stable"];
+const CHECKS: [&str; 5] = ["read", "views", "composite", "roundtrip", "stable"];
 
 fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")

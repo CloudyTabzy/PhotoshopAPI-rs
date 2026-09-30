@@ -300,3 +300,25 @@ fn a_blurred_shadow_is_centred_on_the_shifted_matte() {
         );
     }
 }
+
+/// The port's generated shape document: a filled rectangle and ellipse, a
+/// stroked rectangle with no fill, and a triangle cut by a vector mask.
+#[test]
+fn generated_shape_layers_render_from_their_paths() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/generated/Vectors/vector_shapes_8bit.psd");
+    let doc = LayeredFile::<u8>::read(path).unwrap();
+    let image = flatten(&doc);
+    let background = image.pixel(1, 1);
+    // The red rectangle and the blue ellipse are filled from their paths.
+    let red = image.pixel(10, 10);
+    assert!(red[0] > 150 && red[1] < 80 && red[2] < 80, "{red:?}");
+    let blue = image.pixel(46, 12);
+    assert!(blue[2] > 150 && blue[0] < 80, "{blue:?}");
+    // The ellipse leaves its corners to the background.
+    assert_eq!(image.pixel(36, 4), background);
+    // The stroked rectangle has a green band and an untouched middle.
+    let band = image.pixel(6, 45);
+    assert!(band[1] > 120 && band[0] < 100, "{band:?}");
+    assert_eq!(image.pixel(16, 45), background);
+}

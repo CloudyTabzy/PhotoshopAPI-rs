@@ -69,6 +69,21 @@ fn cubic(p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), t: f64)
 /// Coverage of the even-odd union of `polygons` over `rect` (document
 /// pixels), row-major, `0.0..=1.0`.
 pub(crate) fn fill_even_odd(polygons: &[Polygon], rect: Rect) -> Vec<f32> {
+    fill(polygons, rect, FillRule::EvenOdd)
+}
+
+/// How overlapping contours decide what is inside.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillRule {
+    /// Inside where an odd number of edges lie to the left.
+    EvenOdd,
+    /// Inside where the signed edge count is not zero: same-orientation
+    /// pieces union.
+    NonZero,
+}
+
+/// Coverage of `polygons` over `rect` (document pixels) under a fill rule.
+pub(crate) fn fill(polygons: &[Polygon], rect: Rect, rule: FillRule) -> Vec<f32> {
     let width = rect.width().max(0) as usize;
     let height = rect.height().max(0) as usize;
     let mut plane = vec![0.0f32; width * height];
@@ -76,8 +91,9 @@ pub(crate) fn fill_even_odd(polygons: &[Polygon], rect: Rect) -> Vec<f32> {
         return plane;
     }
 
-    // Edges as (y_min, y_max, x_at_y_min, dx/dy) in rect-local pixels.
-    let mut edges: Vec<(f64, f64, f64, f64)> = Vec::new();
+    // Edges as (y_min, y_max, x_at_y_min, dx/dy, direction) in rect-local
+    // pixels; the direction is +1 for an edge that runs downward.
+    let mut edges: Vec<(f64, f64, f64, f64, i32)> = Vec::new();
     for polygon in polygons {
         let count = polygon.len();
         if count < 2 {
@@ -91,12 +107,18 @@ pub(crate) fn fill_even_odd(polygons: &[Polygon], rect: Rect) -> Vec<f32> {
             if y0 == y1 {
                 continue;
             }
-            let (top, bottom, x_top, x_bottom) = if y0 < y1 {
-                (y0, y1, x0, x1)
+            let (top, bottom, x_top, x_bottom, direction) = if y0 < y1 {
+                (y0, y1, x0, x1, 1)
             } else {
-                (y1, y0, x1, x0)
+                (y1, y0, x1, x0, -1)
             };
-            edges.push((top, bottom, x_top, (x_bottom - x_top) / (bottom - top)));
+            edges.push((
+                top,
+                bottom,
+                x_top,
+                (x_bottom - x_top) / (bottom - top),
+                direction,
+            ));
         }
     }
     edges.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -104,7 +126,8 @@ pub(crate) fn fill_even_odd(polygons: &[Polygon], rect: Rect) -> Vec<f32> {
     let weight = 1.0 / SUBSAMPLES as f32;
     let mut next_edge = 0;
     let mut active: Vec<usize> = Vec::new();
-    let mut crossings: Vec<f64> = Vec::new();
+    let mut crossings: Vec<(f64, i32)> = Vec::new();
+    let mut spans: Vec<(f64, f64)> = Vec::new();
     let mut diff = vec![0.0f32; width + 2];
     for row in 0..height {
         diff.fill(0.0);
@@ -122,13 +145,34 @@ pub(crate) fn fill_even_odd(polygons: &[Polygon], rect: Rect) -> Vec<f32> {
             }
             crossings.clear();
             crossings.extend(active.iter().map(|&edge| {
-                let (top, _, x_top, slope) = edges[edge];
-                x_top + (y - top) * slope
+                let (top, _, x_top, slope, direction) = edges[edge];
+                (x_top + (y - top) * slope, direction)
             }));
-            crossings.sort_by(|a, b| a.total_cmp(b));
-            for pair in crossings.chunks_exact(2) {
-                let xa = pair[0].clamp(0.0, width as f64);
-                let xb = pair[1].clamp(0.0, width as f64);
+            crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+            spans.clear();
+            match rule {
+                FillRule::EvenOdd => {
+                    for pair in crossings.chunks_exact(2) {
+                        spans.push((pair[0].0, pair[1].0));
+                    }
+                }
+                FillRule::NonZero => {
+                    let mut winding = 0;
+                    let mut start = 0.0;
+                    for &(x, direction) in &crossings {
+                        let before = winding;
+                        winding += direction;
+                        if before == 0 && winding != 0 {
+                            start = x;
+                        } else if before != 0 && winding == 0 {
+                            spans.push((start, x));
+                        }
+                    }
+                }
+            }
+            for &(start, end) in &spans {
+                let xa = start.clamp(0.0, width as f64);
+                let xb = end.clamp(0.0, width as f64);
                 if xb <= xa {
                     continue;
                 }
@@ -213,9 +257,16 @@ pub(crate) fn rasterize_path(path: &VectorPath, width: u32, height: u32, rect: R
     let starts_full = path.initial_fill_rule() == Some(1)
         || groups.first().is_some_and(|group| group.operation == 2);
     let mut accumulated = vec![if starts_full { 1.0 } else { 0.0 }; pixels];
-    for group in &groups {
+    for (index, group) in groups.iter().enumerate() {
         let coverage = fill_even_odd(&group.polygons, rect);
-        combine(&mut accumulated, &coverage, group.operation);
+        // On an empty accumulator the first shape is exactly itself, whatever
+        // its operation (Subtract alone starts from everything).
+        let operation = if index == 0 && !starts_full {
+            1
+        } else {
+            group.operation
+        };
+        combine(&mut accumulated, &coverage, operation);
     }
     accumulated
 }

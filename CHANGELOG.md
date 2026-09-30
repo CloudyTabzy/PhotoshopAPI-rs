@@ -12,6 +12,34 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-09-30
+
+Bevel and emboss, and shape layers. On the reference flattens every shape fixture now
+matches (fills, pattern and gradient fills, boolean combines, strokes, feather) and the
+bevel and emboss fixtures match to a few /255.
+
+### Added
+
+- **Shape layers**: a fill layer with a vector mask (how Photoshop stores a shape, with no
+  pixels) is rendered from its path. The fill is a solid colour, a gradient (geometry aligned
+  to the path's own bounds) or a pattern; `vstk` strokes render with their width, alignment
+  (inside, centre, outside), caps, joins, miter limit, dashes and paint (solid, gradient or
+  pattern) and opacity; the path's feather blurs the whole shape, stroke included, without
+  clamping at the canvas edge, and its density shows the fill at `1 - density` outside the
+  path. Subpath combines follow Photoshop: the first shape on an empty path is exactly itself.
+- **Bevel and emboss**: Inner and Outer Bevel, Emboss and Pillow Emboss; Smooth, Chisel Hard
+  and Chisel Soft; Soften; Depth, Direction, Size, angle and altitude; highlight and shadow
+  colours, modes and opacities; the Contour sub-option (a Linear contour steepens the slope by
+  100 / Range, any other curve reshapes the profile); the Gloss Contour; and Texture (the
+  pattern's luminance perturbs the height). Stroke Emboss is not rendered yet.
+- `composite` contours: natural-cubic curves with corner points, baked into a 256-entry table.
+- The corpus harness gained a `composite` check: every document flattens to the canvas size
+  without panicking.
+
+### Changed
+
+- The stroker unions its pieces under the non-zero fill rule.
+
 ## [0.11.1] - 2026-09-30
 
 The compositor is now checked against Photoshop's own flattens of 50 small test documents
