@@ -467,6 +467,9 @@ impl<T: BitDepth> Compositor<'_, T> {
         // own blend modes, when the layer's mode or fill opacity would
         // otherwise change them (Blend Interior Effects as Group is off).
         let mut interior_after: Option<(psd_core::LayerEffects, Vec<f32>, Rect)> = None;
+        // A Normal layer whose fill opacity scales its pixels but not its
+        // interior effects draws them as a second pass over its own pixels.
+        let mut effect_pass: Option<(Content, Vec<f32>)> = None;
         if self.options.effects {
             if let Some(effects) = self.typed_effects(layer) {
                 let canvas_rect = Rect::new(
@@ -481,7 +484,19 @@ impl<T: BitDepth> Compositor<'_, T> {
                     effects::fold_interior_overlays(&mut content, &matte, &effects, &context);
                     effects::paint_interior(&mut content, &matte, &effects);
                 } else if effects::has_interior_effects(&effects) {
-                    interior_after = Some((effects.clone(), matte.clone(), canvas_rect));
+                    if mode == BlendMode::NORMAL {
+                        let context = self.effect_context(layer, canvas_rect);
+                        let mut folded = Content::new(content.rect);
+                        folded.color = content.color.clone();
+                        folded.alpha = vec![1.0; content.alpha.len()];
+                        effects::fold_interior_overlays(&mut folded, &matte, &effects, &context);
+                        effects::paint_interior(&mut folded, &matte, &effects);
+                        let weight = effects::interior_strength(&effects);
+                        let cover = matte.iter().map(|value| value * weight).collect();
+                        effect_pass = Some((folded, cover));
+                    } else {
+                        interior_after = Some((effects.clone(), matte.clone(), canvas_rect));
+                    }
                 }
                 outer = effects::build_outer(&content, &matte, &effects, canvas_rect);
                 // A stroke follows the pixel shape, reshaped by the mask only
@@ -553,6 +568,18 @@ impl<T: BitDepth> Compositor<'_, T> {
             clip_base,
             true,
         );
+        if let Some((folded, cover)) = &effect_pass {
+            self.blend_content(
+                folded,
+                canvas,
+                layer,
+                Some(cover),
+                BlendMode::NORMAL,
+                self.opacity(layer, false),
+                None,
+                false,
+            );
+        }
         if let Some((effects, pre_knockout, canvas_rect)) = &interior_after {
             self.paint_group_interior(
                 canvas,

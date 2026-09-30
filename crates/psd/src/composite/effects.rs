@@ -99,6 +99,49 @@ pub(crate) fn has_interior_effects(effects: &LayerEffects) -> bool {
         || effects.satin.as_ref().is_some_and(|s| enabled(s.enabled))
         || effects.color_overlays.iter().any(|o| enabled(o.enabled))
         || effects.gradient_overlays.iter().any(|o| enabled(o.enabled))
+        || effects
+            .pattern_overlay
+            .as_ref()
+            .is_some_and(|o| enabled(o.enabled))
+}
+
+/// How much of a layer's silhouette its interior effects cover: the union of
+/// the overlays' opacities, or full strength when a soft interior effect
+/// (satin, glow, inner shadow) is present.
+pub(crate) fn interior_strength(effects: &LayerEffects) -> f32 {
+    let soft = effects.inner_shadows.iter().any(|s| enabled(s.enabled))
+        || effects
+            .inner_glow
+            .as_ref()
+            .is_some_and(|g| enabled(g.enabled))
+        || effects.satin.as_ref().is_some_and(|s| enabled(s.enabled));
+    if soft {
+        return 1.0;
+    }
+    let mut clear = 1.0f32;
+    for opacity in effects
+        .color_overlays
+        .iter()
+        .filter(|o| enabled(o.enabled))
+        .map(|o| o.opacity)
+        .chain(
+            effects
+                .gradient_overlays
+                .iter()
+                .filter(|o| enabled(o.enabled))
+                .map(|o| o.opacity),
+        )
+        .chain(
+            effects
+                .pattern_overlay
+                .iter()
+                .filter(|o| enabled(o.enabled))
+                .map(|o| o.opacity),
+        )
+    {
+        clear *= 1.0 - opacity_scale(opacity);
+    }
+    1.0 - clear
 }
 
 /// The rect a layer's exterior effects can reach beyond the layer's bounds.

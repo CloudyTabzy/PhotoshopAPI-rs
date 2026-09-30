@@ -15,11 +15,18 @@
 //!   (zero second derivative at both ends, clamped outside) — Photoshop's own
 //!   interpolation — per-channel tables first, then the composite table.
 //!
-//! Approximated, and documented as such: Hue/Saturation uses the standard HSL
-//! model rather than Photoshop's measured wheel tables (master and colorize;
-//! the six ranges are not applied), Exposure works in the sRGB domain,
-//! Vibrance follows the usual falloff, Selective Color, Color Lookup and
-//! Content Generator are not rendered, and pattern fills are not generated.
+//! - **Exposure** applies gain and offset in linear light, then gamma, then
+//!   re-encodes.
+//! - **Hue/Saturation** runs Photoshop's integer pipeline (lightness per
+//!   channel, then a saturation ratio on the half chroma and a hue turn in
+//!   whole steps of a 1530-step wheel; colorize rebuilds from the source's
+//!   lightness).
+//!
+//! Approximated, and documented as such: the saturation ratio is a closed
+//! form where Photoshop's is a measured table, the six Hue/Saturation ranges
+//! are not applied, Vibrance follows the usual falloff, Color Balance is a
+//! smooth approximation, and Selective Color, Color Lookup and Content
+//! Generator are not rendered.
 
 use psd_core::adjustments::{
     AdjustmentData, AdjustmentKind, ColorBalanceValues, Curve, CurveData, CurvePoint, GradientMap,
@@ -195,9 +202,21 @@ impl Operation {
                 // under one level.)
                 let gain = 2f32.powf(exposure.exposure);
                 let inverse_gamma = 1.0 / exposure.gamma.max(0.01);
+                let gray = self.gray;
                 color.map(|value| {
-                    let linear = srgb_to_linear(value) * gain + exposure.offset;
-                    linear_to_srgb(linear.max(0.0).powf(inverse_gamma))
+                    // A grayscale document's working space is gamma 1.8.
+                    let linear = if gray {
+                        value.powf(1.8)
+                    } else {
+                        srgb_to_linear(value)
+                    } * gain
+                        + exposure.offset;
+                    let corrected = linear.max(0.0).powf(inverse_gamma);
+                    if gray {
+                        corrected.clamp(0.0, 1.0).powf(1.0 / 1.8)
+                    } else {
+                        linear_to_srgb(corrected)
+                    }
                 })
             }
             AdjustmentData::HueSaturation(settings) => hue_saturation(
@@ -510,80 +529,110 @@ fn sample_lut(table: &[f32; 256], value: f32) -> f32 {
 // Colour adjustments
 // ---------------------------------------------------------------------------
 
-fn rgb_to_hsl(color: [f32; 3]) -> (f32, f32, f32) {
-    let max = color[0].max(color[1]).max(color[2]);
-    let min = color[0].min(color[1]).min(color[2]);
-    let lightness = 0.5 * (max + min);
-    let delta = max - min;
-    if delta <= 1e-6 {
-        return (0.0, 0.0, lightness);
-    }
-    let saturation = if lightness > 0.5 {
-        delta / (2.0 - max - min).max(1e-6)
-    } else {
-        delta / (max + min).max(1e-6)
-    };
-    let hue = if max == color[0] {
-        ((color[1] - color[2]) / delta).rem_euclid(6.0)
-    } else if max == color[1] {
-        (color[2] - color[0]) / delta + 2.0
-    } else {
-        (color[0] - color[1]) / delta + 4.0
-    } / 6.0;
-    (hue, saturation, lightness)
-}
-
-fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> [f32; 3] {
-    let c = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
-    let h = hue * 6.0;
-    let x = c * (1.0 - (h.rem_euclid(2.0) - 1.0).abs());
-    let (r, g, b) = match h.floor() as i32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = lightness - c / 2.0;
-    [
-        (r + m).clamp(0.0, 1.0),
-        (g + m).clamp(0.0, 1.0),
-        (b + m).clamp(0.0, 1.0),
-    ]
-}
-
 fn hue_saturation(
     color: [f32; 3],
     values: HueSaturationValues,
     colorize: bool,
     colorization: HueSaturationValues,
 ) -> [f32; 3] {
-    if colorize {
-        let target = (f32::from(colorization.hue) / 360.0).rem_euclid(1.0);
-        let saturation = (f32::from(colorization.saturation) / 100.0).clamp(0.0, 1.0);
-        let lightness = (0.5 + f32::from(colorization.lightness) / 200.0).clamp(0.0, 1.0);
-        return hsl_to_rgb(target, saturation, lightness);
+    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as i32;
+    let rgb = [byte(color[0]), byte(color[1]), byte(color[2])];
+    let out = if colorize {
+        colorize_bytes(rgb, colorization)
+    } else {
+        master_bytes(rgb, values)
+    };
+    out.map(|value| value as f32 / 255.0)
+}
+
+/// Photoshop's lightness slider: the percent is quantised to a byte first,
+/// then each channel moves toward white or black by that step.
+fn lightness_byte(value: i32, percent: i32) -> i32 {
+    if percent == 0 {
+        return value;
     }
-    let (hue, saturation, lightness) = rgb_to_hsl(color);
-    let hue = (hue + f32::from(values.hue) / 360.0).rem_euclid(1.0);
-    let saturation_delta = f32::from(values.saturation) / 100.0;
-    let saturation = if saturation_delta >= 0.0 {
-        saturation + (1.0 - saturation) * saturation_delta
+    let step = percent.abs() * 255 / 100;
+    if percent > 0 {
+        value + ((255 - value) * step + 127) / 255
     } else {
-        saturation * (1.0 + saturation_delta)
-    };
-    let lightness_delta = f32::from(values.lightness) / 100.0;
-    let lightness = if lightness_delta >= 0.0 {
-        lightness + (1.0 - lightness) * lightness_delta
+        (value * (255 - step) + 127) / 255
+    }
+}
+
+/// The saturation slider's ratio on the half chroma: `1 + s` below zero and
+/// `1 / (1 - s)` above, bounded at the slider's end (fitted to Photoshop).
+fn saturation_ratio(percent: i32) -> f32 {
+    let s = percent.clamp(-100, 100) as f32 / 100.0;
+    if s <= 0.0 {
+        1.0 + s
     } else {
-        lightness * (1.0 + lightness_delta)
+        (1.0 / (1.0 - s).max(1.0 / 128.0)).min(128.0)
+    }
+}
+
+/// A position on Photoshop's 1530-step hue wheel (six sectors of 255).
+fn wheel_position(rgb: [i32; 3], max: i32, min: i32) -> f32 {
+    let chroma = (max - min) as f32;
+    let [r, g, b] = rgb.map(|value| value as f32);
+    let hue = if max == rgb[0] {
+        ((g - b) / chroma).rem_euclid(6.0)
+    } else if max == rgb[1] {
+        (b - r) / chroma + 2.0
+    } else {
+        (r - g) / chroma + 4.0
     };
-    hsl_to_rgb(
-        hue.clamp(0.0, 1.0),
-        saturation.clamp(0.0, 1.0),
-        lightness.clamp(0.0, 1.0),
-    )
+    hue * 255.0
+}
+
+/// Rebuild a colour from a wheel position, a lightness and a half chroma: the
+/// high channel is `light + round(half)`, the low `light − floor(half)`, and
+/// the middle one interpolates by the position within its sector.
+fn from_wheel(position: f32, light: i32, half: f32) -> [i32; 3] {
+    let position = position.rem_euclid(1530.0);
+    let sector = (position / 255.0) as usize;
+    let fraction = (position - sector as f32 * 255.0) / 255.0;
+    let high = light + (half + 0.5).floor() as i32;
+    let low = light - half.floor() as i32;
+    let rising = low + (((high - low) as f32) * fraction + 0.5).floor() as i32;
+    let falling = low + (((high - low) as f32) * (1.0 - fraction) + 0.5).floor() as i32;
+    let [r, g, b] = match sector {
+        0 => [high, rising, low],
+        1 => [falling, high, low],
+        2 => [low, high, rising],
+        3 => [low, falling, high],
+        4 => [rising, low, high],
+        _ => [high, low, falling],
+    };
+    [r.clamp(0, 255), g.clamp(0, 255), b.clamp(0, 255)]
+}
+
+fn master_bytes(rgb: [i32; 3], values: HueSaturationValues) -> [i32; 3] {
+    // Lightness runs first and per channel, then the integer HSL stages.
+    let rgb = rgb.map(|value| lightness_byte(value, i32::from(values.lightness)));
+    let max = rgb[0].max(rgb[1]).max(rgb[2]);
+    let min = rgb[0].min(rgb[1]).min(rgb[2]);
+    if max == min {
+        // Neutrals are never tinted.
+        return rgb;
+    }
+    let light = (max + min) >> 1;
+    let half = (max - min) as f32 / 2.0;
+    let limit = (light.min(255 - light) as f32).max(half);
+    let half = (half * saturation_ratio(i32::from(values.saturation))).min(limit);
+    // The hue turns by a whole number of wheel steps.
+    let steps = (f32::from(values.hue) * 4.25 + 0.5).floor();
+    let position = wheel_position(rgb, max, min) + steps;
+    from_wheel(position, light, half)
+}
+
+fn colorize_bytes(rgb: [i32; 3], colorization: HueSaturationValues) -> [i32; 3] {
+    let max = rgb[0].max(rgb[1]).max(rgb[2]);
+    let min = rgb[0].min(rgb[1]).min(rgb[2]);
+    let light = lightness_byte((max + min) >> 1, i32::from(colorization.lightness));
+    let saturation = f32::from(colorization.saturation).clamp(0.0, 100.0) / 100.0;
+    let half = light.min(255 - light) as f32 * saturation;
+    let position = f32::from(colorization.hue).rem_euclid(360.0) * 4.25;
+    from_wheel(position, light, half)
 }
 
 fn color_balance(color: [f32; 3], settings: &psd_core::adjustments::ColorBalance) -> [f32; 3] {

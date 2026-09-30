@@ -12,6 +12,19 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-09-30
+
+### Fixed
+
+- Hue/Saturation runs Photoshop's integer pipeline instead of a float HSL model: the lightness
+  slider per channel, then a saturation ratio on the half chroma and a hue turn in whole steps
+  of a 1530-step wheel (master within 2/255 of Photoshop); colorize rebuilds from the source's
+  lightness. The six per-range adjustments are still not applied.
+- Exposure on a grayscale document works in gamma 1.8, its working space.
+- A Normal layer with a fill opacity below 100% still shows its pattern, gradient and color
+  overlays, glows and inner shadows at the layer's opacity (they ignore the fill); an overlay
+  pattern overlay counts as an interior effect.
+
 ## [0.11.3] - 2026-09-30
 
 The compositor is now also checked against the merged image Photoshop stored in real documents
