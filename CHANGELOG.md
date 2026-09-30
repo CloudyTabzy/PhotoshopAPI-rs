@@ -12,6 +12,32 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-30
+
+### Changed (breaking)
+
+- `SectionDivider::from_raw` returns `SectionDivider` rather than `Option<_>`, and the enum
+  gained `Unknown(u32)`: a record that carries an `lsct` block is a divider record whatever
+  its type value says. `as_raw` keeps an unknown value byte for byte, and `is_known` reports
+  whether the value is one of the four the format defines.
+
+### Fixed
+
+- A divider whose `lsct` type value this build does not know was read as a pixel layer, so its
+  group lost its pair and the next save synthesized a second divider — one extra layer record
+  per group. Such a record now keeps its pairing, its place in the tree and its bytes. No file
+  in the ~600-document sweep carries an unknown value today (real files use 0-3), so this
+  closes a latent class rather than a live bug: a newer Photoshop, or a patched file, would
+  have hit it.
+
+### Tests
+
+- A round-trip test patches every bounding divider of a group fixture to `0xcafebabe` and
+  requires the tree to keep its shape, the unknown value to survive the write, and the re-read
+  document to hold the same records.
+- The corpus harness now takes a directory-prefix entry with a `*` check, so a corpus that
+  keeps deliberately malformed files can be swept cleanly instead of pinning each file.
+
 ## [0.9.6] - 2026-09-30
 
 ### Added
@@ -21,8 +47,10 @@ v0.9.1 that this project ports.
   literal, the `Txt` descriptor string, the legacy ranges), then the run structure is
   rebuilt: every run starts from the layer's first run's style — Photoshop's own
   inheritance — so the differences are set afterwards with `style_run_mut`, which indexes
-  runs in order. Paragraph runs are split on the text's ``-terminated lines, and a
-  trailing `` is appended when the text does not end with one, since Photoshop's
+  runs in order. Paragraph runs are split on the text's `
+`-terminated lines, and a
+  trailing `
+` is appended when the text does not end with one, since Photoshop's
   `RunLengthArray` covers it. Lengths that are zero or do not cover the whole text are
   refused before anything changes.
 

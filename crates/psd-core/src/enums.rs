@@ -300,6 +300,12 @@ impl ChannelId {
 
 /// Section divider type stored in an `lsct` tagged block
 /// (`Enum::SectionDivider`): group start/end markers.
+///
+/// A record that carries `lsct` at all is a divider record, so an unrecognized
+/// value is kept as [`Unknown`](Self::Unknown) rather than read as a pixel
+/// layer: the block's presence is what pairs a divider with its group, and a
+/// value this build does not know (a newer Photoshop, or a patched file) must
+/// still round-trip instead of gaining a second divider on the next save.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SectionDivider {
     /// `0` — any other type of layer.
@@ -310,16 +316,18 @@ pub enum SectionDivider {
     ClosedFolder,
     /// `3` — bounding section divider (end of a group).
     BoundingSection,
+    /// Any other value, kept verbatim.
+    Unknown(u32),
 }
 
 impl SectionDivider {
-    pub fn from_raw(raw: u32) -> Option<Self> {
+    pub fn from_raw(raw: u32) -> Self {
         match raw {
-            0 => Some(Self::Any),
-            1 => Some(Self::OpenFolder),
-            2 => Some(Self::ClosedFolder),
-            3 => Some(Self::BoundingSection),
-            _ => None,
+            0 => Self::Any,
+            1 => Self::OpenFolder,
+            2 => Self::ClosedFolder,
+            3 => Self::BoundingSection,
+            other => Self::Unknown(other),
         }
     }
 
@@ -329,7 +337,13 @@ impl SectionDivider {
             Self::OpenFolder => 1,
             Self::ClosedFolder => 2,
             Self::BoundingSection => 3,
+            Self::Unknown(raw) => raw,
         }
+    }
+
+    /// Whether this is one of the four values the format defines.
+    pub const fn is_known(self) -> bool {
+        !matches!(self, Self::Unknown(_))
     }
 }
 
@@ -660,9 +674,17 @@ mod tests {
     #[test]
     fn section_divider_round_trips() {
         for raw in 0u32..=3 {
-            assert_eq!(SectionDivider::from_raw(raw).unwrap().as_raw(), raw);
+            assert_eq!(SectionDivider::from_raw(raw).as_raw(), raw);
         }
-        assert!(SectionDivider::from_raw(4).is_none());
+        // An unrecognized value is kept, not dropped.
+        assert_eq!(SectionDivider::from_raw(4), SectionDivider::Unknown(4));
+        assert_eq!(SectionDivider::from_raw(4).as_raw(), 4);
+        assert!(!SectionDivider::from_raw(4).is_known());
+        assert_eq!(
+            SectionDivider::from_raw(0xcafe_babe).as_raw(),
+            0xcafe_babe,
+            "a patched file's value survives"
+        );
     }
 
     #[test]

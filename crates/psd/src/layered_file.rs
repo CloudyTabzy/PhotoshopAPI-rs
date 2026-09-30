@@ -628,9 +628,7 @@ impl<T: BitDepth> LayeredFile<T> {
         let divider = blocks
             .get(TaggedBlockKey::LSCT)
             .and_then(|block| block.data.get(..4))
-            .and_then(|bytes| {
-                SectionDivider::from_raw(u32::from_be_bytes(bytes.try_into().unwrap()))
-            });
+            .map(|bytes| SectionDivider::from_raw(u32::from_be_bytes(bytes.try_into().unwrap())));
 
         let has_text_metadata = blocks.get(TaggedBlockKey::new(*b"TySh")).is_some()
             || blocks.get(TaggedBlockKey::new(*b"Txt2")).is_some();
@@ -769,8 +767,11 @@ impl<T: BitDepth> LayeredFile<T> {
         });
         let carries_shape_settings = has_vector_mask && has_shape_fill;
         let kind = match divider {
-            Some(SectionDivider::BoundingSection) => {
-                LayerKind::SectionDivider(SectionDivider::BoundingSection)
+            // Any `lsct` value this build does not know is still a divider
+            // record: it keeps its pairing (and its bytes) instead of being
+            // read as a pixel layer and gaining a synthesized divider on save.
+            Some(kind @ (SectionDivider::BoundingSection | SectionDivider::Unknown(_))) => {
+                LayerKind::SectionDivider(kind)
             }
             // Groups keep only their mask channels; their color/alpha
             // channels are the empty stubs Photoshop writes for every group.

@@ -704,6 +704,70 @@ mod tests {
         assert!(reread.find_layer("Outer/Inner/Leaf").is_some());
     }
 
+    /// A divider record whose `lsct` value this build does not know still pairs
+    /// with its group, so the tree keeps its shape and a save cannot add a
+    /// second divider.
+    #[test]
+    fn an_unknown_section_divider_type_keeps_its_pairing() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/documents/Groups/Groups_8bit.psd"
+        );
+        let original = LayeredFile::<u8>::read(path).unwrap();
+        let expected = original.flatten().len();
+
+        // Patch every bounding-section divider (`lsct` type 3) to a value the
+        // enum does not define, the way a newer Photoshop or a patched file
+        // could.
+        let mut bytes = std::fs::read(path).unwrap();
+        let mut patched = 0;
+        let mut at = 0;
+        while let Some(found) = bytes[at..]
+            .windows(16)
+            .position(|window| window.starts_with(b"8BIMlsct") && window[12..16] == [0, 0, 0, 3])
+        {
+            let start = at + found + 12;
+            bytes[start..start + 4].copy_from_slice(&0xcafe_babeu32.to_be_bytes());
+            patched += 1;
+            at = start + 4;
+        }
+        assert!(patched > 0, "the fixture must carry bounding dividers");
+
+        let document = LayeredFile::<u8>::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            document.flatten().len(),
+            expected,
+            "the divider records keep their place in the tree"
+        );
+        assert!(
+            document
+                .flatten()
+                .into_iter()
+                .any(|id| document.layer(id).is_some_and(|layer| matches!(
+                    layer.kind,
+                    LayerKind::SectionDivider(kind) if !kind.is_known()
+                ))),
+            "the unknown divider is still a divider layer"
+        );
+        // The written document keeps the same records (no second divider for
+        // the group) and the unknown value itself, byte for byte. The whole
+        // file is not compared: the writer's transparency-channel rule is a
+        // separate, deliberate difference.
+        let written = document.to_bytes().unwrap();
+        assert!(
+            written
+                .windows(4)
+                .any(|window| window == 0xcafe_babeu32.to_be_bytes()),
+            "the unknown divider value survives the write"
+        );
+        let back = LayeredFile::<u8>::from_bytes(&written).unwrap();
+        assert_eq!(
+            back.flatten().len(),
+            expected,
+            "the re-read document has the same records"
+        );
+    }
+
     /// A duplicate lands directly above its original, carries the pixels and
     /// blocks, and gets a fresh id; the document still round-trips.
     #[test]

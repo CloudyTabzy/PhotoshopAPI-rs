@@ -481,14 +481,28 @@ fn corpus_failures_match_the_pinned_list() {
 /// Deliberate differences in an external corpus: files whose round trip is
 /// *normalized* rather than byte-exact, each with its reason. Anything not
 /// listed here is a failure, so a new one stands out in the report.
-const EXTRA_CORPUS_KNOWN: &[(&str, &str, &str)] = &[(
-    "visibility.psd",
-    "roundtrip",
-    concat!(
-        "the record carries no transparency channel, which Photoshop reads as ",
-        "its Background layer; the writer synthesizes one (the 0.6.14 rule)"
+/// Extra-corpus files whose checks are expected to differ, as
+/// `(path suffix or directory prefix, check or "*", reason)`. A first entry
+/// ending in `/` matches everything under that directory.
+const EXTRA_CORPUS_KNOWN: &[(&str, &str, &str)] = &[
+    (
+        "visibility.psd",
+        "roundtrip",
+        concat!(
+            "the record carries no transparency channel, which Photoshop reads as ",
+            "its Background layer; the writer synthesizes one (the 0.6.14 rule)"
+        ),
     ),
-)];
+    (
+        "errors/",
+        "*",
+        concat!(
+            "one corpus keeps deliberately malformed files here (a bad signature, ",
+            "an out-of-range depth, a patched divider type, ...); rejecting them is ",
+            "the design, and the robustness probe covers them instead"
+        ),
+    ),
+];
 
 #[test]
 fn extra_corpus_passes_every_check() {
@@ -503,7 +517,12 @@ fn extra_corpus_passes_every_check() {
         match EXTRA_CORPUS_KNOWN
             .iter()
             .find(|(known_file, known_check, _)| {
-                file.ends_with(known_file) && check == *known_check
+                let path_matches = if let Some(dir) = known_file.strip_suffix('/') {
+                    file.starts_with(dir)
+                } else {
+                    file.ends_with(known_file)
+                };
+                path_matches && (*known_check == "*" || check == *known_check)
             }) {
             Some((_, _, reason)) => known.push(format!("  {name}: {message} ({reason})")),
             None => unknown.push(format!("  {name}: {message}")),

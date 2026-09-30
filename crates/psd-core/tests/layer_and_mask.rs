@@ -215,7 +215,7 @@ fn groups_expose_section_divider_blocks() {
                 .additional_layer_info
                 .as_ref()
                 .and_then(|ali| ali.get(TaggedBlockKey::LSCT))
-                .and_then(|block| {
+                .map(|block| {
                     let raw = u32::from_be_bytes(block.data[..4].try_into().unwrap());
                     SectionDivider::from_raw(raw)
                 })

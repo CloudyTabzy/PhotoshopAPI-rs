@@ -2011,7 +2011,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             SectionDivider::from_raw(u32::from_be_bytes(block.data[..4].try_into().unwrap())),
-            Some(SectionDivider::OpenFolder)
+            SectionDivider::OpenFolder
         );
     }
 }
