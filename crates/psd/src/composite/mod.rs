@@ -35,6 +35,10 @@
 mod adjustments;
 mod blend;
 mod effects;
+mod masks;
+mod paths;
+mod ramp;
+mod tile;
 
 use psd_core::{BlendMode, ColorMode, LayerBlendingRanges, Result};
 
@@ -186,12 +190,34 @@ impl Content {
     }
 }
 
+/// A coverage plane over a document-space rect; zero outside it.
+pub(crate) struct Plane {
+    pub rect: Rect,
+    pub data: Vec<f32>,
+}
+
+impl Plane {
+    pub fn at(&self, x: i32, y: i32) -> f32 {
+        if x < self.rect.left || y < self.rect.top || x >= self.rect.right || y >= self.rect.bottom
+        {
+            return 0.0;
+        }
+        let width = self.rect.width() as usize;
+        self.data
+            .get((y - self.rect.top) as usize * width + (x - self.rect.left) as usize)
+            .copied()
+            .unwrap_or(0.0)
+    }
+}
+
 /// The compositing engine for one document.
 struct Compositor<'a, T: BitDepth> {
     document: &'a LayeredFile<T>,
     options: CompositeOptions,
     /// 8-bit documents get Photoshop's byte-domain blend rounding.
     byte_domain: bool,
+    /// The document's pattern tiles, decoded once.
+    patterns: Vec<psd_core::pattern::Pattern>,
 }
 
 impl<T: BitDepth> LayeredFile<T> {
@@ -206,6 +232,11 @@ impl<T: BitDepth> LayeredFile<T> {
             document: self,
             options,
             byte_domain: T::DEPTH == 8,
+            patterns: if options.effects {
+                self.patterns()
+            } else {
+                Vec::new()
+            },
         };
         let mut canvas = Canvas::new(self.width, self.height);
         compositor.composite_children(None, &mut canvas)?;
@@ -281,7 +312,7 @@ impl<T: BitDepth> Compositor<'_, T> {
             if !clipped_layer.is_visible() {
                 continue;
             }
-            self.composite_layer(clipped_id, canvas, base_coverage.as_deref())?;
+            self.composite_layer(clipped_id, canvas, base_coverage.as_ref())?;
         }
         Ok(())
     }
@@ -293,8 +324,8 @@ impl<T: BitDepth> Compositor<'_, T> {
         &self,
         id: usize,
         canvas: &mut Canvas,
-        clip_base: Option<&[f32]>,
-    ) -> Result<Option<Vec<f32>>> {
+        clip_base: Option<&Plane>,
+    ) -> Result<Option<Plane>> {
         let Some(layer) = self.document.layer(id) else {
             return Ok(None);
         };
@@ -306,7 +337,7 @@ impl<T: BitDepth> Compositor<'_, T> {
             }
             LayerKind::Adjustment(_) => {
                 if self.options.adjustments {
-                    self.apply_adjustment(layer, canvas)?;
+                    self.apply_adjustment(layer, canvas, clip_base)?;
                 }
                 Ok(None)
             }
@@ -319,12 +350,28 @@ impl<T: BitDepth> Compositor<'_, T> {
         &self,
         layer: &Layer<T>,
         canvas: &mut Canvas,
-        clip_base: Option<&[f32]>,
-    ) -> Result<Option<Vec<f32>>> {
+        clip_base: Option<&Plane>,
+    ) -> Result<Option<Plane>> {
         let mut content = self.layer_content(layer)?;
-        let Some(mut content) = content.take() else {
+        let Some(content) = content.take() else {
             return Ok(None);
         };
+        self.composite_resolved(layer, content, canvas, clip_base, true, layer.blend_mode)
+    }
+
+    /// Run a resolved content through the layer pipeline: effects, coverage,
+    /// blend. `with_fill` scales the content by the layer's fill opacity (a
+    /// group ignores it); `mode` is the blend mode the content meets the
+    /// backdrop with.
+    fn composite_resolved(
+        &self,
+        layer: &Layer<T>,
+        mut content: Content,
+        canvas: &mut Canvas,
+        clip_base: Option<&Plane>,
+        with_fill: bool,
+        mode: BlendMode,
+    ) -> Result<Option<Plane>> {
         if content.width() == 0 || content.height() == 0 {
             return Ok(None);
         }
@@ -339,42 +386,149 @@ impl<T: BitDepth> Compositor<'_, T> {
 
         // Effects: overlays fold into the color, interior effects paint above
         // it, outer effects composite below.
-        let mut outer: Option<Content> = None;
+        let mut outer: Vec<effects::OuterPlane> = Vec::new();
+        let mut strokes: Vec<effects::StrokePlane> = Vec::new();
+        // Interior effects paint over the canvas after the layer, with their
+        // own blend modes, when the layer's mode or fill opacity would
+        // otherwise change them (Blend Interior Effects as Group is off).
+        let mut interior_after: Option<(psd_core::LayerEffects, Vec<f32>, Rect)> = None;
         if self.options.effects {
             if let Some(effects) = self.typed_effects(layer) {
-                effects::fold_interior_overlays(&mut content, &effects);
-                effects::paint_interior(&mut content, &coverage, &effects);
-                let canvas_rect = Rect::new(0, 0, canvas.height as i32, canvas.width as i32);
+                let canvas_rect = Rect::new(
+                    canvas.origin.1,
+                    canvas.origin.0,
+                    canvas.origin.1 + canvas.height as i32,
+                    canvas.origin.0 + canvas.width as i32,
+                );
+                let as_group = self.interior_as_group(layer, mode, with_fill);
+                if as_group {
+                    let context = self.effect_context(layer, canvas_rect);
+                    effects::fold_interior_overlays(&mut content, &coverage, &effects, &context);
+                    effects::paint_interior(&mut content, &coverage, &effects);
+                } else if effects::has_interior_effects(&effects) {
+                    interior_after = Some((effects.clone(), coverage.clone(), canvas_rect));
+                }
                 outer = effects::build_outer(&content, &coverage, &effects, canvas_rect);
+                // A stroke follows the pixel shape, reshaped by the mask only
+                // where the mask is fully black.
+                let mut shape = content.alpha.clone();
+                if let Some(mask) = &content.mask {
+                    for (value, mask) in shape.iter_mut().zip(mask.iter()) {
+                        if *mask <= 0.0 {
+                            *value = 0.0;
+                        }
+                    }
+                }
+                strokes = effects::build_strokes(&content, &shape, &effects, canvas_rect);
+                // Without overprint a stroke's band knocks the layer's own
+                // content out.
+                for plane in &strokes {
+                    for (index, value) in coverage.iter_mut().enumerate() {
+                        *value *= plane.content_factor(index);
+                    }
+                }
             }
         }
 
-        if let Some(outer) = outer.as_ref() {
+        // Exterior effects draw below the layer, each with its own blend mode,
+        // at the layer's master opacity. Blend If does not gate effects.
+        for plane in &outer {
             self.blend_content(
-                outer,
+                &plane.content,
                 canvas,
                 layer,
                 None,
-                layer.blend_mode,
+                plane.blend_mode,
                 self.opacity(layer, false),
                 None,
+                false,
             );
         }
+        // Strokes in a mode other than Normal blend against the backdrop
+        // below the content.
+        for plane in strokes.iter().filter(|plane| !plane.above_content()) {
+            self.draw_stroke(plane, canvas, layer);
+        }
 
-        let coverage_after_effects = coverage.clone();
+        let mut clip_plane = Plane {
+            rect: content.rect,
+            data: coverage.clone(),
+        };
+        // A clipped layer fades with its base: opacity and fill scale the
+        // whole clipping group.
+        let group_strength = self.opacity(layer, with_fill);
+        for value in &mut clip_plane.data {
+            *value *= group_strength;
+        }
         self.blend_content(
             &content,
             canvas,
             layer,
             Some(&coverage),
-            layer.blend_mode,
-            self.opacity(layer, true),
+            mode,
+            group_strength,
             clip_base,
+            true,
         );
+        if let Some((effects, pre_knockout, canvas_rect)) = &interior_after {
+            self.paint_group_interior(
+                canvas,
+                layer,
+                &content,
+                pre_knockout,
+                effects,
+                *canvas_rect,
+                self.opacity(layer, false),
+                false,
+            );
+        }
+        for plane in strokes.iter().filter(|plane| plane.above_content()) {
+            self.draw_stroke(plane, canvas, layer);
+        }
 
         // The clip base coverage a clipped layer above sees is the layer's own
         // coverage including its mask.
-        Ok(Some(coverage_after_effects))
+        Ok(Some(clip_plane))
+    }
+
+    /// Whether the layer's interior effects blend together with its content:
+    /// always with "Blend Interior Effects as Group" (`infx`), and in any case
+    /// for a Normal layer at full fill, where the two agree.
+    fn interior_as_group(&self, layer: &Layer<T>, mode: BlendMode, with_fill: bool) -> bool {
+        let key = psd_core::TaggedBlockKey::new(*b"infx");
+        let flagged = layer
+            .blocks
+            .get(key)
+            .and_then(|block| block.data.first().copied())
+            .is_some_and(|flag| flag != 0);
+        let full_fill = !with_fill || layer.fill() == 255;
+        flagged || (mode == BlendMode::NORMAL && full_fill)
+    }
+
+    /// Composite a stroke plane at the layer's master opacity; Blend If does
+    /// not gate effects.
+    fn draw_stroke(&self, plane: &effects::StrokePlane, canvas: &mut Canvas, layer: &Layer<T>) {
+        self.draw_stroke_with(plane, canvas, layer, self.opacity(layer, false));
+    }
+
+    /// [`draw_stroke`](Self::draw_stroke) at an explicit master opacity.
+    fn draw_stroke_with(
+        &self,
+        plane: &effects::StrokePlane,
+        canvas: &mut Canvas,
+        layer: &Layer<T>,
+        opacity: f32,
+    ) {
+        self.blend_content(
+            &plane.content,
+            canvas,
+            layer,
+            None,
+            plane.blend_mode,
+            opacity * plane.opacity,
+            None,
+            false,
+        );
     }
 
     /// Blend a resolved content onto the canvas.
@@ -387,9 +541,14 @@ impl<T: BitDepth> Compositor<'_, T> {
         coverage: Option<&[f32]>,
         blend_mode: BlendMode,
         opacity: f32,
-        clip_base: Option<&[f32]>,
+        clip_base: Option<&Plane>,
+        gated: bool,
     ) {
         if opacity <= 0.0 {
+            return;
+        }
+        let restricted = self.channel_restrictions(layer);
+        if restricted == [true; 3] {
             return;
         }
         let blending_ranges = layer.blending_ranges.clone();
@@ -407,11 +566,8 @@ impl<T: BitDepth> Compositor<'_, T> {
                 }
                 if let Some(clip_base) = clip_base {
                     // Clipped layers keep their shape but only where the base
-                    // covers: the base's alpha multiplies the coverage.
-                    if source_index >= clip_base.len() {
-                        continue;
-                    }
-                    source_alpha *= clip_base[source_index];
+                    // covers: the base's coverage multiplies theirs.
+                    source_alpha *= clip_base.at(x, y);
                 }
                 if source_alpha <= 0.0 {
                     continue;
@@ -424,8 +580,8 @@ impl<T: BitDepth> Compositor<'_, T> {
                 let (backdrop, backdrop_alpha) = canvas.pixel(canvas_index);
 
                 let mut gate = 1.0;
-                if self.options.blend_if {
-                    gate = blend_if_gate(&blending_ranges, backdrop, source);
+                if gated && self.options.blend_if {
+                    gate = blend_if_gate(&blending_ranges, backdrop, backdrop_alpha, source);
                     if gate <= 0.0 {
                         continue;
                     }
@@ -434,16 +590,30 @@ impl<T: BitDepth> Compositor<'_, T> {
                 if alpha <= 0.0 {
                     continue;
                 }
-                let blended = blend::blend(blend_mode, backdrop, source, self.byte_domain);
+                let mut blended = blend::blend(blend_mode, backdrop, source, self.byte_domain);
+                if backdrop_alpha < 1.0 {
+                    // Over a partly transparent backdrop the source keeps its
+                    // own colour in proportion to the missing backdrop.
+                    for channel in 0..3 {
+                        blended[channel] = source[channel] * (1.0 - backdrop_alpha)
+                            + blended[channel] * backdrop_alpha;
+                    }
+                }
                 let out_alpha = alpha + backdrop_alpha * (1.0 - alpha);
                 if out_alpha <= 0.0 {
                     continue;
                 }
                 let mut out = [0.0; 3];
                 for channel in 0..3 {
-                    out[channel] = (backdrop[channel] * backdrop_alpha * (1.0 - alpha)
-                        + blended[channel] * alpha)
-                        / out_alpha;
+                    out[channel] = if restricted[channel] {
+                        // An excluded channel keeps the backdrop's
+                        // premultiplied value.
+                        backdrop[channel] * backdrop_alpha / out_alpha
+                    } else {
+                        (backdrop[channel] * backdrop_alpha * (1.0 - alpha)
+                            + blended[channel] * alpha)
+                            / out_alpha
+                    };
                 }
                 canvas.set(canvas_index, out, out_alpha);
             }
@@ -451,90 +621,231 @@ impl<T: BitDepth> Compositor<'_, T> {
     }
 
     /// Composite a group: pass through, or isolated when it has its own blend
-    /// mode, and then fade by the group's opacity.
+    /// mode, and then fade by the group's opacity and mask.
     fn composite_group(&self, id: usize, canvas: &mut Canvas) -> Result<()> {
         let Some(layer) = self.document.layer(id) else {
             return Ok(());
         };
         let opacity = f32::from(layer.opacity) / 255.0;
-        let pass_through = layer.blend_mode == BlendMode::PASSTHROUGH;
-        let group_mask = self.group_mask(layer)?;
+        // A group with a non-default Blend If range always isolates.
+        let pass_through = layer.blend_mode == BlendMode::PASSTHROUGH
+            && !(self.options.blend_if && blend_if_active(&layer.blending_ranges));
+        let bounds = self.subtree_bounds(id);
+        let effects = if self.options.effects {
+            self.typed_effects(layer)
+        } else {
+            None
+        };
+        let canvas_rect = Rect::new(
+            canvas.origin.1,
+            canvas.origin.0,
+            canvas.origin.1 + canvas.height as i32,
+            canvas.origin.0 + canvas.width as i32,
+        );
 
         if pass_through {
-            // Children meet the true backdrop; the group's own mask attenuates
-            // each child in place, and its opacity fades the whole result
-            // toward the pre-group snapshot.
-            let bounds = self.subtree_bounds(id);
-            let snapshot = bounds.map(|bounds| snapshot_canvas(canvas, bounds));
-            self.composite_children_with_mask(Some(id), canvas, group_mask.as_deref())?;
-            if let (Some(bounds), Some(snapshot)) = (bounds, snapshot) {
-                if opacity < 1.0 {
-                    fade_toward(canvas, &snapshot, bounds, opacity);
+            // Children meet the true backdrop; the group's opacity and mask
+            // then fade the whole result toward the pre-group snapshot.
+            let Some(bounds) = bounds else {
+                return Ok(());
+            };
+            let styled = effects.filter(effects::has_effects);
+            let silhouette = styled
+                .as_ref()
+                .map(|effects| self.group_silhouette(id, layer, bounds, effects, canvas_rect))
+                .transpose()?;
+            // Exterior effects paint first, from the children's silhouette.
+            if let (Some(effects), Some((content, coverage))) = (&styled, &silhouette) {
+                for plane in effects::build_outer(content, coverage, effects, canvas_rect) {
+                    self.blend_content(
+                        &plane.content,
+                        canvas,
+                        layer,
+                        None,
+                        plane.blend_mode,
+                        opacity,
+                        None,
+                        false,
+                    );
                 }
+            }
+            let snapshot = snapshot_canvas(canvas, bounds);
+            self.composite_children(Some(id), canvas)?;
+            let mask = self.mask_plane(layer, bounds);
+            if opacity < 1.0 || mask.is_some() {
+                fade_toward(canvas, &snapshot, bounds, opacity, mask.as_deref());
+            }
+            // Interior effects paint above the children, inside the silhouette.
+            if let (Some(effects), Some((content, coverage))) = (&styled, &silhouette) {
+                self.paint_group_interior(
+                    canvas,
+                    layer,
+                    content,
+                    coverage,
+                    effects,
+                    canvas_rect,
+                    opacity,
+                    true,
+                );
             }
             return Ok(());
         }
 
-        // Isolated: children composite into their own transparent canvas.
-        let bounds = self.subtree_bounds(id).unwrap_or(Rect::new(
-            0,
-            0,
-            canvas.width as i32,
-            canvas.height as i32,
-        ));
-        let mut isolated = Canvas::new(bounds.width().max(0) as u32, bounds.height().max(0) as u32);
-        isolated.origin = (bounds.left, bounds.top);
-        self.composite_children_with_mask(Some(id), &mut isolated, None)?;
-
-        // The merged result meets the backdrop with the group's mode, opacity
-        // and mask.
-        let content = canvas_to_content(&isolated);
-        let mut coverage: Vec<f32> = content.alpha.clone();
-        if let Some(mask) = &group_mask {
-            if let Some(mask) = mask.get(..coverage.len()) {
-                for (value, mask) in coverage.iter_mut().zip(mask.iter()) {
-                    *value *= *mask;
-                }
-            }
+        // Isolated: children composite into their own transparent canvas,
+        // wide enough for the group's own effects.
+        let mut rect = bounds.unwrap_or(canvas_rect);
+        if let Some(effects) = &effects {
+            rect = clamp_to_canvas_rect(effects::padded_rect(&rect, effects), canvas_rect);
         }
-        self.blend_content(
-            &content,
-            canvas,
-            layer,
-            Some(&coverage),
-            layer.blend_mode,
-            opacity,
-            None,
-        );
+        let mut isolated = Canvas::new(rect.width().max(0) as u32, rect.height().max(0) as u32);
+        isolated.origin = (rect.left, rect.top);
+        self.composite_children(Some(id), &mut isolated)?;
+
+        // The merged result plays the layer's role: effects, then it meets the
+        // backdrop with the group's mode, opacity and mask (the group's fill
+        // opacity is ignored).
+        let mut content = canvas_to_content(&isolated);
+        content.mask = self.mask_plane(layer, rect);
+        let mode = if layer.blend_mode == BlendMode::PASSTHROUGH {
+            BlendMode::NORMAL
+        } else {
+            layer.blend_mode
+        };
+        self.composite_resolved(layer, content, canvas, None, false, mode)?;
         Ok(())
     }
 
-    /// Composite a level's children with an extra coverage multiplier (the
-    /// group mask) applied to each child.
-    fn composite_children_with_mask(
+    /// A pass-through group's silhouette: the children composited on their own,
+    /// as a content and its coverage (alpha × the group's mask), over the
+    /// group's bounds padded for its effects.
+    fn group_silhouette(
         &self,
-        parent: Option<usize>,
-        canvas: &mut Canvas,
-        _mask: Option<&[f32]>,
-    ) -> Result<()> {
-        // The mask is applied through the group's own coverage paths; for the
-        // pass-through case it attenuates each child's contribution, which is
-        // what compositing into the parent canvas already does when the mask
-        // multiplies the child's coverage.
-        self.composite_children(parent, canvas)
+        id: usize,
+        layer: &Layer<T>,
+        bounds: Rect,
+        effects: &psd_core::LayerEffects,
+        canvas_rect: Rect,
+    ) -> Result<(Content, Vec<f32>)> {
+        let rect = clamp_to_canvas_rect(effects::padded_rect(&bounds, effects), canvas_rect);
+        let mut isolated = Canvas::new(rect.width().max(0) as u32, rect.height().max(0) as u32);
+        isolated.origin = (rect.left, rect.top);
+        self.composite_children(Some(id), &mut isolated)?;
+        let mut content = canvas_to_content(&isolated);
+        content.mask = self.mask_plane(layer, rect);
+        let mut coverage = content.alpha.clone();
+        if let Some(mask) = &content.mask {
+            for (value, mask) in coverage.iter_mut().zip(mask) {
+                *value *= *mask;
+            }
+        }
+        Ok((content, coverage))
     }
 
-    fn group_mask(&self, layer: &Layer<T>) -> Result<Option<Vec<f32>>> {
-        let Some(record) = layer.mask_record() else {
-            return Ok(None);
+    /// Interior effects of a pass-through group, painted over the canvas
+    /// inside the group's silhouette, each with its own blend mode.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_group_interior(
+        &self,
+        canvas: &mut Canvas,
+        layer: &Layer<T>,
+        silhouette: &Content,
+        coverage: &[f32],
+        effects: &psd_core::LayerEffects,
+        canvas_rect: Rect,
+        opacity: f32,
+        with_strokes: bool,
+    ) {
+        let scaled: Vec<f32> = coverage.iter().map(|value| value * opacity).collect();
+        let copy_canvas = |canvas: &Canvas| -> Content {
+            let mut content = Content::new(silhouette.rect);
+            for y in silhouette.rect.top..silhouette.rect.bottom {
+                for x in silhouette.rect.left..silhouette.rect.right {
+                    if let (Some(source), Some(target)) = (
+                        canvas.index(i64::from(x), i64::from(y)),
+                        content.index(i64::from(x), i64::from(y)),
+                    ) {
+                        for channel in 0..3 {
+                            content.color[channel][target] = canvas.color[channel][source];
+                        }
+                        content.alpha[target] = canvas.alpha[source];
+                    }
+                }
+            }
+            content
         };
-        if record.flags.disabled() {
-            return Ok(None);
+        let write_back = |canvas: &mut Canvas, content: &Content, weights: Option<&[f32]>| {
+            for y in silhouette.rect.top..silhouette.rect.bottom {
+                for x in silhouette.rect.left..silhouette.rect.right {
+                    let (Some(target), Some(source)) = (
+                        canvas.index(i64::from(x), i64::from(y)),
+                        content.index(i64::from(x), i64::from(y)),
+                    ) else {
+                        continue;
+                    };
+                    let weight = weights.map_or(1.0, |weights| weights[source]);
+                    if weight <= 0.0 {
+                        continue;
+                    }
+                    for channel in 0..3 {
+                        let old = canvas.color[channel][target];
+                        canvas.color[channel][target] =
+                            old + (content.color[channel][source] - old) * weight;
+                    }
+                }
+            }
+        };
+
+        // Overlays fold into the colours inside the silhouette.
+        let mut folded = copy_canvas(canvas);
+        let context = self.effect_context(layer, canvas_rect);
+        effects::fold_interior_overlays(&mut folded, coverage, effects, &context);
+        write_back(canvas, &folded, Some(&scaled));
+        // Soft interior effects then paint above.
+        let mut painted = copy_canvas(canvas);
+        effects::paint_interior(&mut painted, &scaled, effects);
+        write_back(canvas, &painted, None);
+        // Strokes draw above, at the group's opacity.
+        if with_strokes {
+            for plane in effects::build_strokes(silhouette, coverage, effects, canvas_rect) {
+                self.draw_stroke_with(&plane, canvas, layer, opacity);
+            }
         }
-        let Some(pixels) = layer.mask_pixels() else {
-            return Ok(None);
-        };
-        Ok(Some(pixels.iter().map(|sample| sample.to_f32()).collect()))
+    }
+
+    /// The effect renderers' view of the document around a layer.
+    fn effect_context(&self, layer: &Layer<T>, canvas: Rect) -> effects::EffectContext<'_> {
+        // `fxrp`: the effects reference point, two big-endian doubles.
+        let key = psd_core::TaggedBlockKey::new(*b"fxrp");
+        let reference = layer
+            .blocks
+            .get(key)
+            .filter(|block| block.data.len() >= 16)
+            .map_or((0.0, 0.0), |block| {
+                let read = |at: usize| {
+                    f64::from_be_bytes(block.data[at..at + 8].try_into().unwrap_or([0; 8]))
+                };
+                (read(0), read(8))
+            });
+        effects::EffectContext {
+            canvas,
+            patterns: &self.patterns,
+            reference,
+        }
+    }
+
+    /// The colour channels Advanced Blending excludes (`brst` lists them).
+    fn channel_restrictions(&self, layer: &Layer<T>) -> [bool; 3] {
+        let mut restricted = [false; 3];
+        let key = psd_core::TaggedBlockKey::new(*b"brst");
+        if let Some(block) = layer.blocks.get(key) {
+            for chunk in block.data.chunks_exact(4) {
+                let channel = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                if let Some(slot) = restricted.get_mut(channel as usize) {
+                    *slot = true;
+                }
+            }
+        }
+        restricted
     }
 
     fn opacity(&self, layer: &Layer<T>, include_fill: bool) -> f32 {
@@ -562,14 +873,29 @@ impl<T: BitDepth> Compositor<'_, T> {
     /// The document-space bounds a subtree touches, clamped to the canvas.
     fn subtree_bounds(&self, id: usize) -> Option<Rect> {
         let mut bounds: Option<Rect> = None;
-        for child in self.subtree_ids(id) {
+        // The group itself has no pixels of its own; its descendants do.
+        for child in self.subtree_ids(id).into_iter().skip(1) {
             let Some(layer) = self.document.layer(child) else {
                 continue;
             };
             if !layer.is_visible() || matches!(layer.kind, LayerKind::SectionDivider(_)) {
                 continue;
             }
-            let rect = self.layer_rect(layer);
+            let rect = if matches!(layer.kind, LayerKind::Adjustment(_)) {
+                // An adjustment reaches every pixel beneath it, and a fill
+                // layer covers the whole canvas.
+                Rect::new(
+                    0,
+                    0,
+                    self.document.height as i32,
+                    self.document.width as i32,
+                )
+            } else {
+                self.layer_rect(layer)
+            };
+            if rect.width() <= 0 || rect.height() <= 0 {
+                continue;
+            }
             bounds = Some(match bounds {
                 Some(current) => union_rect(current, rect),
                 None => rect,
@@ -592,7 +918,7 @@ impl<T: BitDepth> Compositor<'_, T> {
             if !mask.flags.disabled() {
                 rect = union_rect(
                     rect,
-                    Rect::new(mask.left, mask.top, mask.right, mask.bottom),
+                    Rect::new(mask.top, mask.left, mask.bottom, mask.right),
                 );
             }
         }
@@ -626,21 +952,37 @@ impl<T: BitDepth> Compositor<'_, T> {
             return Ok(None);
         }
         let mut content = Content::new(rect);
-        let (width, height) = (content.width(), content.height());
+        let width = content.width();
+
+        // The channel planes cover the layer's own bounds; the content rect may
+        // be padded (effects, mask) or clamped to the canvas, so place them by
+        // coordinates, never by linear index.
+        let bounds = layer.bounds;
+        let (bounds_width, bounds_height) = (
+            bounds.width().max(0) as usize,
+            bounds.height().max(0) as usize,
+        );
+        let place = |plane: &mut [f32], data: &[T]| {
+            if data.len() < bounds_width * bounds_height {
+                return;
+            }
+            for y in rect.top.max(bounds.top)..rect.bottom.min(bounds.bottom) {
+                let source_row = (y - bounds.top) as usize * bounds_width;
+                let target_row = (y - rect.top) as usize * width;
+                for x in rect.left.max(bounds.left)..rect.right.min(bounds.right) {
+                    plane[target_row + (x - rect.left) as usize] =
+                        data[source_row + (x - bounds.left) as usize].to_f32();
+                }
+            }
+        };
 
         let color_keys = self.color_keys();
         for (plane, key) in color_keys.iter().enumerate() {
             if plane >= 3 {
                 break;
             }
-            let Some(data) = channels.get(*key) else {
-                continue;
-            };
-            if data.len() < width * height {
-                continue;
-            }
-            for (index, sample) in data.iter().take(width * height).enumerate() {
-                content.color[plane][index] = sample.to_f32();
+            if let Some(data) = channels.get(*key) {
+                place(&mut content.color[plane], data);
             }
         }
         // Grayscale documents repeat one plane; CMYK is not converted here.
@@ -651,39 +993,21 @@ impl<T: BitDepth> Compositor<'_, T> {
         }
 
         match channels.get(ChannelKey::ALPHA) {
-            Some(data) if data.len() >= width * height => {
-                for (index, sample) in data.iter().take(width * height).enumerate() {
-                    content.alpha[index] = sample.to_f32();
-                }
+            Some(data) if data.len() >= bounds_width * bounds_height => {
+                place(&mut content.alpha, data);
             }
-            _ => content.alpha.fill(1.0),
-        }
-
-        // The layer mask, honored outside its rect by its default color.
-        if let Some(record) = layer.mask_record() {
-            if !record.flags.disabled() {
-                let default = f32::from(record.default_color) / 255.0;
-                let mut mask = vec![default; width * height];
-                if let Some(pixels) = layer.mask_pixels() {
-                    let mask_width = (record.right - record.left).max(0) as usize;
-                    let mask_height = (record.bottom - record.top).max(0) as usize;
-                    for y in record.top..record.bottom {
-                        for x in record.left..record.right {
-                            let Some(target) = content.index(i64::from(x), i64::from(y)) else {
-                                continue;
-                            };
-                            let source_y = (y - record.top) as usize;
-                            let source_x = (x - record.left) as usize;
-                            let source = source_y * mask_width + source_x;
-                            if source < pixels.len() && source_y < mask_height {
-                                mask[target] = pixels[source].to_f32();
-                            }
-                        }
+            _ => {
+                // No transparency channel: opaque over the layer's bounds only.
+                for y in rect.top.max(bounds.top)..rect.bottom.min(bounds.bottom) {
+                    let target_row = (y - rect.top) as usize * width;
+                    for x in rect.left.max(bounds.left)..rect.right.min(bounds.right) {
+                        content.alpha[target_row + (x - rect.left) as usize] = 1.0;
                     }
                 }
-                content.mask = Some(mask);
             }
         }
+
+        content.mask = self.mask_plane(layer, rect);
         Ok(Some(content))
     }
 
@@ -730,8 +1054,13 @@ impl<T: BitDepth> Compositor<'_, T> {
         adjustments::fill_content(self, layer)
     }
 
-    fn apply_adjustment(&self, layer: &Layer<T>, canvas: &mut Canvas) -> Result<()> {
-        adjustments::apply(self, layer, canvas)
+    fn apply_adjustment(
+        &self,
+        layer: &Layer<T>,
+        canvas: &mut Canvas,
+        clip_base: Option<&Plane>,
+    ) -> Result<()> {
+        adjustments::apply(self, layer, canvas, clip_base)
     }
 }
 
@@ -742,6 +1071,16 @@ fn clamp_to_canvas(rect: Rect, width: u32, height: u32) -> Rect {
         rect.left.max(0),
         rect.bottom.min(height as i32),
         rect.right.min(width as i32),
+    )
+}
+
+/// Clamp a rect to another (the canvas' document-space rect).
+fn clamp_to_canvas_rect(rect: Rect, canvas: Rect) -> Rect {
+    Rect::new(
+        rect.top.max(canvas.top),
+        rect.left.max(canvas.left),
+        rect.bottom.min(canvas.bottom),
+        rect.right.min(canvas.right),
     )
 }
 
@@ -792,7 +1131,13 @@ fn snapshot_canvas(canvas: &Canvas, rect: Rect) -> Snapshot {
 
 /// Interpolate the canvas back toward a snapshot by `keep` (the group's
 /// opacity), in premultiplied space: the group's contribution is scaled.
-fn fade_toward(canvas: &mut Canvas, snapshot: &Snapshot, rect: Rect, keep: f32) {
+fn fade_toward(
+    canvas: &mut Canvas,
+    snapshot: &Snapshot,
+    rect: Rect,
+    opacity: f32,
+    mask: Option<&[f32]>,
+) {
     let width = rect.width().max(0) as usize;
     for y in rect.top..rect.bottom {
         for x in rect.left..rect.right {
@@ -803,6 +1148,11 @@ fn fade_toward(canvas: &mut Canvas, snapshot: &Snapshot, rect: Rect, keep: f32) 
             if target >= snapshot.alpha.len() {
                 continue;
             }
+            let keep = opacity
+                * mask
+                    .and_then(|mask| mask.get(target))
+                    .copied()
+                    .unwrap_or(1.0);
             let alpha_before = snapshot.alpha[target];
             let alpha_after = canvas.alpha[canvas_index];
             let alpha = alpha_before + (alpha_after - alpha_before) * keep;
@@ -823,10 +1173,10 @@ fn fade_toward(canvas: &mut Canvas, snapshot: &Snapshot, rect: Rect, keep: f32) 
 
 fn canvas_to_content(canvas: &Canvas) -> Content {
     let rect = Rect::new(
-        canvas.origin.0,
         canvas.origin.1,
-        canvas.origin.0 + canvas.width as i32,
+        canvas.origin.0,
         canvas.origin.1 + canvas.height as i32,
+        canvas.origin.0 + canvas.width as i32,
     );
     Content {
         rect,
@@ -836,55 +1186,58 @@ fn canvas_to_content(canvas: &Canvas) -> Content {
     }
 }
 
-/// The blending-ranges gates: the composite range (backdrop) and the
-/// this-layer range (source) multiply, per channel, with Photoshop's split
-/// feather and the composite gray weights.
-fn blend_if_gate(ranges: &LayerBlendingRanges, backdrop: [f32; 3], source: [f32; 3]) -> f32 {
+/// Whether any blending range differs from the identity.
+pub(crate) fn blend_if_active(ranges: &LayerBlendingRanges) -> bool {
+    let identity = [0, 0, 255, 255];
+    ranges
+        .ranges
+        .iter()
+        .take(4)
+        .any(|range| range.source != identity || range.destination != identity)
+}
+
+/// The blending-ranges gates. The record holds one entry per channel (Gray,
+/// then R, G, B); each carries a This Layer pair and an Underlying Layer pair.
+/// The four active gates multiply, and This Layer multiplies Underlying Layer.
+/// Underlying coverage is `(1 - backdrop alpha) + backdrop alpha * gate`:
+/// transparent backdrop pixels always pass.
+pub(crate) fn blend_if_gate(
+    ranges: &LayerBlendingRanges,
+    backdrop: [f32; 3],
+    backdrop_alpha: f32,
+    source: [f32; 3],
+) -> f32 {
     if ranges.ranges.is_empty() {
         return 1.0;
     }
     let gray = |color: [f32; 3]| -> f32 {
-        (299.0 * color[0] + 590.0 * color[1] + 111.0 * color[2]) / 1000.0
+        let weighted = 299.0 * color[0].clamp(0.0, 1.0) * 255.0
+            + 590.0 * color[1].clamp(0.0, 1.0) * 255.0
+            + 111.0 * color[2].clamp(0.0, 1.0) * 255.0;
+        (weighted / 1000.0).round() / 255.0
     };
     let backdrop_channels = [gray(backdrop), backdrop[0], backdrop[1], backdrop[2]];
     let source_channels = [gray(source), source[0], source[1], source[2]];
 
-    let mut gate = 1.0;
-    // The block stores the composite range then the this-layer range, each as
-    // four channel entries of [black_lo, black_hi, white_lo, white_hi].
-    for (index, range) in ranges.ranges.iter().enumerate() {
-        if index >= 8 {
-            break;
-        }
-        let channel = index % 4;
-        let is_source = index >= 4;
-        let value = if is_source {
-            source_channels[channel]
-        } else {
-            backdrop_channels[channel]
-        };
-        let (lo, hi) = (range.source, range.destination);
-        gate *= range_factor(value, lo, hi);
+    let mut this_gate = 1.0f32;
+    let mut underlying_gate = 1.0f32;
+    for (channel, range) in ranges.ranges.iter().take(4).enumerate() {
+        this_gate *= range_factor(source_channels[channel], range.source);
+        underlying_gate *= range_factor(backdrop_channels[channel], range.destination);
     }
-    gate.clamp(0.0, 1.0)
+    let underlying = (1.0 - backdrop_alpha) + backdrop_alpha * underlying_gate;
+    (this_gate * underlying).clamp(0.0, 1.0)
 }
 
 /// One channel's range factor: the black side's inclusive feather, then the
-/// white side's.
-fn range_factor(value: f32, black: [u8; 4], white: [u8; 4]) -> f32 {
+/// white side's. `range` is `[black_low, black_high, white_low, white_high]`;
+/// equal low/high values are a hard cutoff.
+fn range_factor(value: f32, range: [u8; 4]) -> f32 {
     let byte = (value.clamp(0.0, 1.0) * 255.0).round() as i32;
-    let black_lo = i32::from(black[0]);
-    let black_hi = i32::from(black[1]);
-    let white_lo = i32::from(white[0]);
-    let white_hi = i32::from(white[1]);
-    // A default range (0, 0, 255, 255) passes everything.
-    if black_lo == 0 && black_hi == 0 && white_lo == 255 && white_hi == 255 {
-        return 1.0;
-    }
-    if black_lo == 0 && black_hi == 0 && white_lo == 0 && white_hi == 0 {
-        // Fully excluded.
-        return 0.0;
-    }
+    let black_lo = i32::from(range[0]);
+    let black_hi = i32::from(range[1]);
+    let white_lo = i32::from(range[2]);
+    let white_hi = i32::from(range[3]);
     let mut factor = 1.0f32;
     if byte < black_hi {
         if byte < black_lo {

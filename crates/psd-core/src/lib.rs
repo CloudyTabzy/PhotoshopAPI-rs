@@ -47,6 +47,7 @@ pub mod layer_comps;
 pub mod layer_effects;
 mod legacy_effects;
 pub mod linked_layer;
+pub mod pattern;
 pub mod photoshop_file;
 pub mod placed_layer;
 #[cfg(feature = "serde")]

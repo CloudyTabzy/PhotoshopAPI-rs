@@ -30,15 +30,23 @@ use psd_core::{
     TransparencyStop,
 };
 
-use super::{Canvas, Compositor, Content, Rect};
+use super::ramp::{self, Placement, Ramp, Span, SpanBasis};
+use super::{Canvas, Compositor, Content, Plane, Rect};
 use crate::layer::Layer;
 use crate::BitDepth;
+use psd_core::effect_enums::{GradientInterpolation, GradientStyle};
 
 /// Apply the layer's adjustment to the canvas, inside its mask.
+///
+/// Strength is the layer's opacity and fill (both scale an adjustment), times
+/// its mask, times the clipping base when clipped, times the Blend If gate:
+/// This Layer is evaluated on the adjusted output and Underlying Layer on the
+/// pre-adjustment backdrop.
 pub fn apply<T: BitDepth>(
     compositor: &Compositor<'_, T>,
     layer: &Layer<T>,
     canvas: &mut Canvas,
+    clip_base: Option<&Plane>,
 ) -> Result<()> {
     let blocks = layer.adjustments()?;
     let Some(block) = blocks.iter().find(|block| {
@@ -54,74 +62,52 @@ pub fn apply<T: BitDepth>(
         return Ok(());
     }
 
-    let mask = mask_field(layer)?;
-    for y in 0..canvas.height as i32 {
-        for x in 0..canvas.width as i32 {
+    let strength = compositor.opacity(layer, true);
+    if strength <= 0.0 {
+        return Ok(());
+    }
+    let restricted = compositor.channel_restrictions(layer);
+    let canvas_rect = Rect::new(
+        canvas.origin.1,
+        canvas.origin.0,
+        canvas.origin.1 + canvas.height as i32,
+        canvas.origin.0 + canvas.width as i32,
+    );
+    let mask = compositor.mask_plane(layer, canvas_rect);
+    let width = canvas.width as usize;
+    let ranges = &layer.blending_ranges;
+    let gated = compositor.options.blend_if && super::blend_if_active(ranges);
+    for y in canvas_rect.top..canvas_rect.bottom {
+        for x in canvas_rect.left..canvas_rect.right {
             let Some(index) = canvas.index(i64::from(x), i64::from(y)) else {
                 continue;
             };
-            let coverage = mask.as_ref().map(|mask| mask.coverage(x, y)).unwrap_or(1.0);
+            let local = (y - canvas_rect.top) as usize * width + (x - canvas_rect.left) as usize;
+            let mut coverage = strength * mask.as_ref().map_or(1.0, |mask| mask[local]);
+            if let Some(clip_base) = clip_base {
+                coverage *= clip_base.at(x, y);
+            }
             if coverage <= 0.0 {
                 continue;
             }
             let (color, alpha) = canvas.pixel(index);
             let adjusted = operation.apply(color);
+            if gated {
+                coverage *= super::blend_if_gate(ranges, color, alpha, adjusted);
+                if coverage <= 0.0 {
+                    continue;
+                }
+            }
             let mut result = color;
             for (channel, value) in result.iter_mut().enumerate() {
-                *value = color[channel] + (adjusted[channel] - color[channel]) * coverage;
+                if !restricted[channel] {
+                    *value = color[channel] + (adjusted[channel] - color[channel]) * coverage;
+                }
             }
             canvas.set(index, result, alpha);
         }
     }
     Ok(())
-}
-
-/// A layer's raster mask, sampled in canvas coordinates.
-struct MaskField {
-    pixels: Vec<f32>,
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-    width: usize,
-    default: f32,
-}
-
-impl MaskField {
-    fn coverage(&self, x: i32, y: i32) -> f32 {
-        if x < self.left || y < self.top || x >= self.right || y >= self.bottom {
-            return self.default;
-        }
-        let index = (y - self.top) as usize * self.width + (x - self.left) as usize;
-        self.pixels.get(index).copied().unwrap_or(self.default)
-    }
-}
-
-fn mask_field<T: BitDepth>(layer: &Layer<T>) -> Result<Option<MaskField>> {
-    let Some(record) = layer.mask_record() else {
-        return Ok(None);
-    };
-    if layer.mask_disabled().unwrap_or(false) {
-        return Ok(None);
-    }
-    let Some(pixels) = layer.mask_pixels() else {
-        return Ok(None);
-    };
-    let width = (record.right - record.left).max(0) as usize;
-    let height = (record.bottom - record.top).max(0) as usize;
-    Ok(Some(MaskField {
-        pixels: pixels
-            .iter()
-            .take(width * height)
-            .map(|sample| sample.to_f32())
-            .collect(),
-        left: record.left,
-        top: record.top,
-        right: record.right,
-        bottom: record.bottom,
-        width,
-        default: f32::from(record.default_color) / 255.0,
-    }))
 }
 
 /// One adjustment, resolved once per layer.
@@ -330,16 +316,7 @@ fn modern_contrast(value: f32, c: f32) -> f32 {
 // ---------------------------------------------------------------------------
 
 fn levels_apply(color: [f32; 3], levels: &Levels) -> [f32; 3] {
-    let mut out = color;
-    for (index, record) in levels.records.iter().enumerate() {
-        // Record 0 is the composite, then R, G, B.
-        let target = match index {
-            0 => None,
-            1 => Some(0),
-            2 => Some(1),
-            3 => Some(2),
-            _ => continue,
-        };
+    let map = |record: &psd_core::adjustments::LevelsRecord, value: f32| -> f32 {
         let floor = f32::from(record.input_floor);
         let ceiling = f32::from(record.input_ceiling);
         let output_floor = f32::from(record.output_floor);
@@ -349,18 +326,19 @@ fn levels_apply(color: [f32; 3], levels: &Levels) -> [f32; 3] {
         } else {
             f32::from(record.gamma) / 100.0
         };
-        let map = |value: f32| -> f32 {
-            let scaled = ((value * 255.0 - floor) / (ceiling - floor).max(1e-6)).clamp(0.0, 1.0);
-            let corrected = scaled.powf(1.0 / gamma.max(1e-6));
-            ((output_floor + corrected * (output_ceiling - output_floor)) / 255.0).clamp(0.0, 1.0)
-        };
-        match target {
-            None => {
-                for channel in 0..3 {
-                    out[channel] = map(color[channel]);
-                }
-            }
-            Some(channel) => out[channel] = map(color[channel]),
+        let scaled = ((value * 255.0 - floor) / (ceiling - floor).max(1e-6)).clamp(0.0, 1.0);
+        let corrected = scaled.powf(1.0 / gamma.max(1e-6));
+        ((output_floor + corrected * (output_ceiling - output_floor)) / 255.0).clamp(0.0, 1.0)
+    };
+    // Record 0 is the composite, then R, G, B. The per-channel records apply
+    // first and the composite record acts on their result.
+    let mut out = color;
+    for (value, record) in out.iter_mut().zip(levels.records.iter().skip(1)) {
+        *value = map(record, *value);
+    }
+    if let Some(record) = levels.records.first() {
+        for value in &mut out {
+            *value = map(record, *value);
         }
     }
     out
@@ -768,8 +746,8 @@ pub fn fill_content<T: BitDepth>(
     let rect = Rect::new(
         0,
         0,
-        compositor.document.width as i32,
         compositor.document.height as i32,
+        compositor.document.width as i32,
     );
     let mut content = Content::new(rect);
     let width = content.width();
@@ -794,40 +772,67 @@ pub fn fill_content<T: BitDepth>(
                 .get("Grad")
                 .and_then(descriptor_descriptor)
                 .and_then(psd_core::Gradient::from_descriptor);
-            for y in 0..height {
-                for x in 0..width {
-                    let t = if width <= 1 {
-                        0.0
-                    } else {
-                        x as f32 / (width - 1) as f32
-                    };
-                    let color = gradient
-                        .as_ref()
-                        .map(|gradient| super::effects::gradient_sample(gradient, t))
-                        .unwrap_or([0.0, 0.0, 0.0]);
-                    let index = y * width + x;
-                    content.color[0][index] = color[0];
-                    content.color[1][index] = color[1];
-                    content.color[2][index] = color[2];
-                    content.alpha[index] = 1.0;
+            let descriptor = &settings.descriptor;
+            let enumerated = |key: &str| {
+                descriptor
+                    .get(key)
+                    .and_then(DescriptorValue::as_enum)
+                    .map(|(_, value)| value.as_bytes().to_vec())
+            };
+            let interpolation = enumerated("gradientsInterpolationMethod")
+                .and_then(|id| GradientInterpolation::from_id(&id));
+            // A gradient fill eases even a two-stop ramp.
+            let ramp = gradient
+                .as_ref()
+                .and_then(|gradient| Ramp::new(gradient, interpolation, true));
+            let placement = Placement {
+                style: enumerated("Type")
+                    .and_then(|id| GradientStyle::from_id(&id))
+                    .unwrap_or(GradientStyle::Linear),
+                angle: descriptor_number(descriptor, "Angl").unwrap_or(90.0) as f32,
+                scale: descriptor_number(descriptor, "Scl ").unwrap_or(100.0) as f32,
+                reverse: descriptor
+                    .get("Rvrs")
+                    .and_then(DescriptorValue::as_bool)
+                    .unwrap_or(false),
+                offset: descriptor
+                    .get("Ofst")
+                    .and_then(descriptor_descriptor)
+                    .map_or((0.0, 0.0), |offset| {
+                        (
+                            descriptor_number(offset, "Hrzn").unwrap_or(0.0) as f32,
+                            descriptor_number(offset, "Vrtc").unwrap_or(0.0) as f32,
+                        )
+                    }),
+            };
+            let span = Span {
+                left: rect.left as f32,
+                top: rect.top as f32,
+                width: width as f32,
+                height: height as f32,
+            };
+            if let Some(ramp) = ramp {
+                for y in 0..height {
+                    for x in 0..width {
+                        let position = ramp::position(
+                            &placement,
+                            span,
+                            SpanBasis::CenterChord,
+                            rect.left + x as i32,
+                            rect.top + y as i32,
+                        );
+                        let (color, alpha) = ramp.sample(position);
+                        let index = y * width + x;
+                        content.color[0][index] = color[0];
+                        content.color[1][index] = color[1];
+                        content.color[2][index] = color[2];
+                        content.alpha[index] = alpha;
+                    }
                 }
             }
         }
         _ => return Ok(None),
     }
-    if let Some(mask) = mask_field(layer)? {
-        let mut values = vec![mask.default; width * height];
-        for y in mask.top..mask.bottom {
-            for x in mask.left..mask.right {
-                let Some(target) = content.index(i64::from(x), i64::from(y)) else {
-                    continue;
-                };
-                if target < values.len() {
-                    values[target] = mask.coverage(x, y);
-                }
-            }
-        }
-        content.mask = Some(values);
-    }
+    content.mask = compositor.mask_plane(layer, rect);
     Ok(Some(content))
 }

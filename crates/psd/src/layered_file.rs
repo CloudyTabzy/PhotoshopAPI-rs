@@ -2162,6 +2162,37 @@ impl<T: BitDepth> LayeredFile<T> {
         };
         Ok((record, ChannelImageData { channels: data }))
     }
+
+    /// The patterns the document carries, from its `Patt`, `Pat2` and `Pat3`
+    /// blocks, as RGBA8 tiles keyed by their id (the `Idnt` a pattern overlay,
+    /// pattern fill or bevel texture refers to).
+    ///
+    /// A record that cannot be decoded ends that block's list with a warning:
+    /// the patterns before it are still returned.
+    pub fn patterns(&self) -> Vec<psd_core::pattern::Pattern> {
+        let mut patterns = Vec::new();
+        let Some(blocks) = &self.document_blocks else {
+            return patterns;
+        };
+        for block in &blocks.blocks {
+            let bytes = block.key.as_bytes();
+            if !matches!(&bytes, b"Patt" | b"Pat2" | b"Pat3") {
+                continue;
+            }
+            let mut reader = psd_core::io::BeReader::new(&block.data);
+            // A record is at least its length prefix and version.
+            while reader.remaining() >= 8 {
+                match psd_core::pattern::read_pattern(&mut reader) {
+                    Ok(pattern) => patterns.push(pattern),
+                    Err(error) => {
+                        tracing::warn!("unreadable pattern record skipped: {error}");
+                        break;
+                    }
+                }
+            }
+        }
+        patterns
+    }
 }
 
 #[cfg(test)]

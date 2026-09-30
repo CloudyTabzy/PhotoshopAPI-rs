@@ -12,6 +12,70 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-09-30
+
+The compositor is now checked against Photoshop's own flattens of 50 small test documents
+(an env-gated probe, `tests/composite_oracle.rs`). Most of the gap to Photoshop turned out
+to be a handful of real bugs, all fixed here; masks, Blend If, channel restrictions, group
+styles, inner and outer glows, inner shadows, stroke knockout and pattern overlays now match
+within 0-2/255 on the reference set.
+
+### Fixed
+
+- Every effect, mask union or canvas clamp displaced or blacked out the layer's pixels:
+  channel planes were copied linearly into the padded rect instead of being placed at the
+  layer's bounds.
+- Blend If read the wrong record layout. The first four blending ranges are Gray, R, G and B,
+  each carrying a This Layer pair and an Underlying Layer pair; the gate now multiplies them
+  and lets transparent backdrop pixels always pass the underlying side. Adjustment layers
+  gate on the adjusted output, and a group with a non-default range isolates.
+- Blend modes ignored the backdrop's alpha: over a partly transparent backdrop the source
+  keeps its own colour in proportion to the missing backdrop (an isolated group's Multiply
+  child no longer multiplies against nothing).
+- Three `Rect::new` calls had their arguments swapped (masks, isolated groups, fill layers).
+- The tent blur used a forward-only window, which shifted every shadow and glow up and left
+  by about the blur size; the two box passes are now centred. Drop and inner shadows fall
+  away from the light (120 degrees throws the shadow down and right).
+- Inner shadows, inner glows and satin never saw the world beyond the layer's edge and drew
+  nothing there; their fields now run over the matte padded with transparent pixels.
+- Levels applied the per-channel records over the composite record instead of composing with
+  it.
+- A group's bounds always included the canvas origin, and adjustment layers inside a group
+  were clipped to the children's bounds.
+
+### Added
+
+- **Masks**: layer and group masks are resolved to one coverage plane with their density and
+  feather. A raster mask's feather is a Gaussian (sigma = the feather radius) that replicates
+  the canvas edge; density lerps toward white. **Vector masks** (`vmsk`/`vsms`) are
+  rasterized from their Bezier paths: contours sharing a shape group fill even-odd together,
+  groups combine by their lead contour's operation (add, subtract, intersect, exclude) over
+  the running coverage, and the vector feather and density apply unclamped at the canvas edge.
+  Adjustment layers honor masks, opacity, fill opacity, clipping and Blend If.
+- **Layer effects**: gradient overlays with Photoshop's calibrated geometry (Linear,
+  Radial, Angle, Reflected, Diamond; angle, scale, offset, reverse, Align with Layer, colour
+  and transparency stops, midpoints and Classic easing), pattern overlays (anchored at the
+  effects reference point or the document origin, with phase, scale and rotation), strokes
+  as real planes (distance band, gradient and Shape Burst fills, and the overprint-off
+  knockout that removes the layer's own content under the band even at 0% opacity),
+  exterior effects composited with their own blend modes, "Layer Knocks Out Drop Shadow",
+  and "Blend Interior Effects as Group" (`infx`): with it off, interior effects of a
+  non-Normal layer paint over the result with their own modes.
+- **Styled groups**: a group with effects runs the layer pipeline on its flattened content
+  (isolated groups), or draws its exterior effects before and its interior effects after its
+  children (pass-through groups).
+- **Advanced Blending channel restrictions** (`brst`).
+- Gradient fill layers use the fill-layer geometry instead of a horizontal ramp.
+- `LayeredFile::patterns()` decodes the document's `Patt`, `Pat2` and `Pat3` blocks into RGBA8
+  tiles. The decoder moved to `psd_core::pattern` (`psd-companion` re-exports it).
+- Tests: synthetic documents with known flattened pixels (`tests/composite.rs`), and unit
+  tests for the path rasterizer, the gradient ramps and their geometry.
+
+### Changed
+
+- Clipped layers fade with their base: the base's opacity and fill scale the whole clipping
+  group, and a clipped layer samples its base's coverage by position.
+
 ## [0.11.0] - 2026-09-30
 
 ### Added

@@ -1053,6 +1053,56 @@ mod tests {
         body.into_inner()
     }
 
+    /// A 2x2 raw RGB pattern record as a `patt` section carries it: a length
+    /// prefix, then version, colour mode, offset, name, id and three raw
+    /// 8-bit planes (the last two slots of the positional list absent).
+    fn rgb_pattern_record() -> Vec<u8> {
+        let mut body = BeWriter::new();
+        body.u32(1); // version
+        body.u32(3); // RGB
+        body.i16(0);
+        body.i16(0);
+        UnicodeString::new("Dots", 1)
+            .expect("name")
+            .write(&mut body)
+            .expect("write name");
+        PascalString::new("pat-id", 1)
+            .write(&mut body)
+            .expect("write id");
+        body.u32(3); // channel-list version
+        body.u32(0); // list length, unused
+        for edge in [0, 0, 2, 2] {
+            body.u32(edge); // top, left, bottom, right
+        }
+        body.u32(3); // declared channels
+        for plane in 0..3u8 {
+            body.u32(1); // present
+            body.u32(4 + 16 + 2 + 1 + 4); // length
+            body.u32(8); // depth
+            for edge in [0, 0, 2, 2] {
+                body.u32(edge);
+            }
+            body.u16(8);
+            body.u8(0); // raw
+            body.bytes(&[plane * 4, plane * 4 + 1, plane * 4 + 2, plane * 4 + 3]);
+        }
+        body.u32(0); // user-mask slot absent
+        body.u32(0); // transparency slot absent
+        body.u32(0); // trailing slot absent
+
+        let mut out = BeWriter::new();
+        let mut length = body.position();
+        while !length.is_multiple_of(4) {
+            length += 1;
+        }
+        out.u32(length as u32);
+        out.bytes(&body.into_inner());
+        while !out.position().is_multiple_of(4) {
+            out.u8(0);
+        }
+        out.into_inner()
+    }
+
     fn write_sample(writer: &mut BeWriter, body: &[u8]) {
         let mut length = body.len() as u32;
         while !length.is_multiple_of(4) {
@@ -1250,7 +1300,7 @@ mod tests {
         );
 
         let mut patt_body = BeWriter::new();
-        patt_body.bytes(&crate::pattern::test_support::rgb_pattern_record());
+        patt_body.bytes(&rgb_pattern_record());
 
         let mut phry_body = BeWriter::new();
         phry_body.u32(16);
