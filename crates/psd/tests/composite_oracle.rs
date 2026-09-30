@@ -199,3 +199,126 @@ fn composite_matches_photoshop_flattens() {
     }
     assert!(failures.is_empty(), "over the error limit: {failures:?}");
 }
+
+/// Photoshop's stored merged image of each document in a directory of
+/// `.merged` extracts (magic `PSDMERG1`, big-endian `u32` width, `u32` height, `u16`
+/// channels, `u16` depth, then interleaved 8-bit samples) and a
+/// `manifest.tsv` of `slug<TAB>status<TAB>detail` rows, where the slug is the
+/// source path with `/` replaced by `__`.
+///
+/// Set `PSD_COMPOSITE_MERGED` to that directory and
+/// `PSD_COMPOSITE_MERGED_SOURCES` to the directory the slugs are relative to.
+/// A stored merge is often a flat placeholder, so documents whose merge has
+/// fewer than 33 distinct colours are skipped. The worst files by mean error
+/// are listed; `PSD_COMPOSITE_FILTER` narrows the run.
+#[test]
+fn composite_tracks_stored_merges() {
+    let (Some(dir), Some(sources)) = (
+        std::env::var_os("PSD_COMPOSITE_MERGED").map(PathBuf::from),
+        std::env::var_os("PSD_COMPOSITE_MERGED_SOURCES").map(PathBuf::from),
+    ) else {
+        return;
+    };
+    let filter = std::env::var("PSD_COMPOSITE_FILTER").unwrap_or_default();
+    let manifest = std::fs::read_to_string(dir.join("manifest.tsv")).unwrap();
+    let mut rows = Vec::new();
+    for line in manifest.lines() {
+        let mut fields = line.split('\t');
+        let (Some(slug), Some(status)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if status != "ok" || !slug.contains(&filter) {
+            continue;
+        }
+        let source = sources.join(slug.replace("__", "/"));
+        let Ok(data) = std::fs::read(dir.join(format!("{slug}.merged"))) else {
+            continue;
+        };
+        if data.len() < 20 || &data[..8] != b"PSDMERG1" {
+            continue;
+        }
+        let width = u32::from_be_bytes(data[8..12].try_into().unwrap()) as usize;
+        let height = u32::from_be_bytes(data[12..16].try_into().unwrap()) as usize;
+        let channels = u16::from_be_bytes(data[16..18].try_into().unwrap()) as usize;
+        let samples = &data[20..];
+        if samples.len() < width * height * channels || !(3..=4).contains(&channels) {
+            continue;
+        }
+        // Photoshop stores a merge that has transparency already matted
+        // against white next to its alpha channel, so the colour channels are
+        // the flatten over white as they are.
+        let over_white = |index: usize| -> [u8; 3] {
+            [
+                samples[index * channels],
+                samples[index * channels + 1],
+                samples[index * channels + 2],
+            ]
+        };
+        let mut colors = std::collections::HashSet::new();
+        for index in 0..width * height {
+            colors.insert(over_white(index));
+            if colors.len() > 32 {
+                break;
+            }
+        }
+        if colors.len() <= 32 {
+            continue;
+        }
+        let Ok(file) = LayeredFile::<u8>::read(&source) else {
+            continue;
+        };
+        if (file.width as usize, file.height as usize) != (width, height) {
+            continue;
+        }
+        // The extracts read a merge's first three planes as RGB, which is
+        // wrong for any mode that is not RGB or grayscale.
+        if !matches!(
+            file.color_mode,
+            psd::core::ColorMode::Rgb | psd::core::ColorMode::Grayscale
+        ) {
+            continue;
+        }
+        let started = Instant::now();
+        let Ok(image) = file.composite_rgba8() else {
+            continue;
+        };
+        let ms = started.elapsed().as_millis();
+        let (mut sum, mut max, mut over) = (0u64, 0u32, 0usize);
+        for index in 0..width * height {
+            let reference = over_white(index);
+            let alpha = f32::from(image.rgba[index * 4 + 3]) / 255.0;
+            let mut worst = 0u32;
+            for (channel, expected) in reference.iter().enumerate() {
+                let value =
+                    f32::from(image.rgba[index * 4 + channel]) * alpha + 255.0 * (1.0 - alpha);
+                let diff = (value.round() as i32 - i32::from(*expected)).unsigned_abs();
+                sum += u64::from(diff);
+                worst = worst.max(diff);
+            }
+            max = max.max(worst);
+            if worst > 2 {
+                over += 1;
+            }
+        }
+        let pixels = (width * height) as f64;
+        rows.push((
+            sum as f64 / (pixels * 3.0),
+            max,
+            over as f64 * 100.0 / pixels,
+            ms,
+            slug.to_owned(),
+        ));
+    }
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+    println!("{} documents with a real stored merge", rows.len());
+    println!("{:>6} {:>4} {:>7} {:>6}  file", "mean", "max", ">2 %", "ms");
+    let shown = std::env::var("PSD_COMPOSITE_TOP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
+    for (mean, max, over, ms, slug) in rows.iter().take(shown) {
+        println!("{mean:>6.2} {max:>4} {over:>7.2} {ms:>6}  {slug}");
+    }
+    let median = rows.get(rows.len() / 2).map_or(0.0, |row| row.0);
+    println!("median mean error {median:.3}");
+}

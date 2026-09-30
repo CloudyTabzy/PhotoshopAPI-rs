@@ -849,7 +849,7 @@ fn stroke_band(
     // its plane's edge still has a world outside it.
     let both = with_padding_pair(matte, width, height, f64::from(pad), |matte, w, h| {
         let any_solid = matte.iter().any(|value| *value >= 0.5);
-        let contour: Vec<f32> = matte
+        let mut contour: Vec<f32> = matte
             .iter()
             .map(|value| {
                 let painted = if any_solid {
@@ -864,6 +864,18 @@ fn stroke_band(
                 }
             })
             .collect();
+        if any_solid {
+            // An anti-aliased fringe hugs solid pixels and stays outside the
+            // contour, but a faint flat region (a wash, a faded gradient) is
+            // stroked whole: a painted pixel farther than two pixels from
+            // every solid one joins the shape.
+            let to_solid = distance_transform(&contour, w, h);
+            for (index, value) in contour.iter_mut().enumerate() {
+                if *value == 0.0 && matte[index] > 0.0 && to_solid[index] > 2.0 {
+                    *value = 1.0;
+                }
+            }
+        }
         let outside = if band_out > 0.0 {
             distance_transform(&contour, w, h)
         } else {
@@ -992,8 +1004,9 @@ pub(crate) fn build_strokes(
     content: &Content,
     coverage: &[f32],
     effects: &LayerEffects,
-    canvas: Rect,
+    context: &EffectContext<'_>,
 ) -> Vec<StrokePlane> {
+    let canvas = context.canvas;
     let (width, height) = (content.width(), content.height());
     let mut planes = Vec::new();
     if width == 0 || height == 0 || coverage.len() < width * height {
@@ -1063,7 +1076,29 @@ pub(crate) fn build_strokes(
                     plane.alpha[index] = band[index] * alpha;
                 }
             }
-            StrokeFill::Pattern => continue,
+            StrokeFill::Pattern => {
+                let Some(sampler) = context.sampler(
+                    stroke.pattern.as_ref(),
+                    stroke.scale,
+                    stroke.angle,
+                    stroke.linked,
+                    stroke.phase,
+                ) else {
+                    continue;
+                };
+                for (index, coverage) in band.iter().enumerate() {
+                    if *coverage <= 0.0 {
+                        continue;
+                    }
+                    let x = content.rect.left + (index % width) as i32;
+                    let y = content.rect.top + (index / width) as i32;
+                    let (color, alpha) = sampler.sample(x, y);
+                    for (channel, value) in color.iter().enumerate() {
+                        plane.color[channel][index] = *value;
+                    }
+                    plane.alpha[index] = *coverage * alpha;
+                }
+            }
             StrokeFill::Color => {
                 let color = stroke.color.as_ref().map(color_rgb).unwrap_or([0.0; 3]);
                 for (index, coverage) in band.iter().enumerate() {

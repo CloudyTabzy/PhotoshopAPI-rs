@@ -214,20 +214,22 @@ pub(crate) fn color_rgb(color: &Color) -> [f32; 3] {
             (*green as f32 / 255.0).clamp(0.0, 1.0),
             (*blue as f32 / 255.0).clamp(0.0, 1.0),
         ],
+        // Photoshop writes a gray as a percentage of black ink.
         Color::Gray { gray } => {
-            let value = (*gray as f32 / 255.0).clamp(0.0, 1.0);
-            [value, value, value]
+            let value = (1.0 - *gray as f32 / 100.0).clamp(0.0, 1.0);
+            [value; 3]
         }
+        // CMYK components are ink percentages; the profile-free conversion.
         Color::Cmyk {
             cyan,
             magenta,
             yellow,
             black,
         } => {
-            let c = *cyan as f32 / 255.0;
-            let m = *magenta as f32 / 255.0;
-            let y = *yellow as f32 / 255.0;
-            let k = *black as f32 / 255.0;
+            let c = (*cyan as f32 / 100.0).clamp(0.0, 1.0);
+            let m = (*magenta as f32 / 100.0).clamp(0.0, 1.0);
+            let y = (*yellow as f32 / 100.0).clamp(0.0, 1.0);
+            let k = (*black as f32 / 100.0).clamp(0.0, 1.0);
             [
                 (1.0 - c) * (1.0 - k),
                 (1.0 - m) * (1.0 - k),
@@ -238,9 +240,46 @@ pub(crate) fn color_rgb(color: &Color) -> [f32; 3] {
             hue,
             saturation,
             brightness,
-        } => hsb_to_rgb(*hue as f32 / 360.0, *saturation as f32, *brightness as f32),
-        _ => [0.0; 3],
+        } => hsb_to_rgb(
+            (*hue as f32 / 360.0).rem_euclid(1.0),
+            (*saturation as f32 / 100.0).clamp(0.0, 1.0),
+            (*brightness as f32 / 100.0).clamp(0.0, 1.0),
+        ),
+        Color::Lab { lightness, a, b } => lab_to_rgb(*lightness, *a, *b),
     }
+}
+
+/// CIE L*a*b* (D50) to sRGB: XYZ, Bradford adaptation to D65, the sRGB matrix
+/// and its transfer curve.
+fn lab_to_rgb(lightness: f64, a: f64, b: f64) -> [f32; 3] {
+    let fy = (lightness + 16.0) / 116.0;
+    let fx = fy + a / 500.0;
+    let fz = fy - b / 200.0;
+    let epsilon = 216.0 / 24389.0;
+    let kappa = 24389.0 / 27.0;
+    let cube = |f: f64| {
+        if f * f * f > epsilon {
+            f * f * f
+        } else {
+            (116.0 * f - 16.0) / kappa
+        }
+    };
+    let y = if lightness > kappa * epsilon {
+        fy * fy * fy
+    } else {
+        lightness / kappa
+    };
+    let (x, z) = (cube(fx) * 0.9642, cube(fz) * 0.8249);
+    // D50 to D65 (Bradford), then XYZ to linear sRGB.
+    let xd = 0.955_576_6 * x - 0.023_039_3 * y + 0.063_163_6 * z;
+    let yd = -0.028_289_5 * x + 1.009_941_6 * y + 0.021_007_7 * z;
+    let zd = 0.012_298_2 * x - 0.020_483_0 * y + 1.329_909_8 * z;
+    let linear = [
+        3.240_454_2 * xd - 1.537_138_5 * yd - 0.498_531_4 * zd,
+        -0.969_266_0 * xd + 1.876_010_8 * yd + 0.041_556_0 * zd,
+        0.055_643_4 * xd - 0.204_025_9 * yd + 1.057_225_2 * zd,
+    ];
+    linear.map(|value| linear_to_srgb(value as f32))
 }
 
 fn hsb_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
@@ -281,7 +320,7 @@ fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
         + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
 }
 
-fn srgb_to_linear(value: f32) -> f32 {
+pub(crate) fn srgb_to_linear(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
     if value <= 0.04045 {
         value / 12.92
@@ -290,7 +329,7 @@ fn srgb_to_linear(value: f32) -> f32 {
     }
 }
 
-fn linear_to_srgb(value: f32) -> f32 {
+pub(crate) fn linear_to_srgb(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
     if value <= 0.003_130_8 {
         value * 12.92

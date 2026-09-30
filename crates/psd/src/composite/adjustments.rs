@@ -30,7 +30,7 @@ use psd_core::{
     TransparencyStop,
 };
 
-use super::ramp::{self, Placement, Ramp, Span, SpanBasis};
+use super::ramp::{self, linear_to_srgb, srgb_to_linear, Placement, Ramp, Span, SpanBasis};
 use super::{Canvas, Compositor, Content, Plane, Rect};
 use crate::layer::Layer;
 use crate::BitDepth;
@@ -57,7 +57,15 @@ pub fn apply<T: BitDepth>(
     }) else {
         return Ok(());
     };
-    let operation = Operation::new(&block.data, compositor.byte_domain);
+    let generator = blocks.iter().find_map(|block| match &block.data {
+        AdjustmentData::ContentGenerator(generator) => Some(generator),
+        _ => None,
+    });
+    let gray = matches!(
+        compositor.document.color_mode,
+        psd_core::ColorMode::Grayscale | psd_core::ColorMode::Bitmap | psd_core::ColorMode::Duotone
+    );
+    let operation = Operation::new(&block.data, generator, gray);
     if !operation.supported {
         return Ok(());
     }
@@ -113,12 +121,39 @@ pub fn apply<T: BitDepth>(
 /// One adjustment, resolved once per layer.
 struct Operation {
     data: AdjustmentData,
-    byte_domain: bool,
     supported: bool,
+    /// Brightness, contrast and whether the legacy algorithm applies: a
+    /// modern layer keeps them in its content-generator block, a legacy one
+    /// in the `brit` record.
+    brightness_contrast: (f32, f32, bool),
+    /// A single-channel document: its one channel's Levels record and Curves
+    /// curve sit where a colour document keeps the red channel's.
+    gray: bool,
 }
 
 impl Operation {
-    fn new(data: &AdjustmentData, byte_domain: bool) -> Self {
+    fn new(
+        data: &AdjustmentData,
+        generator: Option<&psd_core::adjustments::ContentGenerator>,
+        gray: bool,
+    ) -> Self {
+        let brightness_contrast = match (data, generator) {
+            (AdjustmentData::BrightnessContrast(legacy), Some(generator))
+                if generator.brightness().is_some() =>
+            {
+                (
+                    generator.brightness().unwrap_or(0.0) as f32,
+                    generator.contrast().unwrap_or(0.0) as f32,
+                    generator.use_legacy().unwrap_or(false) || legacy.lab_only,
+                )
+            }
+            (AdjustmentData::BrightnessContrast(legacy), _) => (
+                f32::from(legacy.brightness),
+                f32::from(legacy.contrast),
+                true,
+            ),
+            _ => (0.0, 0.0, true),
+        };
         let supported = matches!(
             data,
             AdjustmentData::BrightnessContrast(_)
@@ -138,35 +173,32 @@ impl Operation {
         );
         Self {
             data: data.clone(),
-            byte_domain,
             supported,
+            brightness_contrast,
+            gray,
         }
     }
 
     fn apply(&self, color: [f32; 3]) -> [f32; 3] {
         match &self.data {
             AdjustmentData::Invert { .. } => [1.0 - color[0], 1.0 - color[1], 1.0 - color[2]],
-            AdjustmentData::BrightnessContrast(settings) => {
-                let brightness = f32::from(settings.brightness);
-                let contrast = f32::from(settings.contrast);
-                let legacy = settings.lab_only || self.byte_domain;
-                let mut out = [0.0; 3];
-                for channel in 0..3 {
-                    out[channel] =
-                        brightness_contrast(color[channel], brightness, contrast, legacy);
-                }
-                out
+            AdjustmentData::BrightnessContrast(_) => {
+                let (brightness, contrast, legacy) = self.brightness_contrast;
+                color.map(|value| brightness_contrast(value, brightness, contrast, legacy))
             }
-            AdjustmentData::Levels(levels) => levels_apply(color, levels),
-            AdjustmentData::Curves(curves) => curves_apply(color, &curves.curves),
+            AdjustmentData::Levels(levels) => levels_apply(color, levels, self.gray),
+            AdjustmentData::Curves(curves) => curves_apply(color, &curves.curves, self.gray),
             AdjustmentData::Exposure(exposure) => {
-                let mut out = [0.0; 3];
-                for channel in 0..3 {
-                    let value =
-                        color[channel] * 2f32.powf(exposure.exposure) + exposure.offset - 0.5;
-                    out[channel] = value.max(0.0).powf(1.0 / exposure.gamma.max(0.01));
-                }
-                out
+                // Photoshop works in linear light: the gain and the offset
+                // apply there, the gamma correction follows, and the result
+                // is re-encoded. (Fitted against Photoshop's own renders to
+                // under one level.)
+                let gain = 2f32.powf(exposure.exposure);
+                let inverse_gamma = 1.0 / exposure.gamma.max(0.01);
+                color.map(|value| {
+                    let linear = srgb_to_linear(value) * gain + exposure.offset;
+                    linear_to_srgb(linear.max(0.0).powf(inverse_gamma))
+                })
             }
             AdjustmentData::HueSaturation(settings) => hue_saturation(
                 color,
@@ -284,18 +316,20 @@ fn modern_brightness(value: f32, amount: f32) -> f32 {
 /// to (1, 1) with end slope `τ = max(0.1, 1 / (1 + 12(σ − 1)))`.
 fn modern_brightness_curve(value: f32, amount: f32) -> f32 {
     let sigma = 2f32.powf(amount / 110.0);
-    let tau = (1.0 / (1.0 + 12.0 * (sigma - 1.0))).max(0.1);
+    let tau = (1.0 / (1.0 + 12.0 * (sigma - 1.0))).clamp(0.1, 1.0);
     let x0 = 0.5 / sigma;
     if value <= x0 {
         return (value * sigma).clamp(0.0, 1.0);
     }
-    let t = ((value - x0) / (1.0 - x0)).clamp(0.0, 1.0);
+    // A cubic Hermite from (x0, 0.5) with the ray's slope σ to (1, 1) with
+    // slope τ; the tangents scale by the interval's length.
+    let length = 1.0 - x0;
+    let t = ((value - x0) / length).clamp(0.0, 1.0);
     let h00 = 2.0 * t * t * t - 3.0 * t * t + 1.0;
     let h10 = t * t * t - 2.0 * t * t + t;
     let h01 = -2.0 * t * t * t + 3.0 * t * t;
     let h11 = t * t * t - t * t;
-    let slope = tau * (1.0 - x0) / 0.5f32.max(1e-6);
-    (h00 * 0.5 + h10 * slope + h01 * 1.0 + h11 * tau).clamp(0.0, 1.0)
+    (h00 * 0.5 + h10 * sigma * length + h01 + h11 * tau * length).clamp(0.0, 1.0)
 }
 
 fn modern_contrast(value: f32, c: f32) -> f32 {
@@ -315,7 +349,7 @@ fn modern_contrast(value: f32, c: f32) -> f32 {
 // Levels and Curves
 // ---------------------------------------------------------------------------
 
-fn levels_apply(color: [f32; 3], levels: &Levels) -> [f32; 3] {
+fn levels_apply(color: [f32; 3], levels: &Levels, gray: bool) -> [f32; 3] {
     let map = |record: &psd_core::adjustments::LevelsRecord, value: f32| -> f32 {
         let floor = f32::from(record.input_floor);
         let ceiling = f32::from(record.input_ceiling);
@@ -331,7 +365,18 @@ fn levels_apply(color: [f32; 3], levels: &Levels) -> [f32; 3] {
         ((output_floor + corrected * (output_ceiling - output_floor)) / 255.0).clamp(0.0, 1.0)
     };
     // Record 0 is the composite, then R, G, B. The per-channel records apply
-    // first and the composite record acts on their result.
+    // first and the composite record acts on their result. A grayscale
+    // document's single channel uses record 1.
+    if gray {
+        let mut value = color[0];
+        if let Some(record) = levels.records.get(1) {
+            value = map(record, value);
+        }
+        if let Some(record) = levels.records.first() {
+            value = map(record, value);
+        }
+        return [value; 3];
+    }
     let mut out = color;
     for (value, record) in out.iter_mut().zip(levels.records.iter().skip(1)) {
         *value = map(record, *value);
@@ -344,35 +389,52 @@ fn levels_apply(color: [f32; 3], levels: &Levels) -> [f32; 3] {
     out
 }
 
-fn curves_apply(color: [f32; 3], curves: &[Curve]) -> [f32; 3] {
+fn curves_apply(color: [f32; 3], curves: &[Curve], gray: bool) -> [f32; 3] {
     let mut out = color;
-    for curve in curves {
-        let channel = match curve.channel {
-            1 => Some(0),
-            2 => Some(1),
-            3 => Some(2),
-            _ => None,
-        };
-        let table = match &curve.data {
-            CurveData::Points(points) => curve_lut(points),
-            CurveData::Map(values) => {
-                let mut table = [0.0f32; 256];
-                for (index, entry) in table.iter_mut().enumerate() {
-                    *entry = f32::from(*values.get(index).unwrap_or(&(index as u8))) / 255.0;
-                }
-                table
+    if gray {
+        // The single channel's own curve (channel 1) first, then the
+        // composite (channel 0).
+        let mut value = color[0];
+        for wanted in [1, 0] {
+            for curve in curves.iter().filter(|curve| curve.channel == wanted) {
+                value = sample_lut(&curve_table(curve), value);
             }
-        };
-        match channel {
-            Some(channel) => out[channel] = sample_lut(&table, out[channel]),
-            None => {
-                for value in out.iter_mut() {
-                    *value = sample_lut(&table, *value);
-                }
-            }
+        }
+        return [value; 3];
+    }
+    // The per-channel curves apply first, whatever their order in the file,
+    // and the composite curve acts on their result.
+    for curve in curves
+        .iter()
+        .filter(|curve| (1..=3).contains(&curve.channel))
+    {
+        let channel = usize::from(curve.channel - 1);
+        out[channel] = sample_lut(&curve_table(curve), out[channel]);
+    }
+    for curve in curves
+        .iter()
+        .filter(|curve| !(1..=3).contains(&curve.channel))
+    {
+        let table = curve_table(curve);
+        for value in out.iter_mut() {
+            *value = sample_lut(&table, *value);
         }
     }
     out
+}
+
+/// A curve's 256-entry table.
+fn curve_table(curve: &Curve) -> [f32; 256] {
+    match &curve.data {
+        CurveData::Points(points) => curve_lut(points),
+        CurveData::Map(values) => {
+            let mut table = [0.0f32; 256];
+            for (index, entry) in table.iter_mut().enumerate() {
+                *entry = f32::from(*values.get(index).unwrap_or(&(index as u8))) / 255.0;
+            }
+            table
+        }
+    }
 }
 
 /// A 256-entry table from a natural cubic spline through the control points.
@@ -902,4 +964,28 @@ pub(super) fn paint_content<T: BitDepth>(
         _ => return None,
     }
     Some(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modern_brightness_contrast_follows_photoshops_curve() {
+        // Samples of a Photoshop render of a gray ramp at brightness 23,
+        // contrast 70.
+        for (input, expected) in [(64.0, 57.0), (128.0, 157.0), (160.0, 200.0), (192.0, 229.0)] {
+            let value = brightness_contrast(input / 255.0, 23.0, 70.0, false) * 255.0;
+            assert!(
+                (value - expected).abs() < 1.5,
+                "{input}: {value} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gray_descriptor_colour_is_a_percentage_of_black() {
+        let color = super::super::ramp::color_rgb(&psd_core::Color::Gray { gray: 25.0 });
+        assert!((color[0] - 0.75).abs() < 1e-6);
+    }
 }

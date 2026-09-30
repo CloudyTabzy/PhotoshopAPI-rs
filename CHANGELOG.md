@@ -12,6 +12,42 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-09-30
+
+The compositor is now also checked against the merged image Photoshop stored in real documents
+(a second env-gated probe in `tests/composite_oracle.rs`). Across 200 documents the median
+mean error is 0.2 levels, and this pass fixed the real-world failures it exposed.
+
+### Fixed
+
+- **Fill layers never rendered**: a solid, gradient or pattern fill layer was routed to the
+  adjustment path, which skips fills.
+- Modern Brightness/Contrast read its values from the wrong block (they live in the content
+  generator's descriptor, the `brit` record is a legacy placeholder) and applied the legacy
+  formula to 8-bit documents; its brightness Hermite used the wrong start tangent.
+- Exposure worked in the encoded domain with a bogus -0.5 offset; it now applies gain and offset
+  in linear light, then gamma, then re-encodes (within one level of Photoshop).
+- Curves applied the composite curve before the per-channel curves; Levels and Curves on a
+  grayscale document read the wrong channel (its single channel uses the record that a colour
+  document keeps for red).
+- Descriptor colours: gray is a percentage of black, CMYK and HSB saturation/brightness are
+  percentages (they were read as 0-255), and Lab colours now convert to sRGB.
+- A pass-through group with a fill opacity isolates (its adjustments reach only its own
+  content) and the fill scales the merged result like the opacity does.
+- Effects on a shape follow the path, not its fill's transparency, so a gradient fill that fades
+  out keeps a full outline; a stroke promotes a faint flat region to the shape instead of
+  stroking only the solid part.
+- Clipping to a group or an adjustment layer: the clipped layers see the group's silhouette or
+  the adjustment's mask instead of nothing.
+
+### Added
+
+- **Artboards** composite as isolated units clipped to their rectangle over their background
+  (white, black, transparent or a custom colour).
+- CMYK documents convert to RGB with the profile-free device formula instead of reading the
+  first three planes as RGB.
+- Pattern strokes (layer-effect Stroke with a pattern fill).
+
 ## [0.11.2] - 2026-09-30
 
 Bevel and emboss, and shape layers. On the reference flattens every shape fixture now

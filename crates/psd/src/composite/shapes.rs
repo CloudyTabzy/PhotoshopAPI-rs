@@ -177,6 +177,9 @@ impl<T: BitDepth> Compositor<'_, T> {
             vec![0.0f32; width * height],
         ];
         let mut alpha = vec![0.0f32; width * height];
+        // The shape's own silhouette, without the fill's transparency: the
+        // matte layer effects follow.
+        let mut silhouette = vec![0.0f32; width * height];
         for y in 0..height {
             for x in 0..width {
                 let index = y * width + x;
@@ -200,6 +203,11 @@ impl<T: BitDepth> Compositor<'_, T> {
                 }
                 let out_alpha = stroke_alpha + fill_alpha * (1.0 - stroke_alpha);
                 alpha[index] = out_alpha;
+                let stroke_cover = stroke_plane
+                    .as_ref()
+                    .map_or(0.0, |plane| plane[index] * stroke_opacity);
+                let fill_cover = if fill_enabled { shape[index] } else { 0.0 };
+                silhouette[index] = stroke_cover + fill_cover * (1.0 - stroke_cover);
                 for channel in 0..3 {
                     premult[channel][index] = stroke_color[channel] * stroke_alpha
                         + fill.color[channel][source] * fill_alpha * (1.0 - stroke_alpha);
@@ -208,6 +216,7 @@ impl<T: BitDepth> Compositor<'_, T> {
         }
         if feather > 0.0 {
             gaussian_blur(&mut alpha, width, height, feather);
+            gaussian_blur(&mut silhouette, width, height, feather);
             for plane in &mut premult {
                 gaussian_blur(plane, width, height, feather);
             }
@@ -215,6 +224,7 @@ impl<T: BitDepth> Compositor<'_, T> {
 
         // Crop back to the canvas, un-premultiply, apply density.
         let mut out = Content::new(rect);
+        let mut out_silhouette = vec![0.0f32; out.alpha.len()];
         let (out_width, out_height) = (out.width(), out.height());
         for y in 0..out_height {
             for x in 0..out_width {
@@ -246,8 +256,15 @@ impl<T: BitDepth> Compositor<'_, T> {
                     out.color[channel][to] = value.clamp(0.0, 1.0);
                 }
                 out.alpha[to] = a.clamp(0.0, 1.0);
+                let cover = silhouette[from];
+                out_silhouette[to] = match density {
+                    Some(density) => 1.0 - density + density * cover,
+                    None => cover,
+                }
+                .clamp(0.0, 1.0);
             }
         }
+        out.shape = Some(out_silhouette);
         out.mask = fill.mask;
         out
     }
