@@ -59,7 +59,10 @@ pub fn apply<T: BitDepth>(
     let Some(block) = blocks.iter().find(|block| {
         !matches!(
             block.kind,
-            AdjustmentKind::SolidColor | AdjustmentKind::GradientFill | AdjustmentKind::PatternFill
+            AdjustmentKind::SolidColor
+                | AdjustmentKind::GradientFill
+                | AdjustmentKind::PatternFill
+                | AdjustmentKind::ContentGenerator
         )
     }) else {
         return Ok(());
@@ -113,10 +116,15 @@ pub fn apply<T: BitDepth>(
                     continue;
                 }
             }
+            // An adjustment supplies a transformed source color, then its
+            // layer blend mode meets the backdrop. It does not add coverage:
+            // the backdrop's alpha is retained, including partial transparency.
+            let blended =
+                super::blend::blend(layer.blend_mode, color, adjusted, compositor.byte_domain);
             let mut result = color;
             for (channel, value) in result.iter_mut().enumerate() {
                 if !restricted[channel] {
-                    *value = color[channel] + (adjusted[channel] - color[channel]) * coverage;
+                    *value = color[channel] + (blended[channel] - color[channel]) * coverage;
                 }
             }
             canvas.set(index, result, alpha);
@@ -136,6 +144,8 @@ struct Operation {
     /// A single-channel document: its one channel's Levels record and Curves
     /// curve sit where a colour document keeps the red channel's.
     gray: bool,
+    /// Curves are baked once, using the extended channel records when present.
+    curves: Vec<(u16, [f32; 256])>,
 }
 
 impl Operation {
@@ -183,6 +193,14 @@ impl Operation {
             supported,
             brightness_contrast,
             gray,
+            curves: match data {
+                AdjustmentData::Curves(curves) => curves
+                    .effective_curves()
+                    .iter()
+                    .map(|curve| (curve.channel, curve_table(curve)))
+                    .collect(),
+                _ => Vec::new(),
+            },
         }
     }
 
@@ -194,7 +212,7 @@ impl Operation {
                 color.map(|value| brightness_contrast(value, brightness, contrast, legacy))
             }
             AdjustmentData::Levels(levels) => levels_apply(color, levels, self.gray),
-            AdjustmentData::Curves(curves) => curves_apply(color, &curves.curves, self.gray),
+            AdjustmentData::Curves(_) => curves_apply(color, &self.curves, self.gray),
             AdjustmentData::Exposure(exposure) => {
                 // Photoshop works in linear light: the gain and the offset
                 // apply there, the gamma correction follows, and the result
@@ -408,35 +426,31 @@ fn levels_apply(color: [f32; 3], levels: &Levels, gray: bool) -> [f32; 3] {
     out
 }
 
-fn curves_apply(color: [f32; 3], curves: &[Curve], gray: bool) -> [f32; 3] {
+fn curves_apply(color: [f32; 3], curves: &[(u16, [f32; 256])], gray: bool) -> [f32; 3] {
     let mut out = color;
     if gray {
         // The single channel's own curve (channel 1) first, then the
         // composite (channel 0).
         let mut value = color[0];
         for wanted in [1, 0] {
-            for curve in curves.iter().filter(|curve| curve.channel == wanted) {
-                value = sample_lut(&curve_table(curve), value);
+            for (_, table) in curves.iter().filter(|(channel, _)| *channel == wanted) {
+                value = sample_lut(table, value);
             }
         }
         return [value; 3];
     }
     // The per-channel curves apply first, whatever their order in the file,
     // and the composite curve acts on their result.
-    for curve in curves
+    for (channel, table) in curves
         .iter()
-        .filter(|curve| (1..=3).contains(&curve.channel))
+        .filter(|(channel, _)| (1..=3).contains(channel))
     {
-        let channel = usize::from(curve.channel - 1);
-        out[channel] = sample_lut(&curve_table(curve), out[channel]);
+        let channel = usize::from(*channel - 1);
+        out[channel] = sample_lut(table, out[channel]);
     }
-    for curve in curves
-        .iter()
-        .filter(|curve| !(1..=3).contains(&curve.channel))
-    {
-        let table = curve_table(curve);
+    for (_, table) in curves.iter().filter(|(channel, _)| *channel == 0) {
         for value in out.iter_mut() {
-            *value = sample_lut(&table, *value);
+            *value = sample_lut(table, *value);
         }
     }
     out

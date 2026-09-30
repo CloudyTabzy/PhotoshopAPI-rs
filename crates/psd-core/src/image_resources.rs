@@ -32,11 +32,11 @@ use crate::types::FixedFloat4;
 pub const ID_RESOLUTION_INFO: u16 = 1005;
 /// `8BIM` id of the ICC profile block ([`IccProfileBlock`]).
 pub const ID_ICC_PROFILE: u16 = 1039;
-/// `8BIM` id of the grid and guides block ([`GridGuides`](crate::grid_guides::GridGuides)).
+/// `8BIM` id of the grid and guides block ([`GridGuides`]).
 pub const ID_GRID_AND_GUIDES: u16 = 1032;
-/// `8BIM` id of the slices block ([`SlicesResource`](crate::slices::SlicesResource)).
+/// `8BIM` id of the slices block ([`SlicesResource`]).
 pub const ID_SLICES: u16 = 1050;
-/// `8BIM` id of the layer comps block ([`LayerComps`](crate::layer_comps::LayerComps)).
+/// `8BIM` id of the layer comps block ([`LayerComps`]).
 pub const ID_LAYER_COMPS: u16 = 1065;
 
 /// A single image-resource block.

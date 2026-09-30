@@ -6,16 +6,18 @@
 //! 1. **Content.** A layer's color and alpha channels are placed at its bounds,
 //!    clipped to the canvas; a layer with no alpha channel is opaque inside its
 //!    bounds. Fill layers generate their content instead (solid color or
-//!    gradient). Text and shape layers contribute the raster preview Photoshop
-//!    stored, so no font or path engine is needed.
+//!    gradient or pattern). Shape layers render from their vector paths and
+//!    strokes; text layers contribute the raster preview Photoshop stored.
 //! 2. **Effects.** Outer effects (drop shadow, outer glow) paint *below* the
-//!    content; interior overlays fold into the content's color; interior
+//!    content; interior overlays fold into the content's color, or paint
+//!    independently when the fill and effects are separated; interior
 //!    effects (satin, inner glow, inner shadow) paint above it inside the
-//!    silhouette. See [`effects`].
+//!    silhouette. The renderer evaluates effect geometry and blending in
+//!    separate internal modules.
 //! 3. **Coverage.** Alpha × the layer mask (raster `-2` channel, honoring its
 //!    default color outside the mask rect) × clipping (a `clip = 1` layer is
 //!    masked by its base's coverage) × the blend-if gates.
-//! 4. **Blend.** The calibrated blend math in [`blend`] with layer opacity and
+//! 4. **Blend.** The calibrated blend math with layer opacity and
 //!    fill opacity, then source-over onto the canvas.
 //! 5. **Adjustment layers** transform the backdrop in place inside their mask.
 //! 6. **Groups** either pass through (children meet the true backdrop, then the
@@ -23,9 +25,9 @@
 //!    isolate (children composite into a transparent buffer that meets the
 //!    backdrop with the group's blend mode, opacity and mask).
 //!
-//! Documented gaps: bevel/emboss, pattern overlay and pattern fill, noise and
-//! contour shaping, knockout, the special "Precise" glow techniques, vector
-//! rasterization (the stored preview is used), and CMYK/Lab color conversion.
+//! Documented gaps: noise and jitter, soft-effect contour shaping, knockout,
+//! the "Precise" glow techniques, special fill-opacity blend kernels, per-range
+//! Hue/Saturation adjustments, and profile-aware CMYK/Lab document conversion.
 //!
 //! The canvas is float, and for 8-bit documents the modes whose rounding
 //! Photoshop pins (Color Burn, Color Dodge, Exclusion, Divide) are computed in
@@ -44,7 +46,7 @@ mod shapes;
 mod stroke;
 mod tile;
 
-use psd_core::{BlendMode, ColorMode, LayerBlendingRanges, Result};
+use psd_core::{BlendMode, ColorMode, LayerBlendingRanges, PsdError, Result};
 
 use crate::channels::ChannelKey;
 use crate::layer::{Layer, LayerKind, Rect};
@@ -230,17 +232,25 @@ struct Compositor<'a, T: BitDepth> {
 
 impl<T: BitDepth> LayeredFile<T> {
     /// Flatten the layer stack into an 8-bit straight-alpha RGBA image.
+    ///
+    /// Visible layers must have decoded channels. After a lazy read, call
+    /// [`decode_layer_pixels`](Self::decode_layer_pixels) for those layers
+    /// first; otherwise this returns [`PsdError::InvalidData`]. Decoding stays
+    /// explicit so the document's bitmap memory budget is honored.
     pub fn composite_rgba8(&self) -> Result<CompositeImage> {
         self.composite_rgba8_with(CompositeOptions::default())
     }
 
     /// Flatten the layer stack with explicit options.
+    ///
+    /// Like [`composite_rgba8`](Self::composite_rgba8), this requires decoded
+    /// channels for visible layers that participate in rendering.
     pub fn composite_rgba8_with(&self, options: CompositeOptions) -> Result<CompositeImage> {
         let compositor = Compositor {
             document: self,
             options,
             byte_domain: T::DEPTH == 8,
-            patterns: if options.effects {
+            patterns: if options.effects || options.adjustments {
                 self.patterns()
             } else {
                 Vec::new()
@@ -389,10 +399,25 @@ impl<T: BitDepth> Compositor<'_, T> {
         let Some(layer) = self.document.layer(id) else {
             return Ok(None);
         };
+        if matches!(layer.kind, LayerKind::Adjustment(_))
+            && !self.is_fill_layer(layer)
+            && !self.options.adjustments
+        {
+            return Ok(None);
+        }
+        if layer
+            .channels()
+            .is_some_and(|channels| channels.raw_channels().next().is_some())
+        {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "compositing requires decoded channels; call decode_layer_pixels for visible layers after a lazy read",
+            });
+        }
         match &layer.kind {
             LayerKind::SectionDivider(_) => Ok(None),
             LayerKind::Group(_) => {
-                self.composite_group(id, canvas)?;
+                self.composite_group(id, canvas, clip_base)?;
                 Ok(None)
             }
             // A fill layer is content; every other adjustment transforms what
@@ -466,10 +491,7 @@ impl<T: BitDepth> Compositor<'_, T> {
         // Interior effects paint over the canvas after the layer, with their
         // own blend modes, when the layer's mode or fill opacity would
         // otherwise change them (Blend Interior Effects as Group is off).
-        let mut interior_after: Option<(psd_core::LayerEffects, Vec<f32>, Rect)> = None;
-        // A Normal layer whose fill opacity scales its pixels but not its
-        // interior effects draws them as a second pass over its own pixels.
-        let mut effect_pass: Option<(Content, Vec<f32>)> = None;
+        let mut interior_after: Vec<effects::OuterPlane> = Vec::new();
         if self.options.effects {
             if let Some(effects) = self.typed_effects(layer) {
                 let canvas_rect = Rect::new(
@@ -484,19 +506,9 @@ impl<T: BitDepth> Compositor<'_, T> {
                     effects::fold_interior_overlays(&mut content, &matte, &effects, &context);
                     effects::paint_interior(&mut content, &matte, &effects);
                 } else if effects::has_interior_effects(&effects) {
-                    if mode == BlendMode::NORMAL {
-                        let context = self.effect_context(layer, canvas_rect);
-                        let mut folded = Content::new(content.rect);
-                        folded.color = content.color.clone();
-                        folded.alpha = vec![1.0; content.alpha.len()];
-                        effects::fold_interior_overlays(&mut folded, &matte, &effects, &context);
-                        effects::paint_interior(&mut folded, &matte, &effects);
-                        let weight = effects::interior_strength(&effects);
-                        let cover = matte.iter().map(|value| value * weight).collect();
-                        effect_pass = Some((folded, cover));
-                    } else {
-                        interior_after = Some((effects.clone(), matte.clone(), canvas_rect));
-                    }
+                    let context = self.effect_context(layer, canvas_rect);
+                    interior_after =
+                        effects::build_interior(content.rect, &matte, &effects, &context);
                 }
                 outer = effects::build_outer(&content, &matte, &effects, canvas_rect);
                 // A stroke follows the pixel shape, reshaped by the mask only
@@ -558,38 +570,85 @@ impl<T: BitDepth> Compositor<'_, T> {
         for value in &mut clip_plane.data {
             *value *= group_strength;
         }
-        self.blend_content(
-            &content,
-            canvas,
-            layer,
-            Some(&coverage),
-            mode,
-            group_strength,
-            clip_base,
-            true,
-        );
-        if let Some((folded, cover)) = &effect_pass {
+        if interior_after.is_empty() {
             self.blend_content(
-                folded,
-                canvas,
-                layer,
-                Some(cover),
-                BlendMode::NORMAL,
-                self.opacity(layer, false),
-                None,
-                false,
-            );
-        }
-        if let Some((effects, pre_knockout, canvas_rect)) = &interior_after {
-            self.paint_group_interior(
-                canvas,
-                layer,
                 &content,
-                pre_knockout,
-                effects,
-                *canvas_rect,
+                canvas,
+                layer,
+                Some(&coverage),
+                mode,
+                group_strength,
+                clip_base,
+                true,
+            );
+        } else {
+            // Resolve content and independent effects at their intrinsic
+            // opacity over the actual backdrop, then apply the layer's
+            // silhouette, mask, clip coverage and master opacity once to the
+            // complete result. This preserves translucent backdrops without
+            // exposing hidden fill color through the effects.
+            let snapshot = snapshot_canvas(canvas, content.rect);
+            let mut content_coverage: Vec<f32> = coverage
+                .iter()
+                .zip(&matte)
+                .map(|(&value, &matte)| {
+                    if matte > f32::EPSILON {
+                        value / matte
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            for value in &mut content_coverage {
+                *value = value.clamp(0.0, 1.0);
+            }
+            let fill_strength = if with_fill {
+                f32::from(layer.fill()) / 255.0
+            } else {
+                1.0
+            };
+            self.blend_content(
+                &content,
+                canvas,
+                layer,
+                Some(&content_coverage),
+                mode,
+                fill_strength,
+                None,
+                true,
+            );
+            for plane in &mut interior_after {
+                for (effect_alpha, &matte) in plane.content.alpha.iter_mut().zip(&matte) {
+                    *effect_alpha = if matte > f32::EPSILON {
+                        (*effect_alpha / matte).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                }
+                self.blend_content(
+                    &plane.content,
+                    canvas,
+                    layer,
+                    None,
+                    plane.blend_mode,
+                    1.0,
+                    None,
+                    false,
+                );
+            }
+            let mut contribution = matte;
+            if let Some(clip_base) = clip_base {
+                for (index, value) in contribution.iter_mut().enumerate() {
+                    let x = content.rect.left + (index % content.width()) as i32;
+                    let y = content.rect.top + (index / content.width()) as i32;
+                    *value *= clip_base.at(x, y);
+                }
+            }
+            fade_toward(
+                canvas,
+                &snapshot,
                 self.opacity(layer, false),
-                false,
+                Some(&contribution),
             );
         }
         for plane in strokes.iter().filter(|plane| plane.above_content()) {
@@ -744,7 +803,56 @@ impl<T: BitDepth> Compositor<'_, T> {
 
     /// Composite a group: pass through, or isolated when it has its own blend
     /// mode, and then fade by the group's opacity and mask.
-    fn composite_group(&self, id: usize, canvas: &mut Canvas) -> Result<()> {
+    fn composite_group(
+        &self,
+        id: usize,
+        canvas: &mut Canvas,
+        clip_base: Option<&Plane>,
+    ) -> Result<()> {
+        let Some(clip_base) = clip_base else {
+            return self.composite_group_unclipped(id, canvas);
+        };
+        let canvas_rect = Rect::new(
+            canvas.origin.1,
+            canvas.origin.0,
+            canvas.origin.1 + canvas.height as i32,
+            canvas.origin.0 + canvas.width as i32,
+        );
+        let mut rect = self.subtree_bounds(id).unwrap_or(canvas_rect);
+        if let Some(layer) = self.document.layer(id) {
+            if self.options.effects {
+                if let Some(effects) = self.typed_effects(layer) {
+                    rect = effects::padded_rect(&rect, &effects);
+                }
+            }
+            if let Some(board) = layer.artboard()?.and_then(|board| board.rect()) {
+                rect = union_rect(
+                    rect,
+                    Rect::new(
+                        board.top.round() as i32,
+                        board.left.round() as i32,
+                        board.bottom.round() as i32,
+                        board.right.round() as i32,
+                    ),
+                );
+            }
+        }
+        rect = clamp_to_canvas_rect(rect, canvas_rect);
+        // Preserve the true backdrop for pass-through children, then gate the
+        // whole group's contribution (effects included) in premultiplied space.
+        let snapshot = snapshot_canvas(canvas, rect);
+        self.composite_group_unclipped(id, canvas)?;
+        let mut coverage = Vec::with_capacity(snapshot.alpha.len());
+        for y in rect.top..rect.bottom {
+            for x in rect.left..rect.right {
+                coverage.push(clip_base.at(x, y));
+            }
+        }
+        fade_toward(canvas, &snapshot, 1.0, Some(&coverage));
+        Ok(())
+    }
+
+    fn composite_group_unclipped(&self, id: usize, canvas: &mut Canvas) -> Result<()> {
         let Some(layer) = self.document.layer(id) else {
             return Ok(());
         };
@@ -804,7 +912,7 @@ impl<T: BitDepth> Compositor<'_, T> {
             self.composite_children(Some(id), canvas)?;
             let mask = self.mask_plane(layer, bounds);
             if opacity < 1.0 || mask.is_some() {
-                fade_toward(canvas, &snapshot, bounds, opacity, mask.as_deref());
+                fade_toward(canvas, &snapshot, opacity, mask.as_deref());
             }
             // Interior effects paint above the children, inside the silhouette.
             if let (Some(effects), Some((content, coverage))) = (&styled, &silhouette) {
@@ -816,7 +924,6 @@ impl<T: BitDepth> Compositor<'_, T> {
                     effects,
                     canvas_rect,
                     opacity,
-                    true,
                 );
             }
             return Ok(());
@@ -913,7 +1020,6 @@ impl<T: BitDepth> Compositor<'_, T> {
         effects: &psd_core::LayerEffects,
         canvas_rect: Rect,
         opacity: f32,
-        with_strokes: bool,
     ) {
         let scaled: Vec<f32> = coverage.iter().map(|value| value * opacity).collect();
         let copy_canvas = |canvas: &Canvas| -> Content {
@@ -965,10 +1071,8 @@ impl<T: BitDepth> Compositor<'_, T> {
         effects::paint_interior(&mut painted, &scaled, effects);
         write_back(canvas, &painted, None);
         // Strokes draw above, at the group's opacity.
-        if with_strokes {
-            for plane in effects::build_strokes(silhouette, coverage, effects, &context) {
-                self.draw_stroke_with(&plane, canvas, layer, opacity);
-            }
+        for plane in effects::build_strokes(silhouette, coverage, effects, &context) {
+            self.draw_stroke_with(&plane, canvas, layer, opacity);
         }
     }
 
@@ -1017,31 +1121,48 @@ impl<T: BitDepth> Compositor<'_, T> {
         }
     }
 
-    /// Every layer id in a subtree, the root included.
-    fn subtree_ids(&self, id: usize) -> Vec<usize> {
-        let mut out = Vec::new();
-        let mut stack = vec![id];
-        while let Some(current) = stack.pop() {
-            out.push(current);
-            if let Some(children) = self.document.children(Some(current)) {
-                stack.extend(children.iter().copied());
-            }
-        }
-        out
-    }
-
     /// The document-space bounds a subtree touches, clamped to the canvas.
     fn subtree_bounds(&self, id: usize) -> Option<Rect> {
         let mut bounds: Option<Rect> = None;
         // The group itself has no pixels of its own; its descendants do.
-        for child in self.subtree_ids(id).into_iter().skip(1) {
+        for &child in self.document.children(Some(id))? {
             let Some(layer) = self.document.layer(child) else {
                 continue;
             };
             if !layer.is_visible() || matches!(layer.kind, LayerKind::SectionDivider(_)) {
                 continue;
             }
-            let rect = if matches!(layer.kind, LayerKind::Adjustment(_)) {
+            let rect = if matches!(layer.kind, LayerKind::Group(_)) {
+                // A nested group's effects follow its merged children, not
+                // the often-empty rectangle in its layer record. Carry those
+                // bounds upward so snapshots include every rendered pixel.
+                let mut rect = self.subtree_bounds(child);
+                if let Some(board) = layer
+                    .artboard()
+                    .ok()
+                    .flatten()
+                    .and_then(|board| board.rect())
+                {
+                    let board = Rect::new(
+                        board.top.round() as i32,
+                        board.left.round() as i32,
+                        board.bottom.round() as i32,
+                        board.right.round() as i32,
+                    );
+                    rect = Some(rect.map_or(board, |rect| union_rect(rect, board)));
+                }
+                let Some(mut rect) = rect else {
+                    continue;
+                };
+                if self.options.effects {
+                    if let Some(effects) = self.typed_effects(layer) {
+                        rect = effects::padded_rect(&rect, &effects);
+                    }
+                }
+                rect
+            } else if matches!(layer.kind, LayerKind::Adjustment(_))
+                || (self.options.adjustments && self.is_fill_layer(layer))
+            {
                 // An adjustment reaches every pixel beneath it, and a fill
                 // layer covers the whole canvas.
                 Rect::new(
@@ -1273,7 +1394,6 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
 
 /// Straight-alpha canvas snapshot over a bounded rect.
 pub(crate) struct Snapshot {
-    #[allow(dead_code)]
     rect: Rect,
     color: [Vec<f32>; 3],
     alpha: Vec<f32>,
@@ -1306,15 +1426,10 @@ fn snapshot_canvas(canvas: &Canvas, rect: Rect) -> Snapshot {
     snapshot
 }
 
-/// Interpolate the canvas back toward a snapshot by `keep` (the group's
-/// opacity), in premultiplied space: the group's contribution is scaled.
-fn fade_toward(
-    canvas: &mut Canvas,
-    snapshot: &Snapshot,
-    rect: Rect,
-    opacity: f32,
-    mask: Option<&[f32]>,
-) {
+/// Interpolate the canvas back toward a snapshot by the group's opacity and
+/// coverage, in premultiplied space: the group's contribution is scaled.
+fn fade_toward(canvas: &mut Canvas, snapshot: &Snapshot, opacity: f32, mask: Option<&[f32]>) {
+    let rect = snapshot.rect;
     let width = rect.width().max(0) as usize;
     for y in rect.top..rect.bottom {
         for x in rect.left..rect.right {

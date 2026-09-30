@@ -21,9 +21,8 @@
 //! Every soft computation runs over the matte padded with transparent pixels,
 //! so the blur sees the empty world beyond the layer's edge.
 //!
-//! Documented gaps: bevel/emboss, pattern overlay, noise and jitter, contour
-//! shaping beyond Linear, the "Precise" glow techniques and stroke overprint
-//! knockout.
+//! Documented gaps: noise and jitter, soft-effect contour shaping, and the
+//! "Precise" glow techniques.
 
 use psd_core::effect_enums::{GlowSource, StrokeFill, StrokePosition};
 use psd_core::{BlendMode, Gradient, LayerEffects, Shadow};
@@ -103,45 +102,6 @@ pub(crate) fn has_interior_effects(effects: &LayerEffects) -> bool {
             .pattern_overlay
             .as_ref()
             .is_some_and(|o| enabled(o.enabled))
-}
-
-/// How much of a layer's silhouette its interior effects cover: the union of
-/// the overlays' opacities, or full strength when a soft interior effect
-/// (satin, glow, inner shadow) is present.
-pub(crate) fn interior_strength(effects: &LayerEffects) -> f32 {
-    let soft = effects.inner_shadows.iter().any(|s| enabled(s.enabled))
-        || effects
-            .inner_glow
-            .as_ref()
-            .is_some_and(|g| enabled(g.enabled))
-        || effects.satin.as_ref().is_some_and(|s| enabled(s.enabled));
-    if soft {
-        return 1.0;
-    }
-    let mut clear = 1.0f32;
-    for opacity in effects
-        .color_overlays
-        .iter()
-        .filter(|o| enabled(o.enabled))
-        .map(|o| o.opacity)
-        .chain(
-            effects
-                .gradient_overlays
-                .iter()
-                .filter(|o| enabled(o.enabled))
-                .map(|o| o.opacity),
-        )
-        .chain(
-            effects
-                .pattern_overlay
-                .iter()
-                .filter(|o| enabled(o.enabled))
-                .map(|o| o.opacity),
-        )
-    {
-        clear *= 1.0 - opacity_scale(opacity);
-    }
-    1.0 - clear
 }
 
 /// The rect a layer's exterior effects can reach beyond the layer's bounds.
@@ -431,8 +391,8 @@ fn shadow_offset(angle: f64, distance: f64) -> (i64, i64) {
 // ---------------------------------------------------------------------------
 
 /// The bounds of the pixels with any coverage, in document coordinates.
-fn visible_span(content: &Content, coverage: &[f32]) -> Option<Span> {
-    let (width, height) = (content.width(), content.height());
+fn visible_span(rect: Rect, coverage: &[f32]) -> Option<Span> {
+    let (width, height) = (rect.width().max(0) as usize, rect.height().max(0) as usize);
     let (mut left, mut top, mut right, mut bottom) = (usize::MAX, usize::MAX, 0, 0);
     for y in 0..height {
         for x in 0..width {
@@ -448,8 +408,8 @@ fn visible_span(content: &Content, coverage: &[f32]) -> Option<Span> {
         return None;
     }
     Some(Span {
-        left: (content.rect.left + left as i32) as f32,
-        top: (content.rect.top + top as i32) as f32,
+        left: (rect.left + left as i32) as f32,
+        top: (rect.top + top as i32) as f32,
         width: (right - left) as f32,
         height: (bottom - top) as f32,
     })
@@ -493,8 +453,97 @@ pub(crate) fn fold_interior_overlays(
     effects: &LayerEffects,
     context: &EffectContext<'_>,
 ) {
-    let width = content.width();
-    let height = content.height();
+    fold_interior_overlays_into(
+        &mut InteriorPainter {
+            rect: content.rect,
+            target: InteriorTarget::Fold(content),
+        },
+        coverage,
+        effects,
+        context,
+    );
+}
+
+/// The same effect fields can fold into a layer's colors, or become independent
+/// source-over planes. Independent planes carry only the effect's paint and
+/// coverage; they never carry the layer's hidden fill color.
+struct InteriorPainter<'a> {
+    rect: Rect,
+    target: InteriorTarget<'a>,
+}
+
+enum InteriorTarget<'a> {
+    Fold(&'a mut Content),
+    Planes(&'a mut Vec<OuterPlane>),
+}
+
+impl InteriorPainter<'_> {
+    fn begin(&mut self, blend_mode: BlendMode) {
+        if let InteriorTarget::Planes(planes) = &mut self.target {
+            planes.push(OuterPlane {
+                content: Content::new(self.rect),
+                blend_mode,
+            });
+        }
+    }
+
+    fn pixel(&mut self, index: usize, color: [f32; 3], strength: f32, mode: BlendMode) {
+        match &mut self.target {
+            InteriorTarget::Planes(planes) => {
+                let plane = &mut planes.last_mut().expect("effect paint was started").content;
+                for (channel, value) in color.into_iter().enumerate() {
+                    plane.color[channel][index] = value;
+                }
+                plane.alpha[index] = strength.clamp(0.0, 1.0);
+            }
+            InteriorTarget::Fold(content) => fold_pixel(content, index, color, strength, mode),
+        }
+    }
+
+    fn overlay(
+        &mut self,
+        index: usize,
+        color: [f32; 3],
+        strength: f32,
+        mode: BlendMode,
+        matte: f32,
+    ) {
+        let strength = if matches!(&self.target, InteriorTarget::Planes(_)) {
+            strength * matte
+        } else {
+            strength
+        };
+        self.pixel(index, color, strength, mode);
+    }
+}
+
+/// Resolve interior effects in Photoshop's stacking order for a layer whose
+/// fill and effects blend independently. Each effect keeps its own alpha and
+/// blend mode, including patterned or gradient transparency.
+pub(crate) fn build_interior(
+    rect: Rect,
+    coverage: &[f32],
+    effects: &LayerEffects,
+    context: &EffectContext<'_>,
+) -> Vec<OuterPlane> {
+    let mut planes = Vec::new();
+    let mut painter = InteriorPainter {
+        rect,
+        target: InteriorTarget::Planes(&mut planes),
+    };
+    fold_interior_overlays_into(&mut painter, coverage, effects, context);
+    paint_interior_into(&mut painter, coverage, effects);
+    planes
+}
+
+fn fold_interior_overlays_into(
+    painter: &mut InteriorPainter<'_>,
+    coverage: &[f32],
+    effects: &LayerEffects,
+    context: &EffectContext<'_>,
+) {
+    let width = painter.rect.width().max(0) as usize;
+    let height = painter.rect.height().max(0) as usize;
     let canvas = context.canvas;
     if width == 0 || height == 0 {
         return;
@@ -513,11 +562,12 @@ pub(crate) fn fold_interior_overlays(
         ) {
             let strength = opacity_scale(overlay.opacity);
             let mode = overlay.blend_mode.unwrap_or(BlendMode::NORMAL);
-            for index in 0..width * height {
-                let x = content.rect.left + (index % width) as i32;
-                let y = content.rect.top + (index / width) as i32;
+            painter.begin(mode);
+            for (index, &matte) in coverage.iter().enumerate().take(width * height) {
+                let x = painter.rect.left + (index % width) as i32;
+                let y = painter.rect.top + (index / width) as i32;
                 let (color, alpha) = sampler.sample(x, y);
-                fold_pixel(content, index, color, alpha * strength, mode);
+                painter.overlay(index, color, alpha * strength, mode, matte);
             }
         }
     }
@@ -533,7 +583,7 @@ pub(crate) fn fold_interior_overlays(
             continue;
         };
         let span = if overlay.align.unwrap_or(true) {
-            visible_span(content, coverage)
+            visible_span(painter.rect, coverage)
         } else {
             Some(Span {
                 left: canvas.left as f32,
@@ -559,12 +609,13 @@ pub(crate) fn fold_interior_overlays(
         };
         let strength = opacity_scale(overlay.opacity);
         let mode = overlay.blend_mode.unwrap_or(BlendMode::NORMAL);
-        for index in 0..width * height {
-            let x = content.rect.left + (index % width) as i32;
-            let y = content.rect.top + (index / width) as i32;
+        painter.begin(mode);
+        for (index, &matte) in coverage.iter().enumerate().take(width * height) {
+            let x = painter.rect.left + (index % width) as i32;
+            let y = painter.rect.top + (index / width) as i32;
             let position = ramp::position(&placement, span, SpanBasis::Projection, x, y);
             let (color, alpha) = ramp.sample(position);
-            fold_pixel(content, index, color, alpha * strength, mode);
+            painter.overlay(index, color, alpha * strength, mode, matte);
         }
     }
 
@@ -572,8 +623,9 @@ pub(crate) fn fold_interior_overlays(
         let color = overlay.color.as_ref().map(color_rgb).unwrap_or([0.0; 3]);
         let strength = opacity_scale(overlay.opacity);
         let mode = overlay.blend_mode.unwrap_or(BlendMode::NORMAL);
-        for index in 0..width * height {
-            fold_pixel(content, index, color, strength, mode);
+        painter.begin(mode);
+        for (index, &matte) in coverage.iter().enumerate().take(width * height) {
+            painter.overlay(index, color, strength, mode, matte);
         }
     }
 }
@@ -602,8 +654,23 @@ fn fold_pixel(
 
 /// Interior soft effects paint above the folded color, inside the silhouette.
 pub(crate) fn paint_interior(content: &mut Content, coverage: &[f32], effects: &LayerEffects) {
-    let width = content.width();
-    let height = content.height();
+    paint_interior_into(
+        &mut InteriorPainter {
+            rect: content.rect,
+            target: InteriorTarget::Fold(content),
+        },
+        coverage,
+        effects,
+    );
+}
+
+fn paint_interior_into(
+    painter: &mut InteriorPainter<'_>,
+    coverage: &[f32],
+    effects: &LayerEffects,
+) {
+    let width = painter.rect.width().max(0) as usize;
+    let height = painter.rect.height().max(0) as usize;
     if width == 0 || height == 0 || coverage.len() < width * height {
         return;
     }
@@ -639,7 +706,7 @@ pub(crate) fn paint_interior(content: &mut Content, coverage: &[f32], effects: &
             opacity_scale(satin.opacity),
             satin.blend_mode.unwrap_or(BlendMode::NORMAL),
         );
-        apply_interior(content, coverage, &field, &paint);
+        apply_interior(painter, coverage, &field, &paint);
     }
 
     if let Some(glow) = effects.inner_glow.as_ref().filter(|g| enabled(g.enabled)) {
@@ -656,7 +723,7 @@ pub(crate) fn paint_interior(content: &mut Content, coverage: &[f32], effects: &
             }
         }
         let paint = glow_paint(glow, BlendMode::SCREEN);
-        apply_interior(content, coverage, &field, &paint);
+        apply_interior(painter, coverage, &field, &paint);
     }
 
     for shadow in effects.inner_shadows.iter().filter(|s| enabled(s.enabled)) {
@@ -682,7 +749,7 @@ pub(crate) fn paint_interior(content: &mut Content, coverage: &[f32], effects: &
             opacity_scale(shadow.opacity),
             shadow.blend_mode.unwrap_or(BlendMode::MULTIPLY),
         );
-        apply_interior(content, coverage, &field, &paint);
+        apply_interior(painter, coverage, &field, &paint);
     }
 }
 
@@ -704,14 +771,21 @@ fn glow_paint(glow: &psd_core::Glow, default_mode: BlendMode) -> EffectPaint {
     }
 }
 
-fn apply_interior(content: &mut Content, coverage: &[f32], field: &[f32], paint: &EffectPaint) {
-    for index in 0..content.alpha.len() {
+fn apply_interior(
+    painter: &mut InteriorPainter<'_>,
+    coverage: &[f32],
+    field: &[f32],
+    paint: &EffectPaint,
+) {
+    painter.begin(paint.blend_mode);
+    let pixels = painter.rect.width().max(0) as usize * painter.rect.height().max(0) as usize;
+    for index in 0..pixels {
         let (color, field_alpha) = paint.at(field[index]);
         let strength = field_alpha * paint.alpha * coverage[index];
         if strength <= 0.0 {
             continue;
         }
-        fold_pixel(content, index, color, strength, paint.blend_mode);
+        painter.pixel(index, color, strength, paint.blend_mode);
     }
 }
 
@@ -1076,7 +1150,7 @@ pub(crate) fn build_strokes(
                     .style
                     .unwrap_or(psd_core::effect_enums::GradientStyle::Linear);
                 let span = if stroke.align.unwrap_or(true) {
-                    visible_span(content, coverage)
+                    visible_span(content.rect, coverage)
                 } else {
                     Some(Span {
                         left: canvas.left as f32,

@@ -7,7 +7,7 @@
 //! Positions and the grid cycle are in **1/32 of a pixel** — the spec calls
 //! them document coordinates and notes the default cycle is "every quarter
 //! inch, i.e. 576 for both horizontal & vertical (at 72 dpi, that is
-//! 18 * 32 = 576)", which is 18 px at 72 dpi. [`GridGuides::to_pixels`] and
+//! 18 * 32 = 576)", which is 18 px at 72 dpi. [`GridGuides::grid_px`] and
 //! [`Guide::position_px`] convert for callers that think in pixels.
 //!
 //! The resource is read on demand from its raw block and written back only

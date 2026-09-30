@@ -12,6 +12,33 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-09-30
+
+### Fixed
+
+- Compositing a visible layer whose channels are still compressed after a lazy read returns
+  an actionable error instead of treating its colors, transparency and masks as absent.
+  Explicit `decode_layer_pixels` calls retain the document's configured memory budget.
+- Groups clipped to another layer honor its coverage, including group opacity, masks and
+  effects. Pass-through groups retain the true backdrop, and nested group effects contribute
+  to the bounds used for clipping and opacity snapshots.
+- Adjustment layers honor their blend mode while preserving backdrop alpha. Companion
+  `CgEd` metadata no longer suppresses an adjustment when stored before its settings block.
+- Independent interior effects keep their own paint, transparency and blend modes when fill
+  opacity is reduced. They render over the true backdrop before the layer's mask, clip
+  coverage and master opacity apply once to the combined result.
+- Curves uses extended `Crv ` channel records when present and excludes non-color channels
+  from RGB adjustment. Its lookup tables are resolved once per layer instead of rebuilding
+  splines and allocating temporary buffers for every pixel.
+- Turning layer effects off preserves pattern fills and pattern-painted shapes.
+- Strict compositor oracle checks reject incomplete comparisons and empty selections in
+  addition to excessive pixel error. The stored-merge probe supports the same strict limit;
+  diagnostic sweeps continue reporting known rendering limitations without enforcing it.
+
+### Changed
+
+- Corrected public documentation links for the compositor and typed image resources.
+
 ## [0.11.4] - 2026-09-30
 
 ### Fixed

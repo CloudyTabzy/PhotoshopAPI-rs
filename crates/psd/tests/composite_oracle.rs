@@ -6,7 +6,8 @@
 //!
 //! - `PSD_COMPOSITE_FILTER`: only run files whose name contains this substring.
 //! - `PSD_COMPOSITE_OUT`: write our flatten beside a diff image (BMP) per file.
-//! - `PSD_COMPOSITE_STRICT`: fail when a file's max error exceeds this value.
+//! - `PSD_COMPOSITE_STRICT`: fail when a file's max error exceeds this value,
+//!   a comparison cannot complete, or no comparable documents are found.
 //!
 //! Run: `PSD_COMPOSITE_ORACLE=<dir> cargo test -p psd --test composite_oracle --release -- --nocapture`
 
@@ -20,6 +21,57 @@ struct Bmp {
     height: usize,
     /// Top-down RGB.
     rgb: Vec<u8>,
+}
+
+fn strict_limit() -> Option<u32> {
+    std::env::var_os("PSD_COMPOSITE_STRICT").map(|value| {
+        value
+            .into_string()
+            .expect("PSD_COMPOSITE_STRICT must be a u32")
+            .parse()
+            .expect("PSD_COMPOSITE_STRICT must be a u32")
+    })
+}
+
+/// Diagnostic runs report skips; strict runs require complete comparisons.
+struct AccuracyGate {
+    limit: Option<u32>,
+    compared: usize,
+    failures: Vec<String>,
+}
+
+impl AccuracyGate {
+    fn new(limit: Option<u32>) -> Self {
+        Self {
+            limit,
+            compared: 0,
+            failures: Vec::new(),
+        }
+    }
+
+    fn incomplete(&mut self, name: &str, reason: &str) {
+        if self.limit.is_some() {
+            self.failures.push(format!("{name}: {reason}"));
+        }
+    }
+
+    fn compared(&mut self, name: &str, max: u32) {
+        self.compared += 1;
+        if let Some(limit) = self.limit.filter(|limit| max > *limit) {
+            self.failures
+                .push(format!("{name}: maximum error {max} exceeds {limit}"));
+        }
+    }
+
+    fn finish(self) -> Result<usize, String> {
+        if !self.failures.is_empty() {
+            return Err(format!("oracle comparisons failed: {:?}", self.failures));
+        }
+        if self.limit.is_some() && self.compared == 0 {
+            return Err("strict oracle validation completed no comparisons".to_owned());
+        }
+        Ok(self.compared)
+    }
 }
 
 fn read_bmp(path: &Path) -> Bmp {
@@ -100,20 +152,26 @@ fn composite_matches_photoshop_flattens() {
     };
     let filter = std::env::var("PSD_COMPOSITE_FILTER").unwrap_or_default();
     let out_dir = std::env::var_os("PSD_COMPOSITE_OUT").map(PathBuf::from);
-    let strict: Option<u32> = std::env::var("PSD_COMPOSITE_STRICT")
-        .ok()
-        .and_then(|v| v.parse().ok());
-    if let Some(out) = &out_dir {
+    compare_photoshop_flattens(&dir, &filter, out_dir.as_deref(), strict_limit()).unwrap();
+}
+
+fn compare_photoshop_flattens(
+    dir: &Path,
+    filter: &str,
+    out_dir: Option<&Path>,
+    strict: Option<u32>,
+) -> Result<usize, String> {
+    if let Some(out) = out_dir {
         std::fs::create_dir_all(out).unwrap();
     }
 
-    let mut stems: Vec<String> = std::fs::read_dir(&dir)
+    let mut stems: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| {
             let p = e.unwrap().path();
             (p.extension()? == "bmp").then(|| p.file_stem().unwrap().to_string_lossy().into_owned())
         })
-        .filter(|s| s.contains(&filter))
+        .filter(|s| s.contains(filter))
         .collect();
     stems.sort();
 
@@ -121,10 +179,11 @@ fn composite_matches_photoshop_flattens() {
         "{:<44} {:>6} {:>4} {:>7} {:>7}  note",
         "file", "mean", "max", ">2 %", "ms"
     );
-    let mut failures = Vec::new();
+    let mut gate = AccuracyGate::new(strict);
     for stem in stems {
-        let Some(source) = source_for(&dir, &stem) else {
+        let Some(source) = source_for(dir, &stem) else {
             println!("{stem:<44} (no matching document)");
+            gate.incomplete(&stem, "no matching document");
             continue;
         };
         let oracle = read_bmp(&dir.join(format!("{stem}.bmp")));
@@ -132,6 +191,7 @@ fn composite_matches_photoshop_flattens() {
             Ok(f) => f,
             Err(e) => {
                 println!("{stem:<44} read failed: {e}");
+                gate.incomplete(&stem, &format!("read failed: {e}"));
                 continue;
             }
         };
@@ -140,6 +200,7 @@ fn composite_matches_photoshop_flattens() {
             Ok(i) => i,
             Err(e) => {
                 println!("{stem:<44} composite failed: {e}");
+                gate.incomplete(&stem, &format!("composite failed: {e}"));
                 continue;
             }
         };
@@ -149,6 +210,7 @@ fn composite_matches_photoshop_flattens() {
                 "{stem:<44} size mismatch: ours {}x{}, reference {}x{}",
                 image.width, image.height, oracle.width, oracle.height
             );
+            gate.incomplete(&stem, "size mismatch");
             continue;
         }
         // The reference is a flatten over white; put ours over white too.
@@ -193,11 +255,116 @@ fn composite_matches_photoshop_flattens() {
                 &diff,
             );
         }
-        if strict.is_some_and(|limit| max > limit) {
-            failures.push(stem);
-        }
+        gate.compared(&stem, max);
     }
-    assert!(failures.is_empty(), "over the error limit: {failures:?}");
+    let compared = gate.finish()?;
+    println!("{compared} completed oracle comparisons");
+    Ok(compared)
+}
+
+struct TemporaryOracle(PathBuf);
+
+impl TemporaryOracle {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "psd-composite-oracle-{}-{time}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn white_bmp(&self, width: usize) {
+        write_bmp(&self.0.join("fixture.bmp"), width, 1, &vec![255; width * 3]);
+    }
+
+    fn empty_psd(&self) {
+        let file = LayeredFile::<u8>::new(psd::core::ColorMode::Rgb, 1, 1).unwrap();
+        std::fs::write(self.0.join("fixture.psd"), file.to_bytes().unwrap()).unwrap();
+    }
+}
+
+impl Drop for TemporaryOracle {
+    fn drop(&mut self) {
+        // This unique directory was created by the test and contains only its fixtures.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn strict_oracle_requires_at_least_one_complete_comparison() {
+    let oracle = TemporaryOracle::new();
+    let error = compare_photoshop_flattens(&oracle.0, "", None, Some(0)).unwrap_err();
+    assert!(error.contains("no comparisons"));
+    oracle.white_bmp(1);
+    oracle.empty_psd();
+    assert_eq!(
+        compare_photoshop_flattens(&oracle.0, "", None, Some(0)).unwrap(),
+        1
+    );
+    assert!(compare_photoshop_flattens(&oracle.0, "not-present", None, Some(0)).is_err());
+}
+
+#[test]
+fn strict_oracle_fails_for_missing_or_unreadable_documents() {
+    let oracle = TemporaryOracle::new();
+    oracle.white_bmp(1);
+    let error = compare_photoshop_flattens(&oracle.0, "", None, Some(0)).unwrap_err();
+    assert!(error.contains("no matching document"));
+    std::fs::write(oracle.0.join("fixture.psd"), b"not a PSD").unwrap();
+    let error = compare_photoshop_flattens(&oracle.0, "", None, Some(0)).unwrap_err();
+    assert!(error.contains("read failed"));
+    // A diagnostic sweep still reports and skips a bad source.
+    assert_eq!(
+        compare_photoshop_flattens(&oracle.0, "", None, None).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn strict_oracle_fails_for_size_mismatches_and_excess_error() {
+    let oracle = TemporaryOracle::new();
+    oracle.empty_psd();
+    oracle.white_bmp(2);
+    let error = compare_photoshop_flattens(&oracle.0, "", None, Some(0)).unwrap_err();
+    assert!(error.contains("size mismatch"));
+    write_bmp(&oracle.0.join("fixture.bmp"), 1, 1, &[0; 3]);
+    let error = compare_photoshop_flattens(&oracle.0, "", None, Some(0)).unwrap_err();
+    assert!(error.contains("maximum error 255 exceeds 0"));
+    assert_eq!(
+        compare_photoshop_flattens(&oracle.0, "", None, Some(255)).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn strict_oracle_reports_compositor_errors_even_when_another_document_matches() {
+    use psd::core::{TaggedBlock, TaggedBlockKey};
+    let oracle = TemporaryOracle::new();
+    oracle.white_bmp(1);
+    oracle.empty_psd();
+    // The format reader preserves settings as raw blocks. Resolving this
+    // truncated Levels payload fails only when the compositor requests it.
+    let mut file = LayeredFile::<u8>::new(psd::core::ColorMode::Rgb, 1, 1).unwrap();
+    let mut adjustment = psd::Layer::new_adjustment("invalid Levels", psd::Rect::default());
+    adjustment
+        .blocks
+        .push(TaggedBlock::new(TaggedBlockKey::new(*b"levl"), vec![0]));
+    file.add_layer(adjustment);
+    std::fs::write(oracle.0.join("broken.psd"), file.to_bytes().unwrap()).unwrap();
+    write_bmp(&oracle.0.join("broken.bmp"), 1, 1, &[255; 3]);
+    let error = compare_photoshop_flattens(&oracle.0, "", None, Some(0)).unwrap_err();
+    assert!(error.contains("broken: composite failed"));
+    assert_eq!(
+        compare_photoshop_flattens(&oracle.0, "", None, None).unwrap(),
+        1
+    );
 }
 
 /// Photoshop's stored merged image of each document in a directory of
@@ -222,6 +389,7 @@ fn composite_tracks_stored_merges() {
     let filter = std::env::var("PSD_COMPOSITE_FILTER").unwrap_or_default();
     let manifest = std::fs::read_to_string(dir.join("manifest.tsv")).unwrap();
     let mut rows = Vec::new();
+    let mut gate = AccuracyGate::new(strict_limit());
     for line in manifest.lines() {
         let mut fields = line.split('\t');
         let (Some(slug), Some(status)) = (fields.next(), fields.next()) else {
@@ -232,9 +400,11 @@ fn composite_tracks_stored_merges() {
         }
         let source = sources.join(slug.replace("__", "/"));
         let Ok(data) = std::fs::read(dir.join(format!("{slug}.merged"))) else {
+            gate.incomplete(slug, "missing or unreadable merged extract");
             continue;
         };
         if data.len() < 20 || &data[..8] != b"PSDMERG1" {
+            gate.incomplete(slug, "invalid merged extract header");
             continue;
         }
         let width = u32::from_be_bytes(data[8..12].try_into().unwrap()) as usize;
@@ -242,6 +412,7 @@ fn composite_tracks_stored_merges() {
         let channels = u16::from_be_bytes(data[16..18].try_into().unwrap()) as usize;
         let samples = &data[20..];
         if samples.len() < width * height * channels || !(3..=4).contains(&channels) {
+            gate.incomplete(slug, "invalid merged extract samples");
             continue;
         }
         // Photoshop stores a merge that has transparency already matted
@@ -264,10 +435,15 @@ fn composite_tracks_stored_merges() {
         if colors.len() <= 32 {
             continue;
         }
-        let Ok(file) = LayeredFile::<u8>::read(&source) else {
-            continue;
+        let file = match LayeredFile::<u8>::read(&source) {
+            Ok(file) => file,
+            Err(error) => {
+                gate.incomplete(slug, &format!("read failed: {error}"));
+                continue;
+            }
         };
         if (file.width as usize, file.height as usize) != (width, height) {
+            gate.incomplete(slug, "size mismatch");
             continue;
         }
         // The extracts read a merge's first three planes as RGB, which is
@@ -279,8 +455,12 @@ fn composite_tracks_stored_merges() {
             continue;
         }
         let started = Instant::now();
-        let Ok(image) = file.composite_rgba8() else {
-            continue;
+        let image = match file.composite_rgba8() {
+            Ok(image) => image,
+            Err(error) => {
+                gate.incomplete(slug, &format!("composite failed: {error}"));
+                continue;
+            }
         };
         let ms = started.elapsed().as_millis();
         let (mut sum, mut max, mut over) = (0u64, 0u32, 0usize);
@@ -301,6 +481,7 @@ fn composite_tracks_stored_merges() {
             }
         }
         let pixels = (width * height) as f64;
+        gate.compared(slug, max);
         rows.push((
             sum as f64 / (pixels * 3.0),
             max,
@@ -321,4 +502,5 @@ fn composite_tracks_stored_merges() {
     }
     let median = rows.get(rows.len() / 2).map_or(0.0, |row| row.0);
     println!("median mean error {median:.3}");
+    gate.finish().unwrap();
 }
