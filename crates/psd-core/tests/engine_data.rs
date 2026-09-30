@@ -394,3 +394,32 @@ fn dictionary_bodies_parse_and_byte_insertion_refuses_undelimited_containers() {
     ));
     assert_eq!(untouched, payload);
 }
+
+/// Photoshop writes leading-dot floats (`.583`, `.8`) throughout its style
+/// sheets; they must read as numbers, and non-numbers must keep their
+/// identifier reading.
+#[test]
+fn leading_dot_tokens_are_numbers() {
+    let payload =
+        b"<< /SuperscriptSize .583 /WordSpacing [ .8 1.0 1.33 ] /Name P22-FLLW-Light /Bad inf >>";
+    let root = engine_data::parse(payload).unwrap();
+    assert_eq!(
+        root.get("SuperscriptSize")
+            .and_then(|value| value.as_number())
+            .map(|number| number.value),
+        Some(0.583)
+    );
+    assert_eq!(
+        root.get("WordSpacing")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items[1].as_number())
+            .map(|number| number.value),
+        Some(1.0)
+    );
+    assert!(root
+        .get("Name")
+        .is_some_and(|value| matches!(value.kind, engine_data::EngineValueKind::Identifier(_))));
+    assert!(root
+        .get("Bad")
+        .is_some_and(|value| matches!(value.kind, engine_data::EngineValueKind::Identifier(_))));
+}

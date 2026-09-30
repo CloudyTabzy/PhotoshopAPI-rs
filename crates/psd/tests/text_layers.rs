@@ -1381,3 +1381,35 @@ fn set_rich_text_rebuilds_the_run_structure() {
         "a refused call changes nothing"
     );
 }
+
+/// Photoshop writes leading-dot floats (`.583`, `.8`) throughout its style
+/// sheets; a typed read must see them as numbers, not identifiers.
+#[test]
+fn leading_dot_floats_read_as_numbers() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/documents/TextLayers/TextLayers_Paragraph.psd"
+    );
+    let document = LayeredFile::<u8>::read(path).unwrap();
+    let mut checked = 0;
+    for &id in &document.flatten() {
+        let layer = document.layer(id).unwrap();
+        if !layer.is_text_layer() {
+            continue;
+        }
+        for run in 0..layer.paragraph_run_count() {
+            if let Some(style) = layer.paragraph_run(run) {
+                if let Some(spacing) = style.word_spacing() {
+                    checked += 1;
+                    assert_eq!(spacing.len(), 3, "a justification triple");
+                    assert!(
+                        spacing.iter().all(|value| value.is_finite()),
+                        "run {run} of {:?} reads {spacing:?}",
+                        layer.name
+                    );
+                }
+            }
+        }
+    }
+    assert!(checked > 0, "the fixture must carry paragraph word spacing");
+}
