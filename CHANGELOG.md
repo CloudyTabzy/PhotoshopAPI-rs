@@ -12,6 +12,26 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-09-30
+
+### Added
+
+- `Layer::set_rich_text`: replace a text layer's body **and** re-split it into runs of the
+  given UTF-16 lengths. The text goes in exactly as `set_text` writes it (the EngineData
+  literal, the `Txt` descriptor string, the legacy ranges), then the run structure is
+  rebuilt: every run starts from the layer's first run's style — Photoshop's own
+  inheritance — so the differences are set afterwards with `style_run_mut`, which indexes
+  runs in order. Paragraph runs are split on the text's ``-terminated lines, and a
+  trailing `` is appended when the text does not end with one, since Photoshop's
+  `RunLengthArray` covers it. Lengths that are zero or do not cover the whole text are
+  refused before anything changes.
+
+### Tests
+
+- A rebuild splits a one-run layer into two runs that both inherit its size, styles the
+  second run differently, re-splits a two-line text into two paragraph runs, survives a
+  save, and leaves the document byte-identical when a call is refused.
+
 ## [0.9.5] - 2026-09-30
 
 ### Added

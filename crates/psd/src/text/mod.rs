@@ -1075,6 +1075,79 @@ impl<T: BitDepth> Layer<T> {
         })
     }
 
+    /// Replace the text and re-split it into runs of the given UTF-16 lengths.
+    ///
+    /// The text is set exactly as [`set_text`](Self::set_text) does — the
+    /// EngineData literal, the `Txt` descriptor string and the legacy ranges —
+    /// and the run structure is then rebuilt: **every run starts from the
+    /// layer's first run's style**, which is Photoshop's own inheritance, so
+    /// set the differences afterwards with
+    /// [`style_run_mut`](Self::style_run_mut), which indexes runs in order.
+    /// Paragraph runs are split on the text's `\r`-terminated lines the way
+    /// Photoshop stores them, and a trailing `\r` is appended when the text
+    /// does not end with one.
+    ///
+    /// `run_lengths` are UTF-16 code units and must be non-zero and cover the
+    /// whole text, trailing carriage return included — the same rule
+    /// Photoshop's `RunLengthArray` follows.
+    pub fn set_rich_text(&mut self, new_text: &str, run_lengths: &[usize]) -> psd_core::Result<()> {
+        let text = if new_text.ends_with('\r') {
+            new_text.to_owned()
+        } else {
+            format!("{new_text}\r")
+        };
+        let units: Vec<u16> = text.encode_utf16().collect();
+        if run_lengths.is_empty()
+            || run_lengths.contains(&0)
+            || run_lengths.iter().sum::<usize>() != units.len()
+        {
+            return Err(invalid(
+                "run lengths must be non-zero and cover the text, trailing carriage return included",
+            ));
+        }
+        let runs: Vec<i32> = run_lengths
+            .iter()
+            .map(|&length| i32::try_from(length).map_err(|_| invalid("run length exceeds i32")))
+            .collect::<psd_core::Result<_>>()?;
+        let paragraphs: Vec<i32> = paragraph_lengths(&units)
+            .into_iter()
+            .map(|length| {
+                i32::try_from(length).map_err(|_| invalid("paragraph length exceeds i32"))
+            })
+            .collect::<psd_core::Result<_>>()?;
+
+        self.set_text(&text)?;
+        self.patch_all_engine_data(move |root, payload| {
+            let mut patches = Vec::new();
+            rebuild_run_array(
+                root,
+                &["EngineDict", "StyleRun", "RunArray"],
+                runs.len(),
+                &mut patches,
+            )?;
+            rebuild_run_array(
+                root,
+                &["EngineDict", "ParagraphRun", "RunArray"],
+                paragraphs.len(),
+                &mut patches,
+            )?;
+            set_run_lengths(
+                root,
+                &["EngineDict", "StyleRun", "RunLengthArray"],
+                &runs,
+                &mut patches,
+            )?;
+            set_run_lengths(
+                root,
+                &["EngineDict", "ParagraphRun", "RunLengthArray"],
+                &paragraphs,
+                &mut patches,
+            )?;
+            engine_data::apply_patches_checked(payload, &mut patches)?;
+            Ok(true)
+        })
+    }
+
     /// Strict replacement variant requiring equal UTF-16 code-unit lengths.
     pub fn set_text_equal_length(&mut self, new_text: &str) -> psd_core::Result<()> {
         let replacement: Vec<u16> = new_text.encode_utf16().collect();
@@ -1413,6 +1486,59 @@ fn mutate_tysh_text(data: &[u8], old_text: &[u16], edit: &TextEdit) -> psd_core:
     let mut updated = data.to_vec();
     engine_data::apply_patches_checked(&mut updated, &mut block_patches)?;
     remap_legacy_descriptor_ranges(updated, old_text.len(), &edit.replacements)
+}
+
+/// Replace the run array at `path` with `count` copies of its first entry, so
+/// every run of a rebuilt text starts from the same style.
+fn rebuild_run_array(
+    root: &EngineValue,
+    path: &[&str],
+    count: usize,
+    patches: &mut Vec<PayloadPatch>,
+) -> psd_core::Result<()> {
+    let node = root
+        .get_path(path.iter().copied())
+        .ok_or_else(|| invalid("EngineData has no run array"))?;
+    let template = node
+        .as_array()
+        .and_then(|items| items.first())
+        .ok_or_else(|| invalid("EngineData run array is empty"))?
+        .clone();
+    let replacement = EngineValue {
+        span: node.span.clone(),
+        kind: EngineValueKind::Array(vec![template; count]),
+    };
+    patches.push(PayloadPatch {
+        range: node.span.clone(),
+        new_bytes: engine_data::format_value_bytes(&replacement, 0),
+    });
+    Ok(())
+}
+
+/// Set the run-length array at `path` to `lengths`.
+fn set_run_lengths(
+    root: &EngineValue,
+    path: &[&str],
+    lengths: &[i32],
+    patches: &mut Vec<PayloadPatch>,
+) -> psd_core::Result<()> {
+    let node = root
+        .get_path(path.iter().copied())
+        .ok_or_else(|| invalid("EngineData has no run length array"))?;
+    let replacement = EngineValue {
+        span: node.span.clone(),
+        kind: EngineValueKind::Array(
+            lengths
+                .iter()
+                .map(|&length| EngineValue::number(f64::from(length)))
+                .collect(),
+        ),
+    };
+    patches.push(PayloadPatch {
+        range: node.span.clone(),
+        new_bytes: engine_data::format_value_bytes(&replacement, 0),
+    });
+    Ok(())
 }
 
 /// UTF-16 lengths of the `\r`-terminated paragraphs of EngineData text (a

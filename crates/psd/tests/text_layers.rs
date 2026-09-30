@@ -1285,3 +1285,99 @@ fn text_builder_scales_points_to_pixels_by_document_resolution() {
         "a 300 dpi 12pt box ({big_w}x{big_h}) should be about 4x the 72 dpi one ({small_w}x{small_h})"
     );
 }
+
+/// A rich-text rebuild replaces the body and re-splits it into runs of the
+/// given lengths, every run starting from the layer's first style; paragraph
+/// runs follow the text's carriage returns, and the trailing one is appended.
+#[test]
+fn set_rich_text_rebuilds_the_run_structure() {
+    let mut file = LayeredFile::<u8>::new(psd::core::ColorMode::Rgb, 64, 64).unwrap();
+    let layer = TextLayerBuilder::new("Rich", "original")
+        .font_size(12.0)
+        .build::<u8>()
+        .unwrap();
+    let id = file.add_layer(layer);
+    let original_size = file
+        .layer(id)
+        .unwrap()
+        .style_run(0)
+        .and_then(|style| style.font_size())
+        .unwrap();
+    assert_eq!(original_size, 12.0);
+    assert_eq!(file.layer(id).unwrap().style_run_count(), 1);
+
+    file.layer_mut(id)
+        .unwrap()
+        .set_rich_text("Hello world", &[5, 7])
+        .unwrap();
+    let layer = file.layer(id).unwrap();
+    // The trailing carriage return is part of the text and the last run.
+    assert_eq!(layer.text().as_deref(), Some("Hello world\r"));
+    assert_eq!(layer.style_run_count(), 2);
+    assert_eq!(layer.style_run_lengths(), Some(vec![5, 7]));
+    assert_eq!(layer.paragraph_run_lengths(), Some(vec![12]));
+    // Both runs start from the layer's own style.
+    for run in 0..2 {
+        assert_eq!(
+            layer.style_run(run).and_then(|style| style.font_size()),
+            Some(12.0),
+            "run {run} inherits the original size"
+        );
+    }
+
+    // Per-run styling afterwards is the point of the split.
+    file.layer_mut(id)
+        .unwrap()
+        .style_run_mut(1)
+        .set_font_size(48.0)
+        .unwrap();
+    let layer = file.layer(id).unwrap();
+    assert_eq!(
+        layer.style_run(0).and_then(|style| style.font_size()),
+        Some(12.0)
+    );
+    assert_eq!(
+        layer.style_run(1).and_then(|style| style.font_size()),
+        Some(48.0)
+    );
+
+    // Two lines give two paragraph runs of their own lengths.
+    file.layer_mut(id)
+        .unwrap()
+        .set_rich_text("ab\rcd", &[3, 3])
+        .unwrap();
+    let layer = file.layer(id).unwrap();
+    assert_eq!(layer.text().as_deref(), Some("ab\rcd\r"));
+    assert_eq!(layer.style_run_lengths(), Some(vec![3, 3]));
+    assert_eq!(layer.paragraph_run_lengths(), Some(vec![3, 3]));
+    assert_eq!(layer.paragraph_run_count(), 2);
+
+    // And it all survives a save.
+    let back = LayeredFile::<u8>::from_bytes(&file.to_bytes().unwrap()).unwrap();
+    let layer = back.layer(back.find_layer("Rich").unwrap()).unwrap();
+    assert_eq!(layer.text().as_deref(), Some("ab\rcd\r"));
+    assert_eq!(layer.style_run_lengths(), Some(vec![3, 3]));
+    assert_eq!(
+        layer.style_run(1).and_then(|style| style.font_size()),
+        Some(12.0),
+        "the second run was rebuilt from the first, so it carries 12"
+    );
+
+    // Lengths that do not cover the text are refused, and nothing changes.
+    let before = file.to_bytes().unwrap();
+    assert!(file
+        .layer_mut(id)
+        .unwrap()
+        .set_rich_text("Hello", &[2])
+        .is_err());
+    assert!(file
+        .layer_mut(id)
+        .unwrap()
+        .set_rich_text("Hello", &[5, 0])
+        .is_err());
+    assert_eq!(
+        file.to_bytes().unwrap(),
+        before,
+        "a refused call changes nothing"
+    );
+}
