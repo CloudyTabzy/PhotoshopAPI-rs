@@ -12,6 +12,55 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-30
+
+### Added
+
+- **A compositor** (`LayeredFile::composite_rgba8`, `composite_rgba8_with`): flattens the layer
+  stack into 8-bit straight-alpha RGBA the way Photoshop renders it. The engine places each
+  layer's channels at its bounds, applies effects, resolves coverage (alpha x raster mask x
+  clipping x blend-if), blends with Photoshop's modes and opacity, applies adjustment and fill
+  layers, and composites groups (pass-through children meet the true backdrop and the whole
+  group then fades toward the pre-group snapshot by the group's opacity; a group with its own
+  blend mode isolates instead).
+  - **Blend modes**: all of Photoshop's, including the four non-separable ones (PDF
+    `set_lum`/`set_sat`). For 8-bit documents the modes whose rounding Photoshop pins are
+    computed in the byte domain: Color Burn and Color Dodge round to nearest half-up and
+    resolve their division corner by the destination, Exclusion rounds the product before
+    doubling, Divide rounds to nearest.
+  - **Blend If**: the composite and this-layer ranges gate per channel with Photoshop's split
+    feather and its composite-gray weights (299/590/111 at 1/1000).
+  - **Adjustments**: Brightness/Contrast (legacy hybrid order and the modern gain-ray curve),
+    Levels, Curves (natural cubic, Photoshop's own interpolation), Exposure, Hue/Saturation,
+    Color Balance, Black & White, Photo Filter, Channel Mixer, Invert, Posterize, Threshold,
+    Gradient Map, Vibrance; solid-color and gradient fills.
+  - **Effects**: color and gradient overlays (folded into the layer's straight color),
+    satin, inner glow (Edge and Center), inner shadow, drop shadow and outer glow (spread
+    dilation, then a tent blur applied as two sliding box passes), and strokes (an exact
+    Euclidean distance band around the contour). The soft-effect pipeline follows the
+    calibration records: spread expands the matte by `round(spread% x size)`, the remaining
+    size blurs with `N = max(2, round(size)) - spread_radius`, Range gains multiply after the
+    blur, and an omitted range renders at 100.
+- `CompositeOptions` turns effects, blend-if or adjustments off for diagnostics.
+- The compositor is memory-conscious: canvases are bounded to the layer or subtree bounds and
+  clamped to the document, effect padding never allocates past the canvas, and the tent blur
+  and distance transform are O(pixels).
+
+### Not yet matching Photoshop
+
+The compositor's structure is complete, but its output is **not yet validated against
+Photoshop**: on the corpus it runs over every document (494 of them) without panicking and in
+milliseconds, and it matches the stored merged image closely on simple documents, but the
+stored composites themselves are usually Photoshop's *placeholder* fills (a solid white or
+black image written when the merge was skipped), so they cannot serve as ground truth for
+most files. Accuracy work continues against the files that do carry a real merge.
+
+Known gaps, all deliberate for this pass: bevel/emboss, pattern overlay and pattern fill,
+noise and jitter, contour shaping beyond Linear, the "Precise" glow techniques, stroke
+overprint knockout, knockout (shallow/deep), dissolve, CMYK/Lab color conversion (RGB and
+grayscale documents only), vector rasterization (the stored preview is used), and Selective
+Color, Color Lookup and Content Generator.
+
 ## [0.10.0] - 2026-09-30
 
 ### Changed (breaking)

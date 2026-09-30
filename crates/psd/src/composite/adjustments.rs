@@ -1,0 +1,833 @@
+//! Adjustment and fill layers, as the compositor applies them.
+//!
+//! Adjustment layers transform the backdrop in place, inside their mask. The
+//! math follows the calibration records where Photoshop pins it:
+//!
+//! - **Legacy Brightness/Contrast** uses Photoshop's own hybrid order:
+//!   brightness folds into the *input* for positive contrast
+//!   (`(v + b − 127.5) × 100/(100 − c) + 127.5`), adds to the *output* for
+//!   negative contrast, `c = 100` is a hard threshold at 127 and `c = 0` a
+//!   plain add.
+//! - **Modern Brightness/Contrast** composes a gain ray `2^(b/110)` (cubic
+//!   Hermite tail, `b > 100` composition, bisection inverse below zero) with a
+//!   parabolic contrast curve `β = 1 − 0.0076c`.
+//! - **Curves** interpolate with a natural cubic through the control points
+//!   (zero second derivative at both ends, clamped outside) — Photoshop's own
+//!   interpolation — per-channel tables first, then the composite table.
+//!
+//! Approximated, and documented as such: Hue/Saturation uses the standard HSL
+//! model rather than Photoshop's measured wheel tables (master and colorize;
+//! the six ranges are not applied), Exposure works in the sRGB domain,
+//! Vibrance follows the usual falloff, Selective Color, Color Lookup and
+//! Content Generator are not rendered, and pattern fills are not generated.
+
+use psd_core::adjustments::{
+    AdjustmentData, AdjustmentKind, ColorBalanceValues, Curve, CurveData, CurvePoint, GradientMap,
+    HueSaturationValues, Levels, PhotoFilter, PhotoFilterColor,
+};
+use psd_core::{
+    Color, Descriptor, DescriptorValue, GradientKind, Result, SolidGradient, StopSource,
+    TransparencyStop,
+};
+
+use super::{Canvas, Compositor, Content, Rect};
+use crate::layer::Layer;
+use crate::BitDepth;
+
+/// Apply the layer's adjustment to the canvas, inside its mask.
+pub fn apply<T: BitDepth>(
+    compositor: &Compositor<'_, T>,
+    layer: &Layer<T>,
+    canvas: &mut Canvas,
+) -> Result<()> {
+    let blocks = layer.adjustments()?;
+    let Some(block) = blocks.iter().find(|block| {
+        !matches!(
+            block.kind,
+            AdjustmentKind::SolidColor | AdjustmentKind::GradientFill | AdjustmentKind::PatternFill
+        )
+    }) else {
+        return Ok(());
+    };
+    let operation = Operation::new(&block.data, compositor.byte_domain);
+    if !operation.supported {
+        return Ok(());
+    }
+
+    let mask = mask_field(layer)?;
+    for y in 0..canvas.height as i32 {
+        for x in 0..canvas.width as i32 {
+            let Some(index) = canvas.index(i64::from(x), i64::from(y)) else {
+                continue;
+            };
+            let coverage = mask.as_ref().map(|mask| mask.coverage(x, y)).unwrap_or(1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let (color, alpha) = canvas.pixel(index);
+            let adjusted = operation.apply(color);
+            let mut result = color;
+            for (channel, value) in result.iter_mut().enumerate() {
+                *value = color[channel] + (adjusted[channel] - color[channel]) * coverage;
+            }
+            canvas.set(index, result, alpha);
+        }
+    }
+    Ok(())
+}
+
+/// A layer's raster mask, sampled in canvas coordinates.
+struct MaskField {
+    pixels: Vec<f32>,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    width: usize,
+    default: f32,
+}
+
+impl MaskField {
+    fn coverage(&self, x: i32, y: i32) -> f32 {
+        if x < self.left || y < self.top || x >= self.right || y >= self.bottom {
+            return self.default;
+        }
+        let index = (y - self.top) as usize * self.width + (x - self.left) as usize;
+        self.pixels.get(index).copied().unwrap_or(self.default)
+    }
+}
+
+fn mask_field<T: BitDepth>(layer: &Layer<T>) -> Result<Option<MaskField>> {
+    let Some(record) = layer.mask_record() else {
+        return Ok(None);
+    };
+    if layer.mask_disabled().unwrap_or(false) {
+        return Ok(None);
+    }
+    let Some(pixels) = layer.mask_pixels() else {
+        return Ok(None);
+    };
+    let width = (record.right - record.left).max(0) as usize;
+    let height = (record.bottom - record.top).max(0) as usize;
+    Ok(Some(MaskField {
+        pixels: pixels
+            .iter()
+            .take(width * height)
+            .map(|sample| sample.to_f32())
+            .collect(),
+        left: record.left,
+        top: record.top,
+        right: record.right,
+        bottom: record.bottom,
+        width,
+        default: f32::from(record.default_color) / 255.0,
+    }))
+}
+
+/// One adjustment, resolved once per layer.
+struct Operation {
+    data: AdjustmentData,
+    byte_domain: bool,
+    supported: bool,
+}
+
+impl Operation {
+    fn new(data: &AdjustmentData, byte_domain: bool) -> Self {
+        let supported = matches!(
+            data,
+            AdjustmentData::BrightnessContrast(_)
+                | AdjustmentData::Levels(_)
+                | AdjustmentData::Curves(_)
+                | AdjustmentData::Exposure(_)
+                | AdjustmentData::HueSaturation(_)
+                | AdjustmentData::ColorBalance(_)
+                | AdjustmentData::BlackAndWhite(_)
+                | AdjustmentData::PhotoFilter(_)
+                | AdjustmentData::ChannelMixer(_)
+                | AdjustmentData::Invert { .. }
+                | AdjustmentData::Posterize(_)
+                | AdjustmentData::Threshold(_)
+                | AdjustmentData::GradientMap(_)
+                | AdjustmentData::Vibrance(_)
+        );
+        Self {
+            data: data.clone(),
+            byte_domain,
+            supported,
+        }
+    }
+
+    fn apply(&self, color: [f32; 3]) -> [f32; 3] {
+        match &self.data {
+            AdjustmentData::Invert { .. } => [1.0 - color[0], 1.0 - color[1], 1.0 - color[2]],
+            AdjustmentData::BrightnessContrast(settings) => {
+                let brightness = f32::from(settings.brightness);
+                let contrast = f32::from(settings.contrast);
+                let legacy = settings.lab_only || self.byte_domain;
+                let mut out = [0.0; 3];
+                for channel in 0..3 {
+                    out[channel] =
+                        brightness_contrast(color[channel], brightness, contrast, legacy);
+                }
+                out
+            }
+            AdjustmentData::Levels(levels) => levels_apply(color, levels),
+            AdjustmentData::Curves(curves) => curves_apply(color, &curves.curves),
+            AdjustmentData::Exposure(exposure) => {
+                let mut out = [0.0; 3];
+                for channel in 0..3 {
+                    let value =
+                        color[channel] * 2f32.powf(exposure.exposure) + exposure.offset - 0.5;
+                    out[channel] = value.max(0.0).powf(1.0 / exposure.gamma.max(0.01));
+                }
+                out
+            }
+            AdjustmentData::HueSaturation(settings) => hue_saturation(
+                color,
+                settings.master,
+                settings.colorize,
+                settings.colorization,
+            ),
+            AdjustmentData::ColorBalance(settings) => color_balance(color, settings),
+            AdjustmentData::BlackAndWhite(settings) => black_and_white(color, &settings.descriptor),
+            AdjustmentData::PhotoFilter(settings) => photo_filter(color, settings),
+            AdjustmentData::ChannelMixer(settings) => {
+                let mut out = [0.0; 3];
+                for (channel, mix) in settings.mixes.iter().take(3).enumerate() {
+                    let mut value = f32::from(mix.constant) / 100.0;
+                    for (source, amount) in mix.sources.iter().take(3).enumerate() {
+                        value += color[source] * f32::from(*amount) / 100.0;
+                    }
+                    out[channel] = value.clamp(0.0, 1.0);
+                }
+                if settings.monochrome {
+                    let gray = luminance(out);
+                    [gray, gray, gray]
+                } else {
+                    out
+                }
+            }
+            AdjustmentData::Posterize(settings) => {
+                let levels = f32::from(settings.levels.max(2));
+                let mut out = [0.0; 3];
+                for channel in 0..3 {
+                    let stepped = (color[channel] * levels).floor() / (levels - 1.0);
+                    out[channel] = stepped.clamp(0.0, 1.0);
+                }
+                out
+            }
+            AdjustmentData::Threshold(settings) => {
+                let level = f32::from(settings.level) / 255.0;
+                let value = if luminance(color) >= level { 1.0 } else { 0.0 };
+                [value, value, value]
+            }
+            AdjustmentData::GradientMap(settings) => gradient_map(color, settings),
+            AdjustmentData::Vibrance(settings) => vibrance(color, &settings.descriptor),
+            _ => color,
+        }
+    }
+}
+
+fn luminance(color: [f32; 3]) -> f32 {
+    0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+}
+
+fn preserve_luminosity(before: [f32; 3], after: [f32; 3]) -> [f32; 3] {
+    let delta = luminance(before) - luminance(after);
+    [
+        (after[0] + delta).clamp(0.0, 1.0),
+        (after[1] + delta).clamp(0.0, 1.0),
+        (after[2] + delta).clamp(0.0, 1.0),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Brightness/Contrast
+// ---------------------------------------------------------------------------
+
+fn brightness_contrast(value: f32, brightness: f32, contrast: f32, legacy: bool) -> f32 {
+    if legacy {
+        legacy_brightness_contrast(value, brightness, contrast)
+    } else {
+        modern_contrast(modern_brightness(value, brightness), contrast)
+    }
+}
+
+fn legacy_brightness_contrast(value: f32, b: f32, c: f32) -> f32 {
+    let v = value * 255.0;
+    let result = if c == 0.0 {
+        v + b
+    } else if c > 0.0 && c < 100.0 {
+        (v + b - 127.5) * 100.0 / (100.0 - c) + 127.5
+    } else if c >= 100.0 {
+        if v + b >= 127.0 {
+            255.0
+        } else {
+            0.0
+        }
+    } else {
+        (v - 127.5) * (100.0 + c) / 100.0 + 127.5 + b
+    };
+    (result.round() / 255.0).clamp(0.0, 1.0)
+}
+
+fn modern_brightness(value: f32, amount: f32) -> f32 {
+    if amount == 0.0 {
+        return value;
+    }
+    if amount > 100.0 {
+        return modern_brightness_curve(modern_brightness_curve(value, 100.0), amount - 100.0);
+    }
+    if amount > 0.0 {
+        return modern_brightness_curve(value, amount);
+    }
+    // The exact inverse of the positive curve, by deterministic bisection.
+    let (mut low, mut high) = (0.0f32, 1.0f32);
+    for _ in 0..64 {
+        let mid = 0.5 * (low + high);
+        if modern_brightness_curve(mid, -amount) < value {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    0.5 * (low + high)
+}
+
+/// The gain ray `σ = 2^(amount/110)` up to output 0.5, then one cubic Hermite
+/// to (1, 1) with end slope `τ = max(0.1, 1 / (1 + 12(σ − 1)))`.
+fn modern_brightness_curve(value: f32, amount: f32) -> f32 {
+    let sigma = 2f32.powf(amount / 110.0);
+    let tau = (1.0 / (1.0 + 12.0 * (sigma - 1.0))).max(0.1);
+    let x0 = 0.5 / sigma;
+    if value <= x0 {
+        return (value * sigma).clamp(0.0, 1.0);
+    }
+    let t = ((value - x0) / (1.0 - x0)).clamp(0.0, 1.0);
+    let h00 = 2.0 * t * t * t - 3.0 * t * t + 1.0;
+    let h10 = t * t * t - 2.0 * t * t + t;
+    let h01 = -2.0 * t * t * t + 3.0 * t * t;
+    let h11 = t * t * t - t * t;
+    let slope = tau * (1.0 - x0) / 0.5f32.max(1e-6);
+    (h00 * 0.5 + h10 * slope + h01 * 1.0 + h11 * tau).clamp(0.0, 1.0)
+}
+
+fn modern_contrast(value: f32, c: f32) -> f32 {
+    if c == 0.0 {
+        return value;
+    }
+    let beta = 1.0 - 0.0076 * c;
+    if value <= 0.5 {
+        (2.0 - 2.0 * beta) * value * value + beta * value
+    } else {
+        let u = 1.0 - value;
+        1.0 - ((2.0 - 2.0 * beta) * u * u + beta * u)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Levels and Curves
+// ---------------------------------------------------------------------------
+
+fn levels_apply(color: [f32; 3], levels: &Levels) -> [f32; 3] {
+    let mut out = color;
+    for (index, record) in levels.records.iter().enumerate() {
+        // Record 0 is the composite, then R, G, B.
+        let target = match index {
+            0 => None,
+            1 => Some(0),
+            2 => Some(1),
+            3 => Some(2),
+            _ => continue,
+        };
+        let floor = f32::from(record.input_floor);
+        let ceiling = f32::from(record.input_ceiling);
+        let output_floor = f32::from(record.output_floor);
+        let output_ceiling = f32::from(record.output_ceiling);
+        let gamma = if record.gamma == 0 {
+            1.0
+        } else {
+            f32::from(record.gamma) / 100.0
+        };
+        let map = |value: f32| -> f32 {
+            let scaled = ((value * 255.0 - floor) / (ceiling - floor).max(1e-6)).clamp(0.0, 1.0);
+            let corrected = scaled.powf(1.0 / gamma.max(1e-6));
+            ((output_floor + corrected * (output_ceiling - output_floor)) / 255.0).clamp(0.0, 1.0)
+        };
+        match target {
+            None => {
+                for channel in 0..3 {
+                    out[channel] = map(color[channel]);
+                }
+            }
+            Some(channel) => out[channel] = map(color[channel]),
+        }
+    }
+    out
+}
+
+fn curves_apply(color: [f32; 3], curves: &[Curve]) -> [f32; 3] {
+    let mut out = color;
+    for curve in curves {
+        let channel = match curve.channel {
+            1 => Some(0),
+            2 => Some(1),
+            3 => Some(2),
+            _ => None,
+        };
+        let table = match &curve.data {
+            CurveData::Points(points) => curve_lut(points),
+            CurveData::Map(values) => {
+                let mut table = [0.0f32; 256];
+                for (index, entry) in table.iter_mut().enumerate() {
+                    *entry = f32::from(*values.get(index).unwrap_or(&(index as u8))) / 255.0;
+                }
+                table
+            }
+        };
+        match channel {
+            Some(channel) => out[channel] = sample_lut(&table, out[channel]),
+            None => {
+                for value in out.iter_mut() {
+                    *value = sample_lut(&table, *value);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A 256-entry table from a natural cubic spline through the control points.
+fn curve_lut(points: &[CurvePoint]) -> [f32; 256] {
+    let mut nodes: Vec<(f32, f32)> = points
+        .iter()
+        .map(|point| (f32::from(point.input), f32::from(point.output)))
+        .collect();
+    nodes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    nodes.dedup_by(|a, b| a.0 == b.0);
+    let mut table = [0.0f32; 256];
+    if nodes.len() < 2 {
+        for (index, entry) in table.iter_mut().enumerate() {
+            *entry = index as f32 / 255.0;
+        }
+        return table;
+    }
+    let n = nodes.len();
+    let mut h = vec![0.0f32; n - 1];
+    for index in 0..n - 1 {
+        h[index] = nodes[index + 1].0 - nodes[index].0;
+    }
+    let mut alpha = vec![0.0f32; n];
+    for index in 1..n - 1 {
+        alpha[index] = 3.0
+            * ((nodes[index + 1].1 - nodes[index].1) / h[index]
+                - (nodes[index].1 - nodes[index - 1].1) / h[index - 1]);
+    }
+    let mut l = vec![1.0f32; n];
+    let mut mu = vec![0.0f32; n];
+    let mut z = vec![0.0f32; n];
+    for index in 1..n - 1 {
+        l[index] = 2.0 * (nodes[index + 1].0 - nodes[index - 1].0) - h[index - 1] * mu[index - 1];
+        mu[index] = h[index] / l[index];
+        z[index] = (alpha[index] - h[index - 1] * z[index - 1]) / l[index];
+    }
+    let mut c = vec![0.0f32; n];
+    let mut b = vec![0.0f32; n];
+    let mut d = vec![0.0f32; n];
+    for j in (0..n - 1).rev() {
+        c[j] = z[j] - mu[j] * c[j + 1];
+        b[j] = (nodes[j + 1].1 - nodes[j].1) / h[j] - h[j] * (c[j + 1] + 2.0 * c[j]) / 3.0;
+        d[j] = (c[j + 1] - c[j]) / (3.0 * h[j]);
+    }
+    for (index, entry) in table.iter_mut().enumerate() {
+        let x = index as f32;
+        let value = if x <= nodes[0].0 {
+            nodes[0].1
+        } else if x >= nodes[n - 1].0 {
+            nodes[n - 1].1
+        } else {
+            let mut segment = 0;
+            for i in 0..n - 1 {
+                if x >= nodes[i].0 && x <= nodes[i + 1].0 {
+                    segment = i;
+                    break;
+                }
+            }
+            let dx = x - nodes[segment].0;
+            nodes[segment].1 + b[segment] * dx + c[segment] * dx * dx + d[segment] * dx * dx * dx
+        };
+        *entry = (value / 255.0).clamp(0.0, 1.0);
+    }
+    table
+}
+
+fn sample_lut(table: &[f32; 256], value: f32) -> f32 {
+    let index = (value.clamp(0.0, 1.0) * 255.0).round() as usize;
+    table[index.min(255)]
+}
+
+// ---------------------------------------------------------------------------
+// Colour adjustments
+// ---------------------------------------------------------------------------
+
+fn rgb_to_hsl(color: [f32; 3]) -> (f32, f32, f32) {
+    let max = color[0].max(color[1]).max(color[2]);
+    let min = color[0].min(color[1]).min(color[2]);
+    let lightness = 0.5 * (max + min);
+    let delta = max - min;
+    if delta <= 1e-6 {
+        return (0.0, 0.0, lightness);
+    }
+    let saturation = if lightness > 0.5 {
+        delta / (2.0 - max - min).max(1e-6)
+    } else {
+        delta / (max + min).max(1e-6)
+    };
+    let hue = if max == color[0] {
+        ((color[1] - color[2]) / delta).rem_euclid(6.0)
+    } else if max == color[1] {
+        (color[2] - color[0]) / delta + 2.0
+    } else {
+        (color[0] - color[1]) / delta + 4.0
+    } / 6.0;
+    (hue, saturation, lightness)
+}
+
+fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> [f32; 3] {
+    let c = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let h = hue * 6.0;
+    let x = c * (1.0 - (h.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match h.floor() as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = lightness - c / 2.0;
+    [
+        (r + m).clamp(0.0, 1.0),
+        (g + m).clamp(0.0, 1.0),
+        (b + m).clamp(0.0, 1.0),
+    ]
+}
+
+fn hue_saturation(
+    color: [f32; 3],
+    values: HueSaturationValues,
+    colorize: bool,
+    colorization: HueSaturationValues,
+) -> [f32; 3] {
+    if colorize {
+        let target = (f32::from(colorization.hue) / 360.0).rem_euclid(1.0);
+        let saturation = (f32::from(colorization.saturation) / 100.0).clamp(0.0, 1.0);
+        let lightness = (0.5 + f32::from(colorization.lightness) / 200.0).clamp(0.0, 1.0);
+        return hsl_to_rgb(target, saturation, lightness);
+    }
+    let (hue, saturation, lightness) = rgb_to_hsl(color);
+    let hue = (hue + f32::from(values.hue) / 360.0).rem_euclid(1.0);
+    let saturation_delta = f32::from(values.saturation) / 100.0;
+    let saturation = if saturation_delta >= 0.0 {
+        saturation + (1.0 - saturation) * saturation_delta
+    } else {
+        saturation * (1.0 + saturation_delta)
+    };
+    let lightness_delta = f32::from(values.lightness) / 100.0;
+    let lightness = if lightness_delta >= 0.0 {
+        lightness + (1.0 - lightness) * lightness_delta
+    } else {
+        lightness * (1.0 + lightness_delta)
+    };
+    hsl_to_rgb(
+        hue.clamp(0.0, 1.0),
+        saturation.clamp(0.0, 1.0),
+        lightness.clamp(0.0, 1.0),
+    )
+}
+
+fn color_balance(color: [f32; 3], settings: &psd_core::adjustments::ColorBalance) -> [f32; 3] {
+    let mut deltas = [0.0f32; 3];
+    let ranges: [(&ColorBalanceValues, f32); 3] = [
+        (&settings.shadows, 0.25),
+        (&settings.midtones, 0.5),
+        (&settings.highlights, 0.75),
+    ];
+    for (values, center) in ranges {
+        // A weight that peaks in the range's tonal zone and falls away.
+        let distance = (luminance(color) - center).abs();
+        let weight = (1.0 - distance * 2.0).max(0.0);
+        deltas[0] += f32::from(values.cyan_red) / 100.0 * weight;
+        deltas[1] += f32::from(values.magenta_green) / 100.0 * weight;
+        deltas[2] += f32::from(values.yellow_blue) / 100.0 * weight;
+    }
+    let mut out = color;
+    for channel in 0..3 {
+        out[channel] = (color[channel] + deltas[channel] * 0.5).clamp(0.0, 1.0);
+    }
+    if settings.preserve_luminosity {
+        out = preserve_luminosity(color, out);
+    }
+    out
+}
+
+fn descriptor_number(descriptor: &Descriptor, key: &str) -> Option<f64> {
+    match descriptor.get(key)? {
+        DescriptorValue::Double(value) => Some(*value),
+        DescriptorValue::Integer(value) => Some(f64::from(*value)),
+        DescriptorValue::UnitFloat { value, .. } => Some(*value),
+        _ => None,
+    }
+}
+
+fn descriptor_descriptor(value: &DescriptorValue) -> Option<&Descriptor> {
+    match value {
+        DescriptorValue::Descriptor(descriptor) => Some(descriptor),
+        _ => None,
+    }
+}
+
+/// A descriptor colour (`Rd  `/`Grn `/`Bl  ` doubles) as 0..1 RGB.
+fn descriptor_rgb(value: &DescriptorValue) -> Option<[f32; 3]> {
+    let descriptor = descriptor_descriptor(value)?;
+    let channel =
+        |key: &str| descriptor_number(descriptor, key).map(|value| (value / 255.0) as f32);
+    Some([channel("Rd  ")?, channel("Grn ")?, channel("Bl  ")?])
+}
+
+fn black_and_white(color: [f32; 3], descriptor: &Descriptor) -> [f32; 3] {
+    let weight = |key: &str, fallback: f32| -> f32 {
+        descriptor_number(descriptor, key).map_or(fallback, |value| (value / 100.0) as f32)
+    };
+    let reds = weight("reds", 0.4);
+    let yellows = weight("yellows", 0.6);
+    let greens = weight("greens", 0.4);
+    let cyans = weight("cyans", 0.6);
+    let blues = weight("blues", 0.2);
+    let magentas = weight("magentas", 0.8);
+
+    // Each pixel takes the mix of the two primaries its hue sits between.
+    let (r, g, b) = (color[0], color[1], color[2]);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let chroma = max - min;
+    let gray = if chroma <= 1e-6 {
+        max
+    } else {
+        let mut value = 0.0f32;
+        // Primary shares: how far each channel is above the minimum.
+        let shares = [r - min, g - min, b - min];
+        let total: f32 = shares.iter().sum();
+        let pair_weights = [
+            (reds, yellows, greens),  // red-dominant
+            (greens, yellows, cyans), // green-dominant
+            (blues, cyans, magentas), // blue-dominant
+        ];
+        for (index, share) in shares.iter().enumerate() {
+            if *share <= 0.0 {
+                continue;
+            }
+            let (primary, secondary, _tertiary) = pair_weights[index];
+            // The two secondaries split the remainder by their own shares.
+            let other: Vec<(usize, f32)> = shares
+                .iter()
+                .enumerate()
+                .filter(|(other, share)| *other != index && **share > 0.0)
+                .map(|(other, share)| (other, *share))
+                .collect();
+            let other_total: f32 = other.iter().map(|(_, share)| *share).sum();
+            let mut local = primary * share;
+            for (other_index, other_share) in other {
+                let secondary_weight = match (index, other_index) {
+                    (0, 1) => yellows,
+                    (0, 2) => magentas,
+                    (1, 0) => yellows,
+                    (1, 2) => cyans,
+                    (2, 0) => magentas,
+                    _ => cyans,
+                };
+                let _ = secondary;
+                let portion = if other_total > 0.0 {
+                    other_share / other_total
+                } else {
+                    0.0
+                };
+                local += secondary_weight * other_share * portion;
+            }
+            value += local;
+        }
+        (value / total.max(1e-6)).clamp(0.0, 1.0)
+    };
+
+    let Some(outer) = descriptor.get("tintColor").and_then(descriptor_descriptor) else {
+        return [gray, gray, gray];
+    };
+    let amount = (descriptor_number(outer, "tint").unwrap_or(0.0) / 100.0) as f32;
+    let Some(tint) = outer.get("tintColor").and_then(descriptor_rgb) else {
+        return [gray, gray, gray];
+    };
+    let mut out = [0.0; 3];
+    for channel in 0..3 {
+        out[channel] = gray * (1.0 - amount) + tint[channel] * gray * amount;
+    }
+    out
+}
+
+fn photo_filter(color: [f32; 3], settings: &PhotoFilter) -> [f32; 3] {
+    let filter = match &settings.color {
+        PhotoFilterColor::Xyz(components) => {
+            let scale = |value: i32| ((value as f32) / 255.0).clamp(0.0, 1.0);
+            [
+                scale(components[0]),
+                scale(components[1]),
+                scale(components[2]),
+            ]
+        }
+        PhotoFilterColor::Color(raw) => {
+            let scale = |value: u16| (f32::from(value) / 255.0).clamp(0.0, 1.0);
+            [
+                scale(raw.components[0]),
+                scale(raw.components[1]),
+                scale(raw.components[2]),
+            ]
+        }
+    };
+    let density = (settings.density as f32 / 100.0).clamp(0.0, 1.0);
+    let mut out = [0.0; 3];
+    for channel in 0..3 {
+        out[channel] = color[channel] * (1.0 - density) + filter[channel] * density;
+    }
+    if settings.preserve_luminosity {
+        out = preserve_luminosity(color, out);
+    }
+    out
+}
+
+fn vibrance(color: [f32; 3], descriptor: &Descriptor) -> [f32; 3] {
+    let amount = (descriptor_number(descriptor, "vibrance").unwrap_or(0.0) / 100.0) as f32;
+    let saturation = (descriptor_number(descriptor, "saturation").unwrap_or(0.0) / 100.0) as f32;
+    if amount == 0.0 && saturation == 0.0 {
+        return color;
+    }
+    let max = color[0].max(color[1]).max(color[2]);
+    let min = color[0].min(color[1]).min(color[2]);
+    let current = max - min;
+    // Vibrance boosts the least saturated pixels most.
+    let boost = amount * (1.0 - current) + saturation;
+    let gray = luminance(color);
+    let mut out = [0.0; 3];
+    for channel in 0..3 {
+        out[channel] = (gray + (color[channel] - gray) * (1.0 + boost)).clamp(0.0, 1.0);
+    }
+    out
+}
+
+fn gradient_map(color: [f32; 3], settings: &GradientMap) -> [f32; 3] {
+    let stops: Vec<psd_core::ColorStop> = settings
+        .color_stops
+        .iter()
+        .map(|stop| psd_core::ColorStop {
+            source: StopSource::User(Color::Rgb {
+                red: f64::from(stop.color.components[0].min(255)),
+                green: f64::from(stop.color.components[1].min(255)),
+                blue: f64::from(stop.color.components[2].min(255)),
+            }),
+            location: stop.location.min(4096) as i32,
+            midpoint: stop.midpoint.min(100) as i32,
+        })
+        .collect();
+    let gradient = psd_core::Gradient {
+        label: settings.name.clone(),
+        name: settings.name.clone(),
+        kind: GradientKind::Solid(SolidGradient {
+            smoothness: 4096.0,
+            color_stops: stops,
+            transparency_stops: Vec::<TransparencyStop>::new(),
+        }),
+    };
+    super::effects::gradient_sample(&gradient, luminance(color))
+}
+
+/// A fill layer's content: solid color or gradient over the whole canvas.
+pub fn fill_content<T: BitDepth>(
+    compositor: &Compositor<'_, T>,
+    layer: &Layer<T>,
+) -> Result<Option<Content>> {
+    let blocks = layer.adjustments()?;
+    let Some(block) = blocks.iter().find(|block| {
+        matches!(
+            block.kind,
+            AdjustmentKind::SolidColor | AdjustmentKind::GradientFill
+        )
+    }) else {
+        return Ok(None);
+    };
+    let AdjustmentData::Fill(settings) = &block.data else {
+        return Ok(None);
+    };
+    let rect = Rect::new(
+        0,
+        0,
+        compositor.document.width as i32,
+        compositor.document.height as i32,
+    );
+    let mut content = Content::new(rect);
+    let width = content.width();
+    let height = content.height();
+    match block.kind {
+        AdjustmentKind::SolidColor => {
+            let color = settings
+                .descriptor
+                .get("Clr ")
+                .and_then(descriptor_rgb)
+                .unwrap_or([0.0, 0.0, 0.0]);
+            for index in 0..width * height {
+                content.color[0][index] = color[0];
+                content.color[1][index] = color[1];
+                content.color[2][index] = color[2];
+                content.alpha[index] = 1.0;
+            }
+        }
+        AdjustmentKind::GradientFill => {
+            let gradient = settings
+                .descriptor
+                .get("Grad")
+                .and_then(descriptor_descriptor)
+                .and_then(psd_core::Gradient::from_descriptor);
+            for y in 0..height {
+                for x in 0..width {
+                    let t = if width <= 1 {
+                        0.0
+                    } else {
+                        x as f32 / (width - 1) as f32
+                    };
+                    let color = gradient
+                        .as_ref()
+                        .map(|gradient| super::effects::gradient_sample(gradient, t))
+                        .unwrap_or([0.0, 0.0, 0.0]);
+                    let index = y * width + x;
+                    content.color[0][index] = color[0];
+                    content.color[1][index] = color[1];
+                    content.color[2][index] = color[2];
+                    content.alpha[index] = 1.0;
+                }
+            }
+        }
+        _ => return Ok(None),
+    }
+    if let Some(mask) = mask_field(layer)? {
+        let mut values = vec![mask.default; width * height];
+        for y in mask.top..mask.bottom {
+            for x in mask.left..mask.right {
+                let Some(target) = content.index(i64::from(x), i64::from(y)) else {
+                    continue;
+                };
+                if target < values.len() {
+                    values[target] = mask.coverage(x, y);
+                }
+            }
+        }
+        content.mask = Some(values);
+    }
+    Ok(Some(content))
+}

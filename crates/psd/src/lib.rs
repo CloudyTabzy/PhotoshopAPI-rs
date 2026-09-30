@@ -23,6 +23,7 @@
 
 mod bitdepth;
 pub mod channels;
+pub mod composite;
 pub mod geometry;
 pub mod layer;
 pub mod layered_file;
@@ -39,6 +40,7 @@ pub use psd_core as core;
 
 pub use bitdepth::BitDepth;
 pub use channels::{ChannelKey, ChannelStore};
+pub use composite::{CompositeImage, CompositeOptions};
 pub use geometry::{BezierSurface, BoundingBox, Homography, MeshVertex, Point2, QuadMesh};
 pub use layer::{
     AdjustmentLayer, GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Rect, ShapeLayer, TextLayer,
