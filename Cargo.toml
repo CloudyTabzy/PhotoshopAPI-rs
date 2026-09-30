@@ -10,7 +10,7 @@ exclude = ["crates/psd-png/bench", "crates/psd-png/fuzz"]
 edition = "2021"
 license = "BSD-3-Clause"
 # The single project version; bump it with every CHANGELOG.md entry.
-version = "0.11.5"
+version = "0.12.0"
 
 # Dependency versions are centralized here; crates pull them in with
 # `workspace = true`.
@@ -25,6 +25,7 @@ thiserror = "2"
 tracing = "0.1"
 rayon = "1"
 memmap2 = "0.9"
+moxcms = { version = "0.8.1", default-features = false, features = ["lut", "options"] }
 libdeflater = "1"
 nalgebra = { version = "0.34", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

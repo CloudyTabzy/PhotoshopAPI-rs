@@ -18,6 +18,7 @@ thiserror.workspace = true
 tracing.workspace = true
 rayon.workspace = true
 memmap2.workspace = true
+moxcms.workspace = true
 nalgebra.workspace = true
 image = { workspace = true, optional = true }
 psd-png = { workspace = true, optional = true }

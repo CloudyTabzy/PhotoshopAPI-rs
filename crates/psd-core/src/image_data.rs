@@ -1,10 +1,10 @@
 //! The merged composite ImageData section (`PhotoshopFile/ImageData.h`).
 //!
 //! This section holds a flattened composite of the layer tree and exists for
-//! interoperability (Lightroom et al.). The port never parses it on read and
-//! never renders it on write: saves emit all-zero pixels with RLE compression,
-//! which Photoshop accepts and which cuts 20–50% off file size versus
-//! Photoshop's own output (upstream does the same).
+//! interoperability (Lightroom et al.). The core reader leaves it raw. The
+//! document layer can preserve a source section verbatim when it is the only
+//! pixel data in a layerless document; normal writes synthesize a zeroed RLE
+//! section, which Photoshop accepts and which cuts 20–50% off the file size.
 //!
 //! Layout: `u16` compression (`1` = RLE) | for each channel a scanline-size
 //! table (`u16` PSD / `u32` PSB) | for each channel the concatenated
@@ -18,17 +18,33 @@ use crate::header::FileHeader;
 use crate::io::BeWriter;
 
 /// The merged composite section.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ImageData {
     /// Number of channels written for the merged image. Photoshop's header
     /// counts alpha channels; the merged data does not, so this is set
     /// explicitly by the document layer (upstream does the same).
     pub num_channels: u16,
+    /// Original merged section, when a document is layerless and the caller
+    /// has retained it for compositing and lossless round trips.
+    raw_section: Option<Vec<u8>>,
 }
 
 impl ImageData {
     pub fn new(num_channels: u16) -> Self {
-        Self { num_channels }
+        Self {
+            num_channels,
+            raw_section: None,
+        }
+    }
+
+    /// Preserve an existing merged section verbatim on write.
+    pub fn set_raw_section(&mut self, section: Option<Vec<u8>>) {
+        self.raw_section = section;
+    }
+
+    /// The retained section, including its two-byte compression marker.
+    pub fn raw_section(&self) -> Option<&[u8]> {
+        self.raw_section.as_deref()
     }
 
     /// Bytes per scanline (one channel) for the given header.
@@ -44,6 +60,16 @@ impl ImageData {
 
     /// Write the section with zeroed RLE data (upstream `ImageData::write`).
     pub fn write(&self, writer: &mut BeWriter, header: &FileHeader) -> Result<()> {
+        if let Some(section) = &self.raw_section {
+            if section.len() < 2 {
+                return Err(PsdError::InvalidData {
+                    offset: 0,
+                    message: "retained merged image section is truncated",
+                });
+            }
+            writer.bytes(section);
+            return Ok(());
+        }
         writer.u16(1); // RLE compression marker
 
         let scanline_bytes = Self::scanline_bytes(header);

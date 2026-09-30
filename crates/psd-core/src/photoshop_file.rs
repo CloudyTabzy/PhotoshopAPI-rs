@@ -3,9 +3,9 @@
 //! Section order: [`FileHeader`] | [`ColorModeData`] | [`ImageResources`] |
 //! [`LayerAndMaskInformation`] | [`ImageData`].
 //!
-//! Reading stops after the layer-and-mask section: the trailing merged
-//! composite is never parsed (upstream does the same — the port always
-//! synthesizes a zeroed one on write).
+//! Reading stops after the layer-and-mask section. The document layer may
+//! retain the trailing merged section when a source document has no layer
+//! records; ordinary document writes continue to synthesize a zeroed one.
 
 use crate::color_mode_data::ColorModeData;
 use crate::error::Result;
@@ -26,8 +26,8 @@ pub struct PhotoshopFile<'a> {
     pub color_mode_data: ColorModeData,
     pub image_resources: ImageResources,
     pub layer_and_mask_info: LayerAndMaskInformation<'a>,
-    /// Set the channel count before writing; read leaves it empty because the
-    /// section is never parsed.
+    /// Set the channel count before writing; the merged section can also be
+    /// retained raw by the document layer when the file has no layer tree.
     pub image_data: ImageData,
 }
 
@@ -92,7 +92,7 @@ impl<'a> PhotoshopFile<'a> {
             .flat_map(|layer| &layer.channels)
             .map(|channel| channel.data.len() + 2)
             .sum();
-        payload + (1 << 20)
+        payload + self.image_data.raw_section().map_or(0, <[u8]>::len) + (1 << 20)
     }
 }
 

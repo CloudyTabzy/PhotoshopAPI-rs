@@ -22,15 +22,15 @@
 //!   whole steps of a 1530-step wheel; colorize rebuilds from the source's
 //!   lightness).
 //!
-//! Approximated, and documented as such: the saturation ratio is a closed
-//! form where Photoshop's is a measured table, the six Hue/Saturation ranges
-//! are not applied, Vibrance follows the usual falloff, Color Balance is a
-//! smooth approximation, and Selective Color, Color Lookup and Content
-//! Generator are not rendered.
+//! Approximated, and documented as such: the master saturation ratio is a
+//! measured table with interpolation between pinned samples; Vibrance,
+//! Color Balance, Photo Filter and Selective Color use calibrated models.
+//! Color Lookup and Content Generator are not rendered.
 
 use psd_core::adjustments::{
     AdjustmentData, AdjustmentKind, ColorBalanceValues, Curve, CurveData, CurvePoint, GradientMap,
-    HueSaturationValues, Levels, PhotoFilter, PhotoFilterColor,
+    HueRange, HueSaturation, HueSaturationValues, Levels, PhotoFilter, PhotoFilterColor,
+    SelectiveColor,
 };
 use psd_core::{
     Color, Descriptor, DescriptorValue, GradientKind, Result, SolidGradient, StopSource,
@@ -54,6 +54,7 @@ pub fn apply<T: BitDepth>(
     layer: &Layer<T>,
     canvas: &mut Canvas,
     clip_base: Option<&Plane>,
+    adjustment_limit: Option<&Plane>,
 ) -> Result<()> {
     let blocks = layer.adjustments()?;
     let Some(block) = blocks.iter().find(|block| {
@@ -104,6 +105,9 @@ pub fn apply<T: BitDepth>(
             let mut coverage = strength * mask.as_ref().map_or(1.0, |mask| mask[local]);
             if let Some(clip_base) = clip_base {
                 coverage *= clip_base.at(x, y);
+            }
+            if let Some(group_coverage) = adjustment_limit {
+                coverage *= group_coverage.at(x, y);
             }
             if coverage <= 0.0 {
                 continue;
@@ -187,6 +191,7 @@ impl Operation {
                 | AdjustmentData::Threshold(_)
                 | AdjustmentData::GradientMap(_)
                 | AdjustmentData::Vibrance(_)
+                | AdjustmentData::SelectiveColor(_)
         );
         Self {
             data: data.clone(),
@@ -237,12 +242,7 @@ impl Operation {
                     }
                 })
             }
-            AdjustmentData::HueSaturation(settings) => hue_saturation(
-                color,
-                settings.master,
-                settings.colorize,
-                settings.colorization,
-            ),
+            AdjustmentData::HueSaturation(settings) => hue_saturation(color, settings),
             AdjustmentData::ColorBalance(settings) => color_balance(color, settings),
             AdjustmentData::BlackAndWhite(settings) => black_and_white(color, &settings.descriptor),
             AdjustmentData::PhotoFilter(settings) => photo_filter(color, settings),
@@ -278,6 +278,7 @@ impl Operation {
             }
             AdjustmentData::GradientMap(settings) => gradient_map(color, settings),
             AdjustmentData::Vibrance(settings) => vibrance(color, &settings.descriptor),
+            AdjustmentData::SelectiveColor(settings) => selective_color(color, settings),
             _ => color,
         }
     }
@@ -543,18 +544,13 @@ fn sample_lut(table: &[f32; 256], value: f32) -> f32 {
 // Colour adjustments
 // ---------------------------------------------------------------------------
 
-fn hue_saturation(
-    color: [f32; 3],
-    values: HueSaturationValues,
-    colorize: bool,
-    colorization: HueSaturationValues,
-) -> [f32; 3] {
+fn hue_saturation(color: [f32; 3], settings: &HueSaturation) -> [f32; 3] {
     let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as i32;
     let rgb = [byte(color[0]), byte(color[1]), byte(color[2])];
-    let out = if colorize {
-        colorize_bytes(rgb, colorization)
+    let out = if settings.colorize {
+        colorize_bytes(rgb, settings.colorization)
     } else {
-        master_bytes(rgb, values)
+        master_bytes(rgb, settings.master, &settings.ranges)
     };
     out.map(|value| value as f32 / 255.0)
 }
@@ -562,6 +558,7 @@ fn hue_saturation(
 /// Photoshop's lightness slider: the percent is quantised to a byte first,
 /// then each channel moves toward white or black by that step.
 fn lightness_byte(value: i32, percent: i32) -> i32 {
+    let percent = percent.clamp(-100, 100);
     if percent == 0 {
         return value;
     }
@@ -573,15 +570,10 @@ fn lightness_byte(value: i32, percent: i32) -> i32 {
     }
 }
 
-/// The saturation slider's ratio on the half chroma: `1 + s` below zero and
-/// `1 / (1 - s)` above, bounded at the slider's end (fitted to Photoshop).
+/// The measured saturation ratio on half chroma, including the quantized
+/// percent conversion at intermediate settings and the finite endpoint.
 fn saturation_ratio(percent: i32) -> f32 {
-    let s = percent.clamp(-100, 100) as f32 / 100.0;
-    if s <= 0.0 {
-        1.0 + s
-    } else {
-        (1.0 / (1.0 - s).max(1.0 / 128.0)).min(128.0)
-    }
+    super::hue_tables::MASTER_SATURATION[(percent.clamp(-100, 100) + 100) as usize] as f32
 }
 
 /// A position on Photoshop's 1530-step hue wheel (six sectors of 255).
@@ -620,7 +612,58 @@ fn from_wheel(position: f32, light: i32, half: f32) -> [i32; 3] {
     [r.clamp(0, 255), g.clamp(0, 255), b.clamp(0, 255)]
 }
 
-fn master_bytes(rgb: [i32; 3], values: HueSaturationValues) -> [i32; 3] {
+/// A circular trapezoid: four stops in hue-wheel order, with hard edges when
+/// an outer stop equals its neighboring inner stop. A degenerate empty range
+/// has no effect. Selection always uses the original pixel's hue.
+fn hue_range_weight(hue: f32, stops: [i16; 4]) -> f32 {
+    let forward = |from: f32, to: f32| (to - from).rem_euclid(360.0);
+    let [outer_start, inner_start, inner_end, outer_end] = stops.map(f32::from);
+    let rise = forward(outer_start, inner_start);
+    let plateau = forward(inner_start, inner_end);
+    let fall = forward(inner_end, outer_end);
+    let distance = forward(outer_start, hue);
+    if rise + plateau + fall <= 0.0 {
+        0.0
+    } else if distance < rise {
+        distance / rise
+    } else if distance <= rise + plateau {
+        1.0
+    } else if fall > 0.0 && distance < rise + plateau + fall {
+        1.0 - (distance - rise - plateau) / fall
+    } else {
+        0.0
+    }
+}
+
+fn master_bytes(
+    mut rgb: [i32; 3],
+    values: HueSaturationValues,
+    ranges: &[HueRange; 6],
+) -> [i32; 3] {
+    let mut weights = [0.0f32; 6];
+    let original_max = *rgb.iter().max().unwrap();
+    let original_min = *rgb.iter().min().unwrap();
+    if original_max != original_min {
+        let original_hue = wheel_position(rgb, original_max, original_min);
+        let mut range_lightness = 0.0;
+        for (weight, range) in weights.iter_mut().zip(ranges) {
+            *weight = hue_range_weight(original_hue / 4.25, range.range);
+            range_lightness += *weight * f32::from(range.values.lightness.clamp(-100, 100));
+        }
+        // Range lightness collapses chroma toward max/min, then the master
+        // lightness runs. Overlapping contributions sum before the collapse.
+        if range_lightness != 0.0 {
+            let mut high = original_max as f32;
+            let mut low = original_min as f32;
+            if range_lightness > 0.0 {
+                low += (high - low) * range_lightness.min(100.0) / 100.0;
+            } else {
+                high += (low - high) * (-range_lightness).min(100.0) / 100.0;
+            }
+            let (high, low) = (high.round() as i32, low.round() as i32);
+            rgb = from_wheel(original_hue, (high + low) >> 1, (high - low) as f32 * 0.5);
+        }
+    }
     // Lightness runs first and per channel, then the integer HSL stages.
     let rgb = rgb.map(|value| lightness_byte(value, i32::from(values.lightness)));
     let max = rgb[0].max(rgb[1]).max(rgb[2]);
@@ -632,11 +675,61 @@ fn master_bytes(rgb: [i32; 3], values: HueSaturationValues) -> [i32; 3] {
     let light = (max + min) >> 1;
     let half = (max - min) as f32 / 2.0;
     let limit = (light.min(255 - light) as f32).max(half);
-    let half = (half * saturation_ratio(i32::from(values.saturation))).min(limit);
+    let mut range_ratio = 1.0;
+    let mut steps = (f32::from(values.hue.clamp(-180, 180)) * 4.25 + 0.5).floor();
+    for (weight, range) in weights.iter().zip(ranges) {
+        range_ratio += weight * (saturation_ratio(i32::from(range.values.saturation)) - 1.0);
+        steps += (weight * f32::from(range.values.hue.clamp(-180, 180)) * 4.25 + 0.5).floor();
+    }
+    let half =
+        (half * saturation_ratio(i32::from(values.saturation)) * range_ratio.max(0.0)).min(limit);
     // The hue turns by a whole number of wheel steps.
-    let steps = (f32::from(values.hue) * 4.25 + 0.5).floor();
     let position = wheel_position(rgb, max, min) + steps;
     from_wheel(position, light, half)
+}
+
+/// Selective Color is a sum of range contributions evaluated on the original
+/// RGB pixel. The chromatic weights use max/median/min; the achromatic ranges
+/// use distance from the midtone. Relative mode scales the requested ink by
+/// the channel's remaining ink capacity before clipping its contribution.
+fn selective_color(color: [f32; 3], settings: &SelectiveColor) -> [f32; 3] {
+    let color = color.map(|value| value.clamp(0.0, 1.0));
+    let mut ordered = color;
+    ordered.sort_by(f32::total_cmp);
+    let [min, middle, max] = ordered;
+    let primary = max - middle;
+    let secondary = middle - min;
+    let categories = [
+        (color[0] == max, primary, &settings.reds),
+        (color[2] == min, secondary, &settings.yellows),
+        (color[1] == max, primary, &settings.greens),
+        (color[0] == min, secondary, &settings.cyans),
+        (color[2] == max, primary, &settings.blues),
+        (color[1] == min, secondary, &settings.magentas),
+        (min > 0.5, 2.0 * min - 1.0, &settings.whites),
+        (
+            max > 0.0 && min < 1.0,
+            1.0 - (max - 0.5).abs() - (min - 0.5).abs(),
+            &settings.neutrals,
+        ),
+        (max < 0.5, 1.0 - 2.0 * max, &settings.blacks),
+    ];
+    let mut delta = [0.0; 3];
+    for (selected, weight, correction) in categories {
+        if !selected || weight <= 0.0 {
+            continue;
+        }
+        let ink = [correction.cyan, correction.magenta, correction.yellow]
+            .map(|v| f32::from(v.clamp(-100, 100)) / 100.0);
+        let black = f32::from(correction.black.clamp(-100, 100)) / 100.0;
+        for channel in 0..3 {
+            let capacity = 1.0 - color[channel];
+            let factor = if settings.absolute { 1.0 } else { capacity };
+            let amount = (-(1.0 + ink[channel]) * black - ink[channel]) * factor;
+            delta[channel] += amount.clamp(-color[channel], capacity) * weight;
+        }
+    }
+    std::array::from_fn(|channel| (color[channel] + delta[channel]).clamp(0.0, 1.0))
 }
 
 fn colorize_bytes(rgb: [i32; 3], colorization: HueSaturationValues) -> [i32; 3] {
@@ -650,28 +743,53 @@ fn colorize_bytes(rgb: [i32; 3], colorization: HueSaturationValues) -> [i32; 3] 
 }
 
 fn color_balance(color: [f32; 3], settings: &psd_core::adjustments::ColorBalance) -> [f32; 3] {
+    let light = hsl_lightness(color);
+    // Partition the tonal axis instead of overlapping three broad triangles.
+    // The shadow/highlight shoulders transition over a quarter of the axis;
+    // the midtone receives the remaining weight.
+    let shadow = ((1.0 / 3.0 - light) * 4.0 + 0.5).clamp(0.0, 1.0);
+    let highlight = ((light - 2.0 / 3.0) * 4.0 + 0.5).clamp(0.0, 1.0);
+    let midtone = (1.0 - shadow) * (1.0 - highlight);
     let mut deltas = [0.0f32; 3];
     let ranges: [(&ColorBalanceValues, f32); 3] = [
-        (&settings.shadows, 0.25),
-        (&settings.midtones, 0.5),
-        (&settings.highlights, 0.75),
+        (&settings.shadows, shadow),
+        (&settings.midtones, midtone),
+        (&settings.highlights, highlight),
     ];
-    for (values, center) in ranges {
-        // A weight that peaks in the range's tonal zone and falls away.
-        let distance = (luminance(color) - center).abs();
-        let weight = (1.0 - distance * 2.0).max(0.0);
-        deltas[0] += f32::from(values.cyan_red) / 100.0 * weight;
-        deltas[1] += f32::from(values.magenta_green) / 100.0 * weight;
-        deltas[2] += f32::from(values.yellow_blue) / 100.0 * weight;
+    for (values, weight) in ranges {
+        deltas[0] += f32::from(values.cyan_red.clamp(-100, 100)) / 100.0 * weight;
+        deltas[1] += f32::from(values.magenta_green.clamp(-100, 100)) / 100.0 * weight;
+        deltas[2] += f32::from(values.yellow_blue.clamp(-100, 100)) / 100.0 * weight;
     }
     let mut out = color;
     for channel in 0..3 {
-        out[channel] = (color[channel] + deltas[channel] * 0.5).clamp(0.0, 1.0);
+        out[channel] = (color[channel] + deltas[channel] * 0.7).clamp(0.0, 1.0);
     }
     if settings.preserve_luminosity {
-        out = preserve_luminosity(color, out);
+        out = set_hsl_lightness(out, light);
     }
     out
+}
+
+fn hsl_lightness(color: [f32; 3]) -> f32 {
+    0.5 * (color[0].max(color[1]).max(color[2]) + color[0].min(color[1]).min(color[2]))
+}
+
+/// Preserve hue and saturation while assigning an HSL lightness. Unlike
+/// adding an equal RGB offset, this remains in gamut and keeps both extrema.
+fn set_hsl_lightness(color: [f32; 3], lightness: f32) -> [f32; 3] {
+    let max = color[0].max(color[1]).max(color[2]);
+    let min = color[0].min(color[1]).min(color[2]);
+    let chroma = max - min;
+    let light = 0.5 * (max + min);
+    let target = lightness.clamp(0.0, 1.0);
+    if chroma <= f32::EPSILON {
+        return [target; 3];
+    }
+    let saturation = chroma / (2.0 * light.min(1.0 - light)).max(f32::EPSILON);
+    let target_chroma = saturation.clamp(0.0, 1.0) * 2.0 * target.min(1.0 - target);
+    let target_min = target - target_chroma * 0.5;
+    color.map(|v| (target_min + (v - min) / chroma * target_chroma).clamp(0.0, 1.0))
 }
 
 fn descriptor_number(descriptor: &Descriptor, key: &str) -> Option<f64> {
@@ -693,9 +811,9 @@ fn descriptor_descriptor(value: &DescriptorValue) -> Option<&Descriptor> {
 /// A descriptor colour (`Rd  `/`Grn `/`Bl  ` doubles) as 0..1 RGB.
 fn descriptor_rgb(value: &DescriptorValue) -> Option<[f32; 3]> {
     let descriptor = descriptor_descriptor(value)?;
-    let channel =
-        |key: &str| descriptor_number(descriptor, key).map(|value| (value / 255.0) as f32);
-    Some([channel("Rd  ")?, channel("Grn ")?, channel("Bl  ")?])
+    Color::from_descriptor(descriptor)
+        .as_ref()
+        .map(ramp::color_rgb)
 }
 
 fn black_and_white(color: [f32; 3], descriptor: &Descriptor) -> [f32; 3] {
@@ -779,26 +897,20 @@ fn black_and_white(color: [f32; 3], descriptor: &Descriptor) -> [f32; 3] {
 fn photo_filter(color: [f32; 3], settings: &PhotoFilter) -> [f32; 3] {
     let filter = match &settings.color {
         PhotoFilterColor::Xyz(components) => {
-            let scale = |value: i32| ((value as f32) / 255.0).clamp(0.0, 1.0);
-            [
-                scale(components[0]),
-                scale(components[1]),
-                scale(components[2]),
-            ]
+            let xyz = components.map(|value| f64::from(value) / 32768.0);
+            let lab = xyz_to_lab(xyz);
+            ramp::color_rgb(&Color::Lab {
+                lightness: lab[0],
+                a: lab[1],
+                b: lab[2],
+            })
         }
-        PhotoFilterColor::Color(raw) => {
-            let scale = |value: u16| (f32::from(value) / 255.0).clamp(0.0, 1.0);
-            [
-                scale(raw.components[0]),
-                scale(raw.components[1]),
-                scale(raw.components[2]),
-            ]
-        }
+        PhotoFilterColor::Color(raw) => ramp::color_rgb(&raw_color(raw)),
     };
     let density = (settings.density as f32 / 100.0).clamp(0.0, 1.0);
     let mut out = [0.0; 3];
     for channel in 0..3 {
-        out[channel] = color[channel] * (1.0 - density) + filter[channel] * density;
+        out[channel] = color[channel] * (1.0 - density + filter[channel] * density);
     }
     if settings.preserve_luminosity {
         out = preserve_luminosity(color, out);
@@ -806,23 +918,89 @@ fn photo_filter(color: [f32; 3], settings: &PhotoFilter) -> [f32; 3] {
     out
 }
 
+/// Photoshop stores version-3 Photo Filter XYZ values in Q1.15 form. The
+/// conversion uses the profile connection-space D50 reference white.
+fn xyz_to_lab([x, y, z]: [f64; 3]) -> [f64; 3] {
+    let f = |value: f64| {
+        if value > 0.008856 {
+            value.cbrt()
+        } else {
+            7.787 * value + 16.0 / 116.0
+        }
+    };
+    let (fx, fy, fz) = (f(x / 0.9642), f(y), f(z / 0.8249));
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+/// The binary 10-byte colour structure uses full-range RGB/HSB/CMYK and
+/// hundredths for Lab/gray; descriptor colours use different units.
+fn raw_color(raw: &psd_core::RawColor) -> Color {
+    let c = raw.components.map(f64::from);
+    match raw.color_space {
+        0 => Color::Rgb {
+            red: c[0] / 257.0,
+            green: c[1] / 257.0,
+            blue: c[2] / 257.0,
+        },
+        1 => Color::Hsb {
+            hue: c[0] * 360.0 / 65535.0,
+            saturation: c[1] * 100.0 / 65535.0,
+            brightness: c[2] * 100.0 / 65535.0,
+        },
+        2 => Color::Cmyk {
+            cyan: c[0] * 100.0 / 65535.0,
+            magenta: c[1] * 100.0 / 65535.0,
+            yellow: c[2] * 100.0 / 65535.0,
+            black: c[3] * 100.0 / 65535.0,
+        },
+        7 => Color::Lab {
+            lightness: c[0] / 100.0,
+            a: f64::from(raw.components[1] as i16) / 100.0,
+            b: f64::from(raw.components[2] as i16) / 100.0,
+        },
+        8 => Color::Gray { gray: c[0] / 100.0 },
+        _ => Color::Rgb {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+        },
+    }
+}
+
 fn vibrance(color: [f32; 3], descriptor: &Descriptor) -> [f32; 3] {
-    let amount = (descriptor_number(descriptor, "vibrance").unwrap_or(0.0) / 100.0) as f32;
-    let saturation = (descriptor_number(descriptor, "saturation").unwrap_or(0.0) / 100.0) as f32;
+    let amount =
+        (descriptor_number(descriptor, "vibrance").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0) as f32;
+    let saturation = (descriptor_number(descriptor, "Strt")
+        .or_else(|| descriptor_number(descriptor, "saturation"))
+        .unwrap_or(0.0)
+        / 100.0)
+        .clamp(-1.0, 1.0) as f32;
     if amount == 0.0 && saturation == 0.0 {
         return color;
     }
     let max = color[0].max(color[1]).max(color[2]);
     let min = color[0].min(color[1]).min(color[2]);
-    let current = max - min;
-    // Vibrance boosts the least saturated pixels most.
-    let boost = amount * (1.0 - current) + saturation;
-    let gray = luminance(color);
-    let mut out = [0.0; 3];
-    for channel in 0..3 {
-        out[channel] = (gray + (color[channel] - gray) * (1.0 + boost)).clamp(0.0, 1.0);
+    let chroma = max - min;
+    if chroma <= f32::EPSILON {
+        return color;
     }
-    out
+    let light = 0.5 * (max + min);
+    let maximum_chroma = 2.0 * light.min(1.0 - light);
+    let current = (chroma / maximum_chroma.max(f32::EPSILON)).clamp(0.0, 1.0);
+    let rgb = color.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as i32);
+    let (hi, lo) = (*rgb.iter().max().unwrap(), *rgb.iter().min().unwrap());
+    let hue = if hi > lo {
+        wheel_position(rgb, hi, lo) / 4.25
+    } else {
+        0.0
+    };
+    // Vibrance protects the orange/red region and tapers as saturation grows;
+    // the independent Saturation slider affects every hue equally.
+    let protection = 1.0 - 0.5 * hue_range_weight(hue, [0, 15, 45, 60]);
+    let factor = (1.0 + amount * (1.0 - current) * protection).max(0.0) * (1.0 + saturation);
+    let changed = (chroma * factor).clamp(0.0, maximum_chroma.max(chroma));
+    let floor = light - 0.5 * changed;
+    color.map(|v| (floor + (v - min) / chroma * changed).clamp(0.0, 1.0))
 }
 
 fn gradient_map(color: [f32; 3], settings: &GradientMap) -> [f32; 3] {
@@ -830,11 +1008,7 @@ fn gradient_map(color: [f32; 3], settings: &GradientMap) -> [f32; 3] {
         .color_stops
         .iter()
         .map(|stop| psd_core::ColorStop {
-            source: StopSource::User(Color::Rgb {
-                red: f64::from(stop.color.components[0].min(255)),
-                green: f64::from(stop.color.components[1].min(255)),
-                blue: f64::from(stop.color.components[2].min(255)),
-            }),
+            source: StopSource::User(raw_color(&stop.color)),
             location: stop.location.min(4096) as i32,
             midpoint: stop.midpoint.min(100) as i32,
         })
@@ -907,7 +1081,9 @@ pub(super) fn paint_content<T: BitDepth>(
         AdjustmentKind::SolidColor => {
             let color = descriptor
                 .get("Clr ")
-                .and_then(descriptor_rgb)
+                .and_then(DescriptorValue::as_descriptor)
+                .and_then(Color::from_descriptor)
+                .map(|color| compositor.colors.color(&color))
                 .unwrap_or([0.0, 0.0, 0.0]);
             for index in 0..width * height {
                 content.color[0][index] = color[0];
@@ -921,6 +1097,7 @@ pub(super) fn paint_content<T: BitDepth>(
                 .get("Grad")
                 .and_then(descriptor_descriptor)
                 .and_then(psd_core::Gradient::from_descriptor);
+            let gradient = gradient.map(|gradient| compositor.colors.gradient(&gradient));
             let enumerated = |key: &str| {
                 descriptor
                     .get(key)
@@ -1050,5 +1227,202 @@ mod tests {
     fn a_gray_descriptor_colour_is_a_percentage_of_black() {
         let color = super::super::ramp::color_rgb(&psd_core::Color::Gray { gray: 25.0 });
         assert!((color[0] - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn preserve_luminosity_keeps_hsl_lightness_across_tonal_ranges() {
+        let zero = ColorBalanceValues {
+            cyan_red: 0,
+            magenta_green: 0,
+            yellow_blue: 0,
+        };
+        let settings = psd_core::adjustments::ColorBalance {
+            shadows: ColorBalanceValues {
+                cyan_red: 100,
+                ..zero
+            },
+            midtones: ColorBalanceValues {
+                magenta_green: 100,
+                ..zero
+            },
+            highlights: ColorBalanceValues {
+                yellow_blue: 100,
+                ..zero
+            },
+            preserve_luminosity: true,
+            trailing_bytes: Vec::new(),
+        };
+        for source in [[0.08; 3], [0.5, 0.3, 0.2], [0.92; 3]] {
+            let result = color_balance(source, &settings);
+            assert!((hsl_lightness(source) - hsl_lightness(result)).abs() < 1e-6);
+        }
+        assert!(color_balance([0.08; 3], &settings)[0] > 0.08);
+        assert!(color_balance([0.92; 3], &settings)[2] > 0.92);
+    }
+
+    #[test]
+    fn vibrance_reduces_saturation_growth_for_skin_hues_and_saturated_pixels() {
+        let mut descriptor = Descriptor::default();
+        descriptor.insert("vibrance", DescriptorValue::Integer(100));
+        let low_saturation = [0.5, 0.45, 0.45];
+        let high_saturation = [0.5, 0.05, 0.05];
+        let low_gain =
+            max_chroma(vibrance(low_saturation, &descriptor)) / max_chroma(low_saturation);
+        let high_gain =
+            max_chroma(vibrance(high_saturation, &descriptor)) / max_chroma(high_saturation);
+        assert!(low_gain > high_gain);
+
+        let orange = [0.8, 0.45, 0.3];
+        let blue = [0.3, 0.55, 0.8];
+        let orange_gain = max_chroma(vibrance(orange, &descriptor)) / max_chroma(orange);
+        let blue_gain = max_chroma(vibrance(blue, &descriptor)) / max_chroma(blue);
+        assert!(orange_gain < blue_gain);
+    }
+
+    fn max_chroma(color: [f32; 3]) -> f32 {
+        color[0].max(color[1]).max(color[2]) - color[0].min(color[1]).min(color[2])
+    }
+
+    #[test]
+    fn photo_filter_xyz_white_is_neutral_lab() {
+        let lab = xyz_to_lab([0.9642, 1.0, 0.8249]);
+        assert!((lab[0] - 100.0).abs() < 0.1);
+        assert!(lab[1].abs() < 0.2);
+        assert!(lab[2].abs() < 0.2);
+    }
+
+    fn hue_settings() -> HueSaturation {
+        let zero = HueSaturationValues {
+            hue: 0,
+            saturation: 0,
+            lightness: 0,
+        };
+        HueSaturation {
+            version: 2,
+            colorize: false,
+            colorization: zero,
+            master: zero,
+            ranges: [HueRange {
+                range: [0; 4],
+                values: zero,
+            }; 6],
+            trailing_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn hue_bands_wrap_and_allow_hard_edges() {
+        let red = [315, 345, 15, 45];
+        for hue in [345.0, 0.0, 15.0] {
+            assert_eq!(hue_range_weight(hue, red), 1.0);
+        }
+        assert_eq!(hue_range_weight(330.0, red), 0.5);
+        assert_eq!(hue_range_weight(30.0, red), 0.5);
+        assert_eq!(hue_range_weight(90.0, red), 0.0);
+        assert_eq!(hue_range_weight(0.0, [0, 0, 60, 60]), 1.0);
+        assert_eq!(hue_range_weight(60.0, [0, 0, 60, 60]), 1.0);
+        assert_eq!(hue_range_weight(61.0, [0, 0, 60, 60]), 0.0);
+        assert_eq!(hue_range_weight(0.0, [0; 4]), 0.0);
+    }
+
+    #[test]
+    fn bands_select_original_hue_and_preserve_neutral_pixels() {
+        let mut settings = hue_settings();
+        settings.master.hue = 120;
+        settings.ranges[0] = HueRange {
+            range: [315, 345, 15, 45],
+            values: HueSaturationValues {
+                hue: 60,
+                saturation: 0,
+                lightness: 0,
+            },
+        };
+        assert_eq!(hue_saturation([1.0, 0.0, 0.0], &settings), [0.0, 1.0, 1.0]);
+        assert_eq!(hue_saturation([0.0, 1.0, 0.0], &settings), [0.0, 0.0, 1.0]);
+        assert_eq!(
+            hue_saturation([128.0 / 255.0; 3], &settings),
+            [128.0 / 255.0; 3]
+        );
+    }
+
+    #[test]
+    fn band_lightness_collapses_chroma_and_overlaps_sum() {
+        let mut settings = hue_settings();
+        settings.ranges[0] = HueRange {
+            range: [315, 315, 45, 45],
+            values: HueSaturationValues {
+                hue: 0,
+                saturation: 0,
+                lightness: 100,
+            },
+        };
+        let rgb = [180.0 / 255.0, 100.0 / 255.0, 50.0 / 255.0];
+        assert_eq!(hue_saturation(rgb, &settings), [180.0 / 255.0; 3]);
+        settings.ranges[0].values.lightness = -100;
+        assert_eq!(hue_saturation(rgb, &settings), [50.0 / 255.0; 3]);
+        settings.ranges[0].values.lightness = 0;
+        settings.ranges[0].values.saturation = -50;
+        settings.ranges[1] = settings.ranges[0];
+        assert_eq!(
+            hue_saturation([1.0, 0.0, 0.0], &settings),
+            [127.0 / 255.0; 3]
+        );
+    }
+
+    fn selective_settings(absolute: bool) -> SelectiveColor {
+        use psd_core::adjustments::CmykCorrection;
+        let zero = CmykCorrection {
+            cyan: 0,
+            magenta: 0,
+            yellow: 0,
+            black: 0,
+        };
+        SelectiveColor {
+            version: 1,
+            absolute,
+            reserved: zero,
+            reds: zero,
+            yellows: zero,
+            greens: zero,
+            cyans: zero,
+            blues: zero,
+            magentas: zero,
+            whites: zero,
+            neutrals: zero,
+            blacks: zero,
+            trailing_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn selective_color_matches_absolute_and_relative_pixel_samples() {
+        let source = [180.0 / 255.0, 100.0 / 255.0, 50.0 / 255.0];
+        for (absolute, expected) in [(true, [148, 148, 42]), (false, [171, 129, 44])] {
+            let mut settings = selective_settings(absolute);
+            settings.reds.cyan = 40;
+            settings.reds.magenta = -60;
+            settings.reds.yellow = 10;
+            assert_eq!(
+                selective_color(source, &settings).map(|v| (v * 255.0).round() as u8),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn selective_color_uses_all_ranges_without_affecting_unselected_colors() {
+        let source = [0.7, 0.4, 0.2];
+        let mut settings = selective_settings(true);
+        settings.blues.cyan = 100;
+        assert_eq!(selective_color(source, &settings), source);
+        settings.neutrals.black = 20;
+        assert!(selective_color(source, &settings)[0] < source[0]);
+        settings = selective_settings(true);
+        settings.whites.black = 100;
+        assert_eq!(selective_color([1.0; 3], &settings), [0.0; 3]);
+        settings.absolute = false;
+        assert_eq!(selective_color([1.0; 3], &settings), [1.0; 3]);
+        settings.blacks.black = -100;
+        assert_eq!(selective_color([0.0; 3], &settings), [1.0; 3]);
     }
 }

@@ -82,9 +82,14 @@ pub(crate) fn has_effects(effects: &LayerEffects) -> bool {
             .inner_glow
             .as_ref()
             .is_some_and(|g| enabled(g.enabled))
+        || effects.bevel.as_ref().is_some_and(|b| enabled(b.enabled))
         || effects.satin.as_ref().is_some_and(|s| enabled(s.enabled))
         || effects.color_overlays.iter().any(|o| enabled(o.enabled))
         || effects.gradient_overlays.iter().any(|o| enabled(o.enabled))
+        || effects
+            .pattern_overlay
+            .as_ref()
+            .is_some_and(|o| enabled(o.enabled))
         || effects.strokes.iter().any(|s| enabled(s.enabled))
 }
 

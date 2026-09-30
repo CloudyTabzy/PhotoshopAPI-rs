@@ -403,6 +403,148 @@ fn clipped_groups_preserve_isolation_and_pass_through_blending() {
 }
 
 #[test]
+fn a_group_with_an_adjustment_provides_clip_coverage() {
+    let mut doc = document(3, 1);
+    white_background(&mut doc);
+    let group = doc.add_layer(Layer::new_group("adjusted clip base"));
+    doc.layer_mut(group).unwrap().set_clipping_mask(true);
+    doc.layer_mut(group).unwrap().blend_mode = BlendMode::PASSTHROUGH;
+    doc.add_layer_to_group(group, invert_layer()).unwrap();
+    let mut clipped = solid("clipped red", (0, 0, 1, 3), [255, 0, 0]);
+    clipped.set_clipping_mask(true);
+    doc.add_layer(clipped);
+
+    let image = flatten(&doc);
+    assert_eq!(image.pixel(0, 0), [255, 0, 0, 255]);
+    assert_eq!(image.pixel(2, 0), [255, 0, 0, 255]);
+}
+
+#[test]
+fn adjustments_inside_a_clipped_pass_through_group_only_reach_its_pixels() {
+    let mut doc = document(2, 1);
+    white_background(&mut doc);
+    let mut group = Layer::new_group("adjusted clip base");
+    group.blend_mode = BlendMode::PASSTHROUGH;
+    let group_id = doc.add_layer(group);
+    doc.add_layer_to_group(group_id, solid("red base", (0, 0, 1, 1), [255, 0, 0]))
+        .unwrap();
+    doc.add_layer_to_group(group_id, invert_layer()).unwrap();
+    let mut clipped = solid("half blue", (0, 0, 1, 2), [0, 0, 255]);
+    clipped.set_clipping_mask(true);
+    clipped
+        .image_mut()
+        .unwrap()
+        .set_channel(ChannelKey::ALPHA, vec![128; 2]);
+    doc.add_layer(clipped);
+
+    let image = flatten(&doc);
+    close(image.pixel(0, 0), [0, 127, 255, 255]);
+    assert_eq!(image.pixel(1, 0), [255; 4]);
+}
+
+#[test]
+fn a_clipping_base_paints_its_overlay_after_clipped_layers() {
+    let mut doc = document(1, 1);
+    white_background(&mut doc);
+    let mut base = solid("base", (0, 0, 1, 1), [255, 0, 0]);
+    base.set_layer_effects(&LayerEffects {
+        color_overlays: vec![overlay([0, 255, 0], 100.0, BlendMode::NORMAL)],
+        ..Default::default()
+    })
+    .unwrap();
+    doc.add_layer(base);
+    let mut clipped = solid("clipped", (0, 0, 1, 1), [0, 0, 255]);
+    clipped.set_clipping_mask(true);
+    doc.add_layer(clipped);
+
+    assert_eq!(flatten(&doc).pixel(0, 0), [0, 255, 0, 255]);
+}
+
+#[test]
+fn dissolve_uses_repeatable_stochastic_coverage() {
+    let mut doc = document(100, 100);
+    doc.add_layer(solid("black", (0, 0, 100, 100), [0, 0, 0]));
+    let mut layer = solid("dissolve", (0, 0, 100, 100), [255; 3]);
+    layer.blend_mode = BlendMode::DISSOLVE;
+    layer
+        .image_mut()
+        .unwrap()
+        .set_channel(ChannelKey::ALPHA, vec![128; 10_000]);
+    doc.add_layer(layer);
+
+    let image = flatten(&doc);
+    assert_eq!(image, flatten(&doc));
+    let white = image
+        .rgba
+        .chunks_exact(4)
+        .filter(|pixel| pixel[0] > 0)
+        .count();
+    assert!((4_500..=5_500).contains(&white), "{white} pixels selected");
+    assert!(image.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+}
+
+#[test]
+fn deep_group_knockout_uses_the_document_background() {
+    let mut doc = document(1, 1);
+    white_background(&mut doc);
+    doc.add_layer(solid("red", (0, 0, 1, 1), [255, 0, 0]));
+    let mut group = Layer::new_group("deep knockout");
+    group.blend_mode = BlendMode::NORMAL;
+    group.set_fill(128);
+    group.blocks.push(TaggedBlock::new(
+        TaggedBlockKey::new(*b"knko"),
+        vec![2, 0, 0, 0],
+    ));
+    let id = doc.add_layer(group);
+    doc.add_layer_to_group(id, solid("blue", (0, 0, 1, 1), [0, 0, 255]))
+        .unwrap();
+
+    close(flatten(&doc).pixel(0, 0), [127, 127, 255, 255]);
+}
+
+#[test]
+fn deep_knockout_without_a_background_layer_punches_to_transparency() {
+    let mut doc = document(1, 1);
+    doc.add_layer(solid("red", (0, 0, 1, 1), [255, 0, 0]));
+    let mut group = Layer::new_group("deep knockout");
+    group.blend_mode = BlendMode::NORMAL;
+    group.set_fill(128);
+    group.blocks.push(TaggedBlock::new(
+        TaggedBlockKey::new(*b"knko"),
+        vec![2, 0, 0, 0],
+    ));
+    let id = doc.add_layer(group);
+    doc.add_layer_to_group(id, solid("blue", (0, 0, 1, 1), [0, 0, 255]))
+        .unwrap();
+
+    close(flatten(&doc).pixel(0, 0), [0, 0, 255, 128]);
+}
+
+#[test]
+fn shallow_knockout_inside_a_pass_through_group_uses_its_entry_backdrop() {
+    let mut doc = document(1, 1);
+    white_background(&mut doc);
+    doc.add_layer(solid("red backdrop", (0, 0, 1, 1), [255, 0, 0]));
+    let mut outer = Layer::new_group("pass through");
+    outer.blend_mode = BlendMode::PASSTHROUGH;
+    let outer_id = doc.add_layer(outer);
+    doc.add_layer_to_group(outer_id, solid("green sibling", (0, 0, 1, 1), [0, 255, 0]))
+        .unwrap();
+    let mut knockout = Layer::new_group("shallow knockout");
+    knockout.blend_mode = BlendMode::NORMAL;
+    knockout.set_fill(128);
+    knockout.blocks.push(TaggedBlock::new(
+        TaggedBlockKey::new(*b"knko"),
+        vec![1, 0, 0, 0],
+    ));
+    let knockout_id = doc.add_layer_to_group(outer_id, knockout).unwrap();
+    doc.add_layer_to_group(knockout_id, solid("blue", (0, 0, 1, 1), [0, 0, 255]))
+        .unwrap();
+
+    close(flatten(&doc).pixel(0, 0), [127, 0, 128, 255]);
+}
+
+#[test]
 fn group_clipping_scales_coverage_masks_opacity_and_effects_once() {
     for mode in [BlendMode::NORMAL, BlendMode::PASSTHROUGH] {
         let mut doc = document(3, 1);

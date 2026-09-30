@@ -22,6 +22,7 @@ use crate::bitdepth::BitDepth;
 use crate::channels::{
     compress_channel, decompress_channel, ChannelKey, ChannelStore, RawChannelData,
 };
+use crate::composite::merged::MergedImageData;
 use crate::layer::upsert_block;
 use crate::layer::{
     AdjustmentLayer, GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Rect, ShapeLayer, TextLayer,
@@ -287,6 +288,10 @@ pub struct LayeredFile<T: BitDepth> {
     /// Remaining cumulative budget for channels materialized by a lazy read.
     /// Runtime state, excluded from document equality.
     remaining_bitmap_memory: Option<usize>,
+    /// The merged composite of a source document that has no layer records.
+    /// It is the only pixel source for such a document and is retained for
+    /// rendering plus lossless unedited writes.
+    pub(crate) stored_merged_image: Option<MergedImageData>,
     /// Slot arena: removed layers leave `None` so ids stay stable and are
     /// never reused (see [`LayerId`]).
     layers: Vec<Option<Layer<T>>>,
@@ -311,6 +316,7 @@ impl<T: BitDepth> PartialEq for LayeredFile<T> {
             && self.compression == other.compression
             && self.layers == other.layers
             && self.root_children == other.root_children
+            && self.stored_merged_image == other.stored_merged_image
     }
 }
 
@@ -351,6 +357,7 @@ impl<T: BitDepth> LayeredFile<T> {
             text_cache: None,
             linked_sources: std::collections::HashMap::new(),
             remaining_bitmap_memory: Some(DEFAULT_TOTAL_MEMORY_LIMIT),
+            stored_merged_image: None,
             layers: Vec::new(),
             root_children: Vec::new(),
         })
@@ -452,13 +459,30 @@ impl<T: BitDepth> LayeredFile<T> {
     ) -> Result<Self> {
         let mut reader = BeReader::new(bytes);
         let file = PhotoshopFile::read(&mut reader)?;
-        Self::from_photoshop_file(file, options, progress)
+        let stored_merged_image = if file.layer_and_mask_info.layer_info.layer_records.is_empty() {
+            let start = reader.position();
+            // LayerInfo cannot express a negative zero layer count. For a
+            // layerless image, the one extra merged channel is its available
+            // transparency plane.
+            let merged_transparency = file.layer_and_mask_info.layer_info.has_merged_alpha
+                || file.header.num_channels
+                    == color_channel_count(file.header.color_mode).saturating_add(1);
+            MergedImageData::read(
+                bytes.get(start..).unwrap_or_default(),
+                &file.header,
+                merged_transparency,
+            )?
+        } else {
+            None
+        };
+        Self::from_photoshop_file(file, options, progress, stored_merged_image)
     }
 
     fn from_photoshop_file(
         file: PhotoshopFile,
         options: ReadOptions,
         progress: &mut dyn FnMut(ProgressEvent<'_>),
+        stored_merged_image: Option<MergedImageData>,
     ) -> Result<Self> {
         let header = file.header;
         // A 1-bit (bitmap mode) document is read as an 8-bit one: its packed
@@ -489,6 +513,10 @@ impl<T: BitDepth> LayeredFile<T> {
         // beside it, and could disagree with it.
         let icc_profile = image_resources.take_icc_profile().unwrap_or_default();
         let mut layer_and_mask_info = file.layer_and_mask_info;
+        let has_merged_alpha = layer_and_mask_info.layer_info.has_merged_alpha
+            || stored_merged_image
+                .as_ref()
+                .is_some_and(|merged| merged.transparency);
 
         let mut document = Self {
             version: header.version,
@@ -505,12 +533,13 @@ impl<T: BitDepth> LayeredFile<T> {
             document_blocks: layer_and_mask_info
                 .additional_layer_info
                 .map(|blocks| blocks.into_owned()),
-            has_merged_alpha: layer_and_mask_info.layer_info.has_merged_alpha,
+            has_merged_alpha,
             compression: None,
             source_path: None,
             text_cache: None,
             linked_sources: std::collections::HashMap::new(),
             remaining_bitmap_memory: options.total_memory_limit,
+            stored_merged_image,
             layers: Vec::new(),
             root_children: Vec::new(),
         };
@@ -928,6 +957,78 @@ impl<T: BitDepth> LayeredFile<T> {
             self.remaining_bitmap_memory = remaining;
         }
         Ok(())
+    }
+
+    /// Turn a source document's layerless merged image into an editable
+    /// bottom image layer. This is needed before saving layer edits made over
+    /// a layerless document; otherwise no layer record exists to carry the
+    /// original pixels.
+    pub fn materialize_merged_image(&mut self) -> Result<Option<LayerId>> {
+        let Some(merged) = self.stored_merged_image.as_ref() else {
+            return Ok(None);
+        };
+        if !self.root_children.is_empty() {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "materialize the layerless image before adding layers",
+            });
+        }
+
+        let width = usize::try_from(merged.width).map_err(|_| PsdError::InvalidData {
+            offset: 0,
+            message: "merged image width is unaddressable",
+        })?;
+        let height = usize::try_from(merged.height).map_err(|_| PsdError::InvalidData {
+            offset: 0,
+            message: "merged image height is unaddressable",
+        })?;
+        let channel_count = usize::from(merged.channels);
+        let mut remaining = self.remaining_bitmap_memory;
+        for _ in 0..channel_count {
+            charge_decoded_bitmap(&mut remaining, width, height, T::SIZE)?;
+        }
+        let mut planes = merged.decode::<T>()?;
+        let rect = Rect::new(0, 0, self.height as i32, self.width as i32);
+        let mut layer = Layer::new_image("Background", rect);
+        let color_channels = usize::from(color_channel_count(self.color_mode));
+        if merged.transparency && planes.len() > color_channels {
+            if self.color_mode == ColorMode::Indexed {
+                return Err(PsdError::UnsupportedColorMode(ColorMode::Indexed.as_raw()));
+            }
+            let alpha: Vec<f32> = planes[color_channels]
+                .iter()
+                .map(|sample| sample.to_f32().clamp(0.0, 1.0))
+                .collect();
+            for (channel, samples) in planes.iter_mut().take(color_channels).enumerate() {
+                let matte =
+                    crate::composite::merged_matte_value(self.color_mode, channel, merged.depth);
+                for (sample, &alpha) in samples.iter_mut().zip(&alpha) {
+                    *sample = T::from_f32(crate::composite::unmatte_sample(
+                        sample.to_f32(),
+                        alpha,
+                        matte,
+                    ));
+                }
+            }
+        }
+        for (index, samples) in planes.into_iter().enumerate() {
+            let key = if merged.transparency && index == color_channels {
+                ChannelKey::ALPHA
+            } else {
+                ChannelKey::color(u8::try_from(index).map_err(|_| PsdError::InvalidData {
+                    offset: 0,
+                    message: "merged image has too many channels for a layer",
+                })?)
+            };
+            layer
+                .image_mut()
+                .expect("new_image creates an image layer")
+                .set_channel(key, samples);
+        }
+        let id = self.add_layer(layer);
+        self.remaining_bitmap_memory = remaining;
+        self.stored_merged_image = None;
+        Ok(Some(id))
     }
 
     /// Number of layers in the document (removed layers excluded).
@@ -1562,6 +1663,11 @@ impl<T: BitDepth> LayeredFile<T> {
         // Background form), so the document's channel count has to include the
         // plane those records will carry.
         let bottom_id = self.root_children.first().copied();
+        // An authored empty layerless document is transparent. With no layer
+        // record there is no negative-zero layer count to mark merged alpha,
+        // so carry an explicit zero alpha plane in the merged header instead.
+        let empty_layerless_placeholder =
+            self.root_children.is_empty() && self.stored_merged_image.is_none();
         let synthesizes_alpha = self.layers_with_ids().any(|(id, layer)| {
             matches!(layer.kind, LayerKind::Image(_) | LayerKind::Text(_))
                 && !layer
@@ -1571,7 +1677,8 @@ impl<T: BitDepth> LayeredFile<T> {
         });
         let num_channels = self.num_channels.max(
             color_channels
-                + u16::from(self.has_alpha() || self.has_merged_alpha || synthesizes_alpha),
+                + u16::from(self.has_alpha() || self.has_merged_alpha || synthesizes_alpha)
+                + u16::from(empty_layerless_placeholder),
         );
         // Photoshop reads an extra composite channel as a saved alpha channel
         // ("Alpha 1") unless the layer count is negative, which marks it as the
@@ -1579,15 +1686,50 @@ impl<T: BitDepth> LayeredFile<T> {
         // transparent, flag it so created documents do not gain a phantom
         // alpha channel; read files keep their own flag and saved channels.
         let has_merged_alpha = self.has_merged_alpha
+            || empty_layerless_placeholder
             || ((self.has_alpha() || synthesizes_alpha) && self.num_channels <= color_channels);
+        // A layerless 1-bit source can retain and write its original packed
+        // merged section. Once materialized as an 8-bit background layer, the
+        // normal document-depth path below writes the expanded samples.
+        let output_depth = self
+            .stored_merged_image
+            .as_ref()
+            .filter(|merged| self.root_children.is_empty() && merged.depth == CoreBitDepth::One)
+            .map_or_else(depth_enum::<T>, |_| CoreBitDepth::One);
         let header = FileHeader::new(
             self.version,
             num_channels,
             self.width,
             self.height,
-            depth_enum::<T>(),
+            output_depth,
             self.color_mode,
         )?;
+
+        if self.stored_merged_image.is_some() && !self.root_children.is_empty() {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "materialize a layerless image before saving its added layers",
+            });
+        }
+
+        let mut image_data = ImageData::new(num_channels);
+        if self.root_children.is_empty() {
+            if let Some(merged) = &self.stored_merged_image {
+                let matches_source = merged.version == header.version
+                    && merged.width == header.width
+                    && merged.height == header.height
+                    && merged.depth == header.depth
+                    && merged.color_mode == header.color_mode
+                    && merged.channels == header.num_channels;
+                if !matches_source {
+                    return Err(PsdError::InvalidData {
+                        offset: 0,
+                        message: "the retained layerless image no longer matches the document header; materialize it before saving",
+                    });
+                }
+                image_data.set_raw_section(Some(merged.section().to_vec()));
+            }
+        }
 
         let mut records = Vec::new();
         let mut channel_data = Vec::new();
@@ -1640,7 +1782,7 @@ impl<T: BitDepth> LayeredFile<T> {
                 global_layer_mask_info: self.global_layer_mask_info.clone(),
                 additional_layer_info: self.document_blocks_for_output(),
             },
-            image_data: ImageData::new(num_channels),
+            image_data,
         })
     }
 

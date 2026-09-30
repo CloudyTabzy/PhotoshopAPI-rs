@@ -292,7 +292,7 @@ fn decode_one_bit_channel<T: BitDepth>(
     };
 
     let black = T::from_f32(0.0);
-    let white = T::from_f32(1.0);
+    let white = T::widen_eight(u8::MAX);
     let mut samples = Vec::with_capacity(width * height);
     for row in packed.chunks_exact(row_bytes) {
         for x in 0..width {
@@ -301,6 +301,23 @@ fn decode_one_bit_channel<T: BitDepth>(
         }
     }
     Ok(samples)
+}
+
+/// Decode a one-channel segment from the merged-image section. The merged RLE
+/// table has already been split into this channel's table and row stream.
+pub(crate) fn decompress_merged_channel<T: BitDepth>(
+    compression: Compression,
+    payload: &[u8],
+    width: usize,
+    height: usize,
+    version: Version,
+    source_depth: u16,
+) -> Result<Vec<T>> {
+    if source_depth == 1 {
+        decode_one_bit_channel(compression, payload, width, height, version)
+    } else {
+        decompress_channel(compression, payload, width, height, version, source_depth)
+    }
 }
 
 /// Compress typed samples into `(codec, payload)` for one channel.

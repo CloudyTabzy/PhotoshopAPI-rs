@@ -12,6 +12,36 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-01
+
+### Added
+
+- Hue/Saturation now uses all six range bands, and Selective Color applies its absolute and
+  relative channel corrections. `LayeredFile::materialize_merged_image` promotes a retained
+  layerless composite to an editable background layer.
+- CMYK and Lab document colors use their embedded ICC profiles through `moxcms`, with bounded
+  batches and defined fallbacks for missing or mismatched profiles.
+- Layer knockout modes and deterministic Dissolve coverage are included in compositing.
+
+### Changed
+
+- Untouched layerless documents preserve and render their merged `ImageData`. Transparent merged
+  colors are un-matted before the compositor exposes straight RGBA; Indexed layerless images use
+  their document palette. Empty authored documents retain transparent output.
+- A clipping base's style paints above its clipped members. Pass-through groups used as clipping
+  bases confine child adjustments to pixels already contributed inside the group.
+- Color Balance, Vibrance and Photo Filter use revised Photoshop-oriented approximations. The
+  adjustment-chain reference mean error fell from roughly 13 to 9.8 levels.
+- `psd-core::ImageData` can own a retained merged section and no longer implements `Copy`.
+
+### Fixed
+
+- One-bit white samples expand to full-scale 8-bit values. One-bit and layerless merged images
+  can be rendered, preserved, and materialized within the compositor's byte limits.
+- Disabled effect blocks no longer suppress group fill opacity. Layerless merged-image sections
+  that exceed the retention budget return a typed memory-limit error rather than silently losing
+  their image on save.
+
 ## [0.11.5] - 2026-09-30
 
 ### Fixed

@@ -17,9 +17,9 @@
 //! - [`text`]: TySh-backed text access/editing and EngineData metadata (`LayerTypes/TextLayer/`)
 //!
 //! Reading is mmap-backed via `memmap2`; writing serializes sections through
-//! `psd-core` writers and channel payloads through `psd-codecs`. The merged
-//! composite `ImageData` is never rendered: saves write a zeroed RLE section
-//! (upstream parity, 20–50% smaller files).
+//! `psd-core` writers and channel payloads through `psd-codecs`. Layer stacks
+//! render from their layers; layerless documents render their retained merged
+//! `ImageData` and preserve that section on an untouched save.
 
 mod bitdepth;
 pub mod channels;
