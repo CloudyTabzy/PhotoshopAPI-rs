@@ -1069,7 +1069,7 @@ fn stroke_band(
     position: StrokePosition,
     under_paint: bool,
     fold_inside: bool,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let size = size.max(0.0) as f32;
     let (band_out, band_in) = match position {
         StrokePosition::Outside => (size, 0.0),
@@ -1139,6 +1139,7 @@ fn stroke_band(
         let mut coverage = vec![0.0f32; w * h];
         let mut burst = vec![0.0f32; w * h];
         let mut inner = vec![0.0f32; w * h];
+        let mut behind = vec![0.0f32; w * h];
         let outer_reach = if band_out > 0.0 { band_out + 1.0 } else { 0.0 };
         let inner_reach = if band_in > 0.0 { band_in + 1.0 } else { 0.0 };
         let span = (outer_reach + inner_reach).max(1.0);
@@ -1170,6 +1171,12 @@ fn stroke_band(
                 // layer's alpha; only the outside part paints.
                 coverage[index] = ((1.0 - alpha) * outside_coverage).clamp(0.0, 1.0);
                 inner[index] = inside_coverage;
+                if band_out > 0.0 && band_in > 0.0 {
+                    // A Center stroke's outside half also fills the soft
+                    // region, behind the layer.
+                    behind[index] = outside_coverage;
+                    coverage[index] = 0.0;
+                }
             } else {
                 coverage[index] =
                     (alpha * inside_coverage + (1.0 - alpha) * outside_coverage).clamp(0.0, 1.0);
@@ -1192,7 +1199,7 @@ fn stroke_band(
             };
             burst[index] = (along / span).clamp(0.0, 1.0);
         }
-        (coverage, burst, inner)
+        (coverage, burst, inner, behind)
     });
     both
 }
@@ -1203,8 +1210,8 @@ fn with_padding_pair(
     width: usize,
     height: usize,
     pad: f64,
-    compute: impl FnOnce(&[f32], usize, usize) -> (Vec<f32>, Vec<f32>, Vec<f32>),
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    compute: impl FnOnce(&[f32], usize, usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>),
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let pad = pad.clamp(0.0, width.max(height) as f64 + 256.0).ceil() as usize + 2;
     let (padded_width, padded_height) = (width + 2 * pad, height + 2 * pad);
     let mut padded = vec![0.0f32; padded_width * padded_height];
@@ -1212,7 +1219,7 @@ fn with_padding_pair(
         let target = (y + pad) * padded_width + pad;
         padded[target..target + width].copy_from_slice(&matte[y * width..(y + 1) * width]);
     }
-    let (first, second, third) = compute(&padded, padded_width, padded_height);
+    let (first, second, third, fourth) = compute(&padded, padded_width, padded_height);
     let crop = |field: &[f32]| {
         let mut out = vec![0.0f32; width * height];
         for y in 0..height {
@@ -1221,7 +1228,7 @@ fn with_padding_pair(
         }
         out
     };
-    (crop(&first), crop(&second), crop(&third))
+    (crop(&first), crop(&second), crop(&third), crop(&fourth))
 }
 
 /// One stroke effect resolved to planes.
@@ -1300,7 +1307,7 @@ pub(crate) fn build_strokes(
             && stroke.blend_mode.unwrap_or(BlendMode::NORMAL) == BlendMode::NORMAL
             && !stroke.overprint.unwrap_or(false);
         let fold = position != StrokePosition::Outside && !stroke.overprint.unwrap_or(false);
-        let (band, burst, inner) =
+        let (band, burst, inner, behind) =
             stroke_band(coverage, width, height, size, position, under, fold);
         let mut fold_weight = vec![0.0f32; width * height];
         let mut plane = Content::new(content.rect);
@@ -1398,6 +1405,31 @@ pub(crate) fn build_strokes(
                     fold_weight[index] = inner[index];
                 }
             }
+        }
+        // A Center stroke over a soft region also paints behind the layer.
+        if behind.iter().any(|value| *value > 0.0) {
+            let mut behind_plane = Content::new(content.rect);
+            for index in 0..width * height {
+                if behind[index] <= 0.0 || inner[index] <= 0.0 {
+                    continue;
+                }
+                // The paint's own alpha (a gradient's transparency) is the
+                // ratio the fold weight kept.
+                let paint_alpha = (fold_weight[index] / inner[index]).clamp(0.0, 1.0);
+                for channel in 0..3 {
+                    behind_plane.color[channel][index] = plane.color[channel][index];
+                }
+                behind_plane.alpha[index] = behind[index] * paint_alpha;
+            }
+            planes.push(StrokePlane {
+                band: behind,
+                fold: vec![0.0; width * height],
+                content: behind_plane,
+                opacity: opacity_scale(stroke.opacity),
+                blend_mode: BlendMode::NORMAL,
+                overprint: false,
+                under: true,
+            });
         }
         planes.push(StrokePlane {
             band,

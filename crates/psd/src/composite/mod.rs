@@ -45,6 +45,7 @@ mod hue_tables;
 mod lut;
 mod masks;
 pub(crate) mod merged;
+mod noise;
 mod paths;
 mod ramp;
 mod shapes;
@@ -1572,7 +1573,7 @@ impl<T: BitDepth> Compositor<'_, T> {
                     continue;
                 }
                 if blend_mode == BlendMode::DISSOLVE {
-                    if alpha < dissolve_sample(layer, x, y) {
+                    if alpha < dissolve_sample(x, y) {
                         continue;
                     }
                     let out = std::array::from_fn(|channel| {
@@ -2308,26 +2309,16 @@ impl<T: BitDepth> Compositor<'_, T> {
     }
 }
 
-/// A stable per-document stochastic mask for Dissolve. Fixing the sequence to
-/// layer identity and document coordinates makes repeated compositor calls
-/// agree while retaining the random coverage Photoshop's mode describes.
+/// The noise threshold Dissolve compares a pixel's coverage against: the
+/// pixel's byte from the fixed noise table, as a fraction. A pixel survives
+/// when its coverage reaches that fraction, so it survives with probability
+/// about its coverage, and the same pixel always draws the same noise.
 ///
-/// Approximation by construction: the coverage is statistically right but
-/// cannot match Photoshop's pattern pixel for pixel.
-fn dissolve_sample<T: BitDepth>(layer: &Layer<T>, x: i32, y: i32) -> f32 {
-    let mut seed = u64::from(layer.layer_id().unwrap_or(0));
-    if seed == 0 {
-        for byte in layer.name.as_bytes() {
-            seed = seed.wrapping_mul(0x100_0000_01b3) ^ u64::from(*byte);
-        }
-    }
-    let mut value = seed
-        ^ (x as u32 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        ^ (y as u32 as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^= value >> 31;
-    (value >> 40) as f32 / 16_777_216.0
+/// Approximation: this is the full-coverage kernel only. Photoshop's separate
+/// path for partial fill (a different hash and a weighted blend) is not
+/// reproduced, and the row/column origin of the hash is the document's.
+fn dissolve_sample(x: i32, y: i32) -> f32 {
+    f32::from(noise::at(x, y)) / 255.0
 }
 
 /// Clamp a rect to the canvas; an empty intersection stays empty.
