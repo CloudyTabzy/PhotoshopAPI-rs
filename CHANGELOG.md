@@ -12,6 +12,19 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.14] - 2026-10-02
+
+### Fixed
+
+- A stroke effect on a soft layer (a brush dab with no opaque plateau) now recolours the whole soft
+  region, keeping the layer's alpha for Inside strokes and painting opaque for Center strokes,
+  where the stroke band used to leave the layer's own colour in the middle. Pixels with alpha below
+  one and a half 8-bit steps no longer count as part of the shape the stroke follows.
+- A centred vector stroke in a document last saved by Photoshop CS6 sits half a pixel right and down
+  of its path, as that version draws it: a 3 px stroke on a path at integer coordinates covers whole
+  pixel rows, and a dash pattern starts at the first knot. Documents from later versions draw the
+  stroke on the path, as before.
+
 ## [0.12.13] - 2026-10-02
 
 ### Fixed

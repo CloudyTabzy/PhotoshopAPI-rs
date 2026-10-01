@@ -1075,6 +1075,10 @@ pub(crate) fn fold_strength_into_color(content: &mut Content, mode: BlendMode) {
     }
 }
 
+/// The alpha below which a pixel is too faint to count as part of the shape
+/// a stroke follows (one 8-bit step of alpha is rounding noise).
+const FAINT_FLOOR: f32 = 1.5 / 255.0;
+
 /// The band of a stroke effect over a matte: its coverage, and the Shape Burst
 /// position (0 at the band's outer limit, 1 at its inner limit).
 ///
@@ -1132,7 +1136,7 @@ fn stroke_band(
             // every solid one joins the shape.
             let to_solid = distance_transform(&contour, w, h);
             for (index, value) in contour.iter_mut().enumerate() {
-                if *value == 0.0 && matte[index] > 0.0 && to_solid[index] > 2.0 {
+                if *value == 0.0 && matte[index] > FAINT_FLOOR && to_solid[index] > 2.0 {
                     *value = 1.0;
                 }
             }
@@ -1199,7 +1203,7 @@ fn stroke_band(
                 // replaces the layer's colour where it lies, keeping the
                 // layer's alpha; only the outside part paints.
                 coverage[index] = ((1.0 - alpha) * outside_coverage).clamp(0.0, 1.0);
-                inner[index] = inside_coverage;
+                inner[index] = 1.0;
                 if band_out > 0.0 && band_in > 0.0 {
                     // A Center stroke's outside half also fills the soft
                     // region, behind the layer.

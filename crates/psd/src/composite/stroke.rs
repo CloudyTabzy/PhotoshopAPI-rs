@@ -44,6 +44,9 @@ pub(crate) struct StrokeStyle {
     /// On/off lengths; empty for a solid stroke.
     pub dashes: Vec<f64>,
     pub dash_offset: f64,
+    /// How far a centred stroke sits right and down of its path, in pixels
+    /// (see `CS6_CENTER_OFFSET`); zero for documents from a later writer.
+    pub center_offset: f64,
 }
 
 type Point = (f64, f64);
@@ -335,8 +338,19 @@ pub(crate) fn stroke_coverage(
     let mut sided: Vec<Polygon> = Vec::new();
     for subpath in &subpaths {
         let closed = subpath.record.closed;
-        let polyline = flatten_subpath(subpath, document.0, document.1);
+        let mut polyline = flatten_subpath(subpath, document.0, document.1);
         let side = closed && style.alignment != Alignment::Center;
+        if !side {
+            // A centred stroke lands half a pixel right and down of its
+            // path, the way the references draw it (a 3 px stroke on a path
+            // at integer coordinates covers whole pixel rows, with the dash
+            // pattern starting at the first knot). Inside and Outside
+            // strokes follow the path exactly.
+            for point in &mut polyline {
+                point.0 += style.center_offset;
+                point.1 += style.center_offset;
+            }
+        }
         // Inside and Outside draw a stroke twice as wide centred on the path
         // and keep the side they want.
         let half = if side { style.width } else { style.width / 2.0 };
@@ -368,7 +382,7 @@ pub(crate) fn stroke_coverage(
     }
     if subpaths.len() > 1 {
         let reach = if style.alignment == Alignment::Center {
-            style.width / 2.0
+            style.width / 2.0 + style.center_offset
         } else {
             style.width
         };
@@ -432,6 +446,7 @@ mod tests {
             alignment: Alignment::Center,
             dashes: Vec::new(),
             dash_offset: 0.0,
+            center_offset: 0.0,
         }
     }
 
@@ -439,6 +454,59 @@ mod tests {
         let mut pieces = Vec::new();
         stroke_polyline(&mut pieces, points, closed, style.width / 2.0, style);
         fill(&pieces, Rect::new(0, 0, 12, 12), FillRule::NonZero)
+    }
+
+    /// A closed rectangle path with corners at the given pixel positions of a
+    /// 64 × 64 document.
+    fn rectangle_path(left: f64, top: f64, right: f64, bottom: f64) -> VectorPath {
+        use psd_core::vector::{BezierKnot, PathPoint, PathRecord, SubpathRecord};
+        let point = |x: f64, y: f64| PathPoint {
+            vertical: (y / 64.0 * f64::from(1 << 24)) as i32,
+            horizontal: (x / 64.0 * f64::from(1 << 24)) as i32,
+        };
+        let knot = |x: f64, y: f64| BezierKnot {
+            closed: true,
+            linked: false,
+            preceding: point(x, y),
+            anchor: point(x, y),
+            leaving: point(x, y),
+        };
+        let mut records = vec![PathRecord::Subpath(SubpathRecord {
+            closed: true,
+            knot_count: 4,
+            operation: 1,
+            flags: 0,
+            reserved: [0; 18],
+        })];
+        for (x, y) in [(left, top), (right, top), (right, bottom), (left, bottom)] {
+            records.push(PathRecord::Knot(knot(x, y)));
+        }
+        VectorPath {
+            records,
+            trailing_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_centred_stroke_sits_half_a_pixel_right_and_down_of_its_path() {
+        let path = rectangle_path(20.0, 10.0, 50.0, 40.0);
+        let rect = Rect::new(0, 0, 64, 64);
+        let mut style = style(3.0, Cap::Butt, Join::Miter);
+        style.miter_limit = 10.0;
+        style.center_offset = 0.5;
+        let none = vec![0.0f32; 64 * 64];
+        let plane = stroke_coverage(&path, (64, 64), rect, &style, &none);
+        let at = |x: usize, y: usize| plane[y * 64 + x];
+        // The top edge at y = 10 covers whole rows 9, 10 and 11, not the
+        // half rows 8.5–11.5 of an unshifted stroke.
+        assert_eq!(at(35, 8), 0.0);
+        assert!((at(35, 9) - 1.0).abs() < 1e-3);
+        assert!((at(35, 11) - 1.0).abs() < 1e-3);
+        assert_eq!(at(35, 12), 0.0);
+        // The left edge at x = 20 covers whole columns 19–21.
+        assert_eq!(at(18, 25), 0.0);
+        assert!((at(19, 25) - 1.0).abs() < 1e-3);
+        assert_eq!(at(22, 25), 0.0);
     }
 
     #[test]

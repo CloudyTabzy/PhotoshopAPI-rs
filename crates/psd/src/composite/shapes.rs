@@ -18,6 +18,9 @@ use super::{Compositor, Content, Rect};
 use crate::layer::Layer;
 use crate::BitDepth;
 
+/// The half pixel by which CS6 draws a centred stroke right and down of its path.
+const CS6_CENTER_OFFSET: f64 = 0.5;
+
 impl<T: BitDepth> Compositor<'_, T> {
     /// Whether the layer has an active vector path.
     pub(super) fn has_vector_path(&self, layer: &Layer<T>) -> bool {
@@ -26,6 +29,23 @@ impl<T: BitDepth> Compositor<'_, T> {
             .ok()
             .flatten()
             .is_some_and(|mask| !mask.disabled())
+    }
+
+    /// How far a centred vector stroke sits right and down of its path.
+    ///
+    /// Approximation: a document last saved by Photoshop CS6 draws its centred
+    /// strokes half a pixel right and down (a 3 px stroke on a path at integer
+    /// coordinates covers whole pixel rows, and a dash pattern starts at the
+    /// first knot); two such documents match to within a few levels with the
+    /// offset and miss by up to a whole pixel without it. Documents from later
+    /// versions draw the stroke on the path. The offset is only known for CS6;
+    /// other releases of that era are not told apart.
+    fn center_stroke_offset(&self) -> f64 {
+        if last_saved_by(&self.document.image_resources).is_some_and(|name| name.contains("CS6")) {
+            CS6_CENTER_OFFSET
+        } else {
+            0.0
+        }
     }
 
     /// The vector stroke of a shape layer, resolved to pixels.
@@ -87,6 +107,7 @@ impl<T: BitDepth> Compositor<'_, T> {
             },
             dashes,
             dash_offset: 0.0,
+            center_offset: self.center_stroke_offset(),
         };
         Some((stroke, style))
     }
@@ -297,5 +318,74 @@ impl<T: BitDepth> Compositor<'_, T> {
         out.shape = Some(out_silhouette);
         out.mask = fill.mask;
         out
+    }
+}
+
+/// The reader name of a document's version info resource (`1057`): the
+/// Photoshop release that saved the file last, e.g. "Adobe Photoshop CS6".
+fn last_saved_by(resources: &psd_core::ImageResources) -> Option<String> {
+    let data = resources.blocks().iter().find_map(|block| match block {
+        psd_core::ResourceBlock::Raw(raw) if raw.id == 1057 => Some(raw.data.as_slice()),
+        _ => None,
+    })?;
+    // Version (4 bytes), a has-real-merged-data flag, then two Unicode
+    // strings: the writer's name and the reader's.
+    let mut rest = data.get(5..)?;
+    let mut read_string = || -> Option<String> {
+        let count = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        let bytes = rest.get(4..4 + count * 2)?;
+        rest = &rest[4 + count * 2..];
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect();
+        Some(String::from_utf16_lossy(&units))
+    };
+    read_string()?;
+    read_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use psd_core::{ImageResources, PascalString, RawResourceBlock, ResourceBlock};
+
+    fn unicode(text: &str) -> Vec<u8> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut bytes = (units.len() as u32).to_be_bytes().to_vec();
+        for unit in units {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn the_reader_name_comes_from_the_version_info_resource() {
+        let mut data = vec![0, 0, 0, 1, 1];
+        data.extend(unicode("Adobe Photoshop"));
+        data.extend(unicode("Adobe Photoshop CS6"));
+        data.extend([0, 0, 0, 1]);
+        let mut resources = ImageResources::new();
+        assert_eq!(last_saved_by(&resources), None);
+        resources.push(ResourceBlock::Raw(RawResourceBlock {
+            id: 1057,
+            name: PascalString::new("", 2),
+            data,
+        }));
+        assert_eq!(
+            last_saved_by(&resources).as_deref(),
+            Some("Adobe Photoshop CS6")
+        );
+    }
+
+    #[test]
+    fn a_truncated_version_info_resource_has_no_reader_name() {
+        let mut resources = ImageResources::new();
+        resources.push(ResourceBlock::Raw(RawResourceBlock {
+            id: 1057,
+            name: PascalString::new("", 2),
+            data: vec![0, 0, 0, 1, 1, 0, 0, 0, 9, 0, 65],
+        }));
+        assert_eq!(last_saved_by(&resources), None);
     }
 }

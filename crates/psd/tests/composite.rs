@@ -395,6 +395,56 @@ fn an_outside_stroke_shows_through_the_translucent_part_of_a_layer() {
     );
 }
 
+/// A soft dab with no opaque plateau: a grey disc whose alpha falls linearly
+/// from the middle to nothing at its rim.
+fn soft_dab() -> Layer<u8> {
+    let size = 41usize;
+    let mut layer = Layer::new_image("dab", Rect::new(0, 0, size as i32, size as i32));
+    let alpha: Vec<u8> = (0..size * size)
+        .map(|index| {
+            let (x, y) = ((index % size) as f32 - 20.0, (index / size) as f32 - 20.0);
+            let fade = 1.0 - (x * x + y * y).sqrt() / 20.0;
+            (fade.max(0.0) * 250.0).round() as u8
+        })
+        .collect();
+    let pixels = layer.image_mut().unwrap();
+    for channel in 0..3 {
+        pixels.set_channel(ChannelKey::color(channel), vec![150; size * size]);
+    }
+    pixels.set_channel(ChannelKey::ALPHA, alpha);
+    layer
+}
+
+#[test]
+fn an_inside_stroke_recolours_all_of_a_soft_layer_keeping_its_alpha() {
+    let mut doc = document(41, 41);
+    white_background(&mut doc);
+    let id = doc.add_layer(soft_dab());
+    let mut effects = LayerEffects::default();
+    effects
+        .strokes
+        .push(green_stroke(psd::core::StrokePosition::Inside));
+    doc.layer_mut(id)
+        .unwrap()
+        .set_layer_effects(&effects)
+        .unwrap();
+    let image = flatten(&doc);
+    // Twelve pixels from the rim is far deeper than the 2 px stroke, yet the
+    // layer's grey is gone: the pixel is green at the layer's own alpha
+    // (about 40% there), over white.
+    let pixel = image.pixel(20, 20 - 12);
+    let alpha: f32 = 250.0 * (1.0 - 12.0 / 20.0) / 255.0;
+    close(
+        pixel,
+        [
+            (255.0 * (1.0 - alpha)).round() as u8,
+            255,
+            (255.0 * (1.0 - alpha)).round() as u8,
+            255,
+        ],
+    );
+}
+
 #[test]
 fn fill_scales_the_source_of_linear_dodge_while_opacity_eases_the_result() {
     let render = |fill: u8, opacity: u8| {
