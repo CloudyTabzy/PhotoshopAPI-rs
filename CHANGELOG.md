@@ -12,6 +12,15 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.7] - 2026-10-01
+
+### Added
+
+- The contour of a drop shadow, inner shadow, outer glow, inner glow or satin now reshapes the
+  effect's falloff: it maps the soft field's strength (after the blur and, for glows, the range
+  gain) to the strength painted. A linear contour changes nothing. A reference using shaped shadows
+  and glows improves from 1.46 to 0.57 mean error.
+
 ## [0.12.6] - 2026-10-01
 
 ### Fixed

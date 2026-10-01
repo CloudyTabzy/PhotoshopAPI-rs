@@ -21,8 +21,10 @@
 //! Every soft computation runs over the matte padded with transparent pixels,
 //! so the blur sees the empty world beyond the layer's edge.
 //!
-//! Documented gaps: noise and jitter, soft-effect contour shaping, and the
-//! "Precise" glow techniques.
+//! A shadow, glow or satin contour reshapes the soft field's falloff after the
+//! blur and range gain.
+//!
+//! Documented gaps: noise and jitter, and the "Precise" glow techniques.
 
 use psd_core::effect_enums::{GlowSource, StrokeFill, StrokePosition};
 use psd_core::{BlendMode, Gradient, LayerEffects, Shadow};
@@ -701,6 +703,7 @@ fn paint_interior_into(
             }
             field
         });
+        shape_by_contour(&mut field, satin.contour.as_ref(), satin.anti_aliased);
         if satin.invert.unwrap_or(false) {
             for value in &mut field {
                 *value = 1.0 - *value;
@@ -721,6 +724,7 @@ fn paint_interior_into(
             interior_mask(matte, w, h, size, choke)
         });
         range_gain(&mut field, glow.range.unwrap_or(100.0));
+        shape_by_contour(&mut field, glow.contour.as_ref(), glow.anti_aliased);
         if glow.source == Some(GlowSource::Center) {
             // Center source is the exact complement of the gained edge field.
             for value in &mut field {
@@ -740,7 +744,7 @@ fn paint_interior_into(
         let size = shadow.size.unwrap_or(0.0);
         let limit = (width.max(height) as f64 + size + 2.0) as i64;
         let (dx, dy) = (dx.clamp(-limit, limit), dy.clamp(-limit, limit));
-        let field = with_padding(coverage, width, height, size, |matte, w, h| {
+        let mut field = with_padding(coverage, width, height, size, |matte, w, h| {
             let mut shifted = vec![0.0f32; w * h];
             for y in 0..h {
                 for x in 0..w {
@@ -749,12 +753,30 @@ fn paint_interior_into(
             }
             interior_mask(&shifted, w, h, size, shadow.spread.unwrap_or(0.0))
         });
+        shape_by_contour(&mut field, shadow.contour.as_ref(), shadow.anti_aliased);
         let paint = EffectPaint::flat(
             shadow.color.as_ref().map(color_rgb).unwrap_or([0.0; 3]),
             opacity_scale(shadow.opacity),
             shadow.blend_mode.unwrap_or(BlendMode::MULTIPLY),
         );
         apply_interior(painter, coverage, &field, &paint);
+    }
+}
+
+/// Shape a soft field through the effect's contour: the contour maps the
+/// field's strength (0 outside the effect's reach, 1 at its core) to the
+/// strength actually painted. A linear contour changes nothing.
+fn shape_by_contour(
+    field: &mut [f32],
+    contour: Option<&psd_core::Contour>,
+    anti_aliased: Option<bool>,
+) {
+    let Some(lut) = contour.and_then(super::contour::ContourLut::new) else {
+        return;
+    };
+    let smooth = anti_aliased.unwrap_or(false);
+    for value in field.iter_mut() {
+        *value = lut.sample(value.clamp(0.0, 1.0), smooth);
     }
 }
 
@@ -866,6 +888,7 @@ pub(crate) fn build_outer(
             shadow.size.unwrap_or(0.0),
             shadow.spread.unwrap_or(0.0),
         );
+        shape_by_contour(&mut field, shadow.contour.as_ref(), shadow.anti_aliased);
         // "Layer Knocks Out Drop Shadow" (on by default): the layer's own
         // transparency shape removes its shadow.
         if shadow.layer_knocks_out.unwrap_or(true) {
@@ -885,6 +908,7 @@ pub(crate) fn build_outer(
             glow.spread.unwrap_or(0.0),
         );
         range_gain(&mut field, glow.range.unwrap_or(100.0));
+        shape_by_contour(&mut field, glow.contour.as_ref(), glow.anti_aliased);
         planes.push(plane_from_field(
             rect,
             &field,

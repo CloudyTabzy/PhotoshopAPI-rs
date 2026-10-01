@@ -396,6 +396,45 @@ fn an_outside_stroke_shows_through_the_translucent_part_of_a_layer() {
 }
 
 #[test]
+fn a_shadow_contour_reshapes_its_falloff() {
+    let render = |contour: Option<psd::core::Contour>| {
+        let mut doc = document(40, 40);
+        white_background(&mut doc);
+        let id = doc.add_layer(solid("box", (14, 14, 26, 26), [255, 255, 255]));
+        let mut effects = LayerEffects::default();
+        let mut shadow = Shadow::new(ShadowKind::Drop);
+        shadow.size = Some(8.0);
+        shadow.distance = Some(0.0);
+        shadow.opacity = Some(100.0);
+        shadow.contour = contour;
+        effects.drop_shadows.push(shadow);
+        doc.layer_mut(id)
+            .unwrap()
+            .set_layer_effects(&effects)
+            .unwrap();
+        flatten(&doc)
+    };
+    let point = |horizontal: f64, vertical: f64| psd::core::ContourPoint {
+        horizontal,
+        vertical,
+        smooth: None,
+    };
+    let inverted = psd::core::Contour {
+        name: "inverted".into(),
+        points: vec![point(0.0, 255.0), point(255.0, 0.0)],
+    };
+    // The linear shadow fades away from the edge. Inverting the falloff turns
+    // the faint far end dark and the near end light, so the two disagree most
+    // at the far end.
+    let linear = render(None);
+    let shaped = render(Some(inverted));
+    let far = (8, 20);
+    assert!(linear.pixel(far.0, far.1)[0] > 220);
+    assert!(shaped.pixel(far.0, far.1)[0] < 120);
+    assert!(shaped.pixel(12, 20)[0] < linear.pixel(12, 20)[0]);
+}
+
+#[test]
 fn a_blurred_shadow_is_centred_on_the_shifted_matte() {
     let mut doc = document(41, 41);
     white_background(&mut doc);
