@@ -1314,7 +1314,26 @@ impl<T: BitDepth> Compositor<'_, T> {
         };
         // A clipped layer fades with its base: opacity and fill scale the
         // whole clipping group.
-        let group_strength = self.opacity(layer, with_fill);
+        let mut group_strength = self.opacity(layer, with_fill);
+        // Fill opacity scales the source term of Linear Dodge and Linear Burn
+        // before their saturating add or subtract; only the layer opacity eases
+        // the result toward the backdrop.
+        if with_fill
+            && layer.fill() != 255
+            && matches!(mode, BlendMode::LINEAR_DODGE | BlendMode::LINEAR_BURN)
+        {
+            let fill = f32::from(layer.fill()) / 255.0;
+            for channel in 0..3 {
+                for value in &mut content.color[channel] {
+                    *value = if mode == BlendMode::LINEAR_DODGE {
+                        *value * fill
+                    } else {
+                        *value + (1.0 - *value) * (1.0 - fill)
+                    };
+                }
+            }
+            group_strength = self.opacity(layer, false);
+        }
         for value in &mut clip_plane.data {
             *value *= group_strength;
         }

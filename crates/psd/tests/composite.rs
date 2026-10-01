@@ -396,6 +396,24 @@ fn an_outside_stroke_shows_through_the_translucent_part_of_a_layer() {
 }
 
 #[test]
+fn fill_scales_the_source_of_linear_dodge_while_opacity_eases_the_result() {
+    let render = |fill: u8, opacity: u8| {
+        let mut doc = document(1, 1);
+        doc.add_layer(solid("backdrop", (0, 0, 1, 1), [200, 200, 200]));
+        let mut layer = solid("dodge", (0, 0, 1, 1), [100, 100, 100]);
+        layer.blend_mode = BlendMode::LINEAR_DODGE;
+        layer.set_fill(fill);
+        layer.opacity = opacity;
+        doc.add_layer(layer);
+        flatten(&doc).pixel(0, 0)
+    };
+    // Half fill adds half the source: 200 + 50, not halfway to the clipped sum.
+    close(render(128, 255), [250, 250, 250, 255]);
+    // Half opacity eases the full result (255) halfway from the backdrop.
+    close(render(255, 128), [227, 227, 227, 255]);
+}
+
+#[test]
 fn a_precise_glow_falls_off_linearly_and_stops_at_its_size() {
     let mut doc = document(40, 40);
     white_background(&mut doc);

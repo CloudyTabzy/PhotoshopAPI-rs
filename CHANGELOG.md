@@ -12,6 +12,17 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.10] - 2026-10-01
+
+### Fixed
+
+- Linear Dodge and Linear Burn scale their source by the strength before the saturating add or
+  subtract, instead of easing the blended result toward the backdrop. A bevel's highlight or
+  shadow in those modes, a shadow or glow in them, and a layer's fill opacity now add or subtract
+  the scaled source at full white or black; the layer's own opacity still eases the result. A
+  reference with a Linear Dodge highlight and Linear Burn shadow improves from 4.1 to 1.1 mean
+  error.
+
 ## [0.12.9] - 2026-10-01
 
 ### Changed

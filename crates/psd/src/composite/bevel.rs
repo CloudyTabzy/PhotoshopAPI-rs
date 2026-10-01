@@ -444,6 +444,8 @@ pub(crate) fn build(
             }
         }
     }
+    super::effects::fold_strength_into_color(&mut highlight, highlight_paint.2);
+    super::effects::fold_strength_into_color(&mut shadow, shadow_paint.2);
     vec![
         OuterPlane {
             content: highlight,

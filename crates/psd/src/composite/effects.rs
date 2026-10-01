@@ -991,40 +991,58 @@ fn shadow_paint(shadow: &Shadow) -> EffectPaint {
 /// Photoshop keeps a 50% black linear burn an absolute subtraction.
 fn plane_from_field(rect: Rect, field: &[f32], paint: &EffectPaint) -> OuterPlane {
     let mut content = Content::new(rect);
-    let folds = matches!(
-        paint.blend_mode,
-        BlendMode::LINEAR_BURN | BlendMode::COLOR_BURN | BlendMode::COLOR_DODGE
-    );
     for (index, value) in field.iter().enumerate() {
-        let (mut color, field_alpha) = paint.at(*value);
+        let (color, field_alpha) = paint.at(*value);
         let strength = field_alpha * paint.alpha;
         if strength <= 0.0 {
             continue;
         }
-        let mut alpha = strength;
-        if folds {
-            match paint.blend_mode {
-                BlendMode::COLOR_DODGE => {
-                    for channel in &mut color {
-                        *channel *= strength;
-                    }
-                }
-                _ => {
-                    for channel in &mut color {
-                        *channel += (1.0 - *channel) * (1.0 - strength);
-                    }
-                }
-            }
-            alpha = 1.0;
-        }
         content.color[0][index] = color[0];
         content.color[1][index] = color[1];
         content.color[2][index] = color[2];
-        content.alpha[index] = alpha;
+        content.alpha[index] = strength;
     }
+    fold_strength_into_color(&mut content, paint.blend_mode);
     OuterPlane {
         content,
         blend_mode: paint.blend_mode,
+    }
+}
+
+/// Whether a blend mode scales its source term by the effect's strength before
+/// a saturating add, subtract or divide, instead of easing the blended result
+/// toward the backdrop.
+fn folds_strength(mode: BlendMode) -> bool {
+    matches!(
+        mode,
+        BlendMode::LINEAR_BURN
+            | BlendMode::COLOR_BURN
+            | BlendMode::COLOR_DODGE
+            | BlendMode::LINEAR_DODGE
+    )
+}
+
+/// For the burn and dodge modes, move an effect plane's per-pixel strength
+/// (its alpha) into its colour and make the plane opaque where it paints: a
+/// 50 % black Linear Burn stays an absolute subtraction and a faint Linear
+/// Dodge keeps adding at full white. Other modes are left alone.
+pub(crate) fn fold_strength_into_color(content: &mut Content, mode: BlendMode) {
+    if !folds_strength(mode) {
+        return;
+    }
+    for index in 0..content.alpha.len() {
+        let strength = content.alpha[index];
+        if strength <= 0.0 {
+            continue;
+        }
+        for channel in 0..3 {
+            let value = content.color[channel][index];
+            content.color[channel][index] = match mode {
+                BlendMode::COLOR_DODGE | BlendMode::LINEAR_DODGE => value * strength,
+                _ => value + (1.0 - value) * (1.0 - strength),
+            };
+        }
+        content.alpha[index] = 1.0;
     }
 }
 
