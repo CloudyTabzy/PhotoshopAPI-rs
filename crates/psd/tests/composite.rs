@@ -166,6 +166,44 @@ fn a_clipped_layer_shows_only_where_its_base_does() {
     assert_eq!(image.pixel(3, 0)[3], 0);
 }
 
+/// A half-transparent red base with an opaque green layer clipped to it.
+fn soft_clip_document(blend_clipped_as_group: bool) -> LayeredFile<u8> {
+    let mut doc = document(1, 1);
+    white_background(&mut doc);
+    let mut base = solid("base", (0, 0, 1, 1), [255, 0, 0]);
+    base.image_mut()
+        .unwrap()
+        .set_channel(ChannelKey::ALPHA, vec![128]);
+    if !blend_clipped_as_group {
+        base.blocks.push(TaggedBlock::new(
+            TaggedBlockKey::new(*b"clbl"),
+            vec![0, 0, 0, 0],
+        ));
+    }
+    doc.add_layer(base);
+    let id = doc.add_layer(solid("clipped", (0, 0, 1, 1), [0, 255, 0]));
+    doc.layer_mut(id).unwrap().set_clipping_mask(true);
+    doc
+}
+
+#[test]
+fn a_clipping_group_keeps_the_base_alpha_at_a_soft_edge() {
+    // Blended as a group (the default), the clipped green replaces the base
+    // colour inside the base's half alpha, so only green mixes with the white.
+    close(
+        flatten(&soft_clip_document(true)).pixel(0, 0),
+        [127, 255, 127, 255],
+    );
+}
+
+#[test]
+fn clipped_layers_blend_individually_when_the_group_option_is_off() {
+    // Layer by layer, the clipped green lands over the base already blended
+    // with the white, so the base's red still shows through at the edge.
+    let pixel = flatten(&soft_clip_document(false)).pixel(0, 0);
+    assert!(pixel[0] > 50, "{pixel:?}");
+}
+
 #[test]
 fn blend_if_hides_a_layer_over_dark_backdrop_pixels() {
     let mut doc = document(2, 1);
@@ -579,7 +617,9 @@ fn group_clipping_scales_coverage_masks_opacity_and_effects_once() {
         doc.layer_mut(group).unwrap().clear_layer_effects();
         let image = flatten(&doc);
         close(image.pixel(0, 0), [128, 0, 127, 255]);
-        close(image.pixel(1, 0), [159, 95, 191, 255]);
+        // The clipped group lands atop the base at full strength inside the
+        // base's half alpha: half red over blue, then half of that over white.
+        close(image.pixel(1, 0), [191, 127, 191, 255]);
         doc.layer_mut(group)
             .unwrap()
             .set_mask(vec![0; 3], Rect::new(0, 0, 1, 3))

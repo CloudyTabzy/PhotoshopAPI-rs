@@ -12,6 +12,30 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-10-01
+
+### Changed
+
+- Color Balance renders as one transfer curve per channel instead of tonal-range weights: the
+  shadow sliders move a channel's black point, the highlight sliders its white point and the
+  midtone sliders bend it. With Preserve Luminosity the sliders act relative to the largest
+  shadow, smallest highlight and midpoint of the midtone sliders, so moving all three of a range
+  together changes nothing. Checked against two Photoshop-authored documents (stored merges within
+  0.6 levels) and a chained adjustment reference, which falls from 9.8 to 2.6 mean error.
+- Photo Filter multiplies in the D50 connection space (tristimulus values against the filter colour
+  relative to the white point) instead of in gamma-encoded RGB, then restores luma when Preserve
+  Luminosity is on.
+- Vibrance follows a hue/saturation/value model: positive amounts favour muted pixels, spare the
+  red-to-orange band and leave very dark pixels alone; negative amounts pull saturated pixels toward
+  gray. The Saturation slider scales channels about a fixed gray that leans on red and green.
+- A Black & White tint shifts the tint colour so its luma becomes the gray.
+- A clipping group whose base is a plain pixel or text layer without effects, Blend If or knockout
+  now blends as a unit when "Blend Clipped Layers as Group" is on (the default): members meet the
+  base colour as if it were opaque, the base's alpha decides where the group shows, and the result
+  merges with the base's blend mode. A soft base edge no longer picks up the clipped colour over the
+  backdrop. A Photoshop-authored clipping fixture (Multiply and Levels members over a translucent
+  base) now matches exactly. With the option off, members still blend one by one.
+
 ## [0.12.1] - 2026-10-01
 
 ### Fixed

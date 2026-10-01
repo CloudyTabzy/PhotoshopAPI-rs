@@ -614,6 +614,18 @@ impl<T: BitDepth> Compositor<'_, T> {
             return Ok(());
         }
         let mut adjustment_coverage = adjustment_coverage;
+        if let Some(rect) = self.isolated_clip_group_rect(layer, clipped, canvas) {
+            return self.composite_clip_group(
+                base,
+                layer,
+                clipped,
+                rect,
+                canvas,
+                shallow_backdrop,
+                deep_backdrop,
+                adjustment_coverage,
+            );
+        }
         let adjustment_limit = adjustment_coverage.as_deref();
         let is_clip_base = !clipped.is_empty();
         let defer_effects = !clipped.is_empty()
@@ -686,6 +698,138 @@ impl<T: BitDepth> Compositor<'_, T> {
         if defer_effects {
             self.composite_layer_effects(base, canvas, None)?;
         }
+        Ok(())
+    }
+
+    /// The canvas rect a clipping group renders in when it blends as a unit
+    /// ("Blend Clipped Layers as Group", on by default): a plain pixel or text
+    /// base without effects, Blend If, knockout, Dissolve or channel
+    /// restrictions. Anything else keeps the layer-by-layer path.
+    fn isolated_clip_group_rect(
+        &self,
+        layer: &Layer<T>,
+        clipped: &[usize],
+        canvas: &Canvas,
+    ) -> Option<Rect> {
+        if clipped.is_empty()
+            || !matches!(layer.kind, LayerKind::Image(_) | LayerKind::Text(_))
+            || layer.blend_mode == BlendMode::DISSOLVE
+            || knockout_setting(layer) != KnockoutSetting::None
+            || blend_if_active(&layer.blending_ranges)
+            || self.channel_restrictions(layer) != [false; 3]
+        {
+            return None;
+        }
+        let key = psd_core::TaggedBlockKey::new(*b"clbl");
+        let as_group = layer
+            .blocks
+            .get(key)
+            .and_then(|block| block.data.first().copied())
+            .is_none_or(|flag| flag != 0);
+        if !as_group {
+            return None;
+        }
+        if self.options.effects
+            && self
+                .typed_effects(layer)
+                .as_ref()
+                .is_some_and(effects::has_effects)
+        {
+            return None;
+        }
+        let canvas_rect = Rect::new(
+            canvas.origin.1,
+            canvas.origin.0,
+            canvas.origin.1 + canvas.height as i32,
+            canvas.origin.0 + canvas.width as i32,
+        );
+        let rect = clamp_to_canvas_rect(self.layer_rect(layer), canvas_rect);
+        (rect.width() > 0 && rect.height() > 0).then_some(rect)
+    }
+
+    /// Composite a clipping group as one unit: the base and its clipped layers
+    /// render over a transparent buffer, then the result meets the backdrop
+    /// with the base's blend mode. A clipped layer lands "atop" the group, so
+    /// the group keeps the base's alpha and a soft base edge never shows the
+    /// clipped colour over the backdrop.
+    #[allow(clippy::too_many_arguments)]
+    fn composite_clip_group(
+        &self,
+        base: usize,
+        layer: &Layer<T>,
+        clipped: &[usize],
+        rect: Rect,
+        canvas: &mut Canvas,
+        shallow_backdrop: Option<&Canvas>,
+        deep_backdrop: Option<&Canvas>,
+        mut adjustment_coverage: Option<&mut Plane>,
+    ) -> Result<()> {
+        let mut group = Canvas::new(rect.width() as u32, rect.height() as u32);
+        group.origin = (rect.left, rect.top);
+        let base_coverage = self.composite_layer(
+            base,
+            &mut group,
+            None,
+            shallow_backdrop,
+            deep_backdrop,
+            true,
+            None,
+        )?;
+        if let (Some(accumulated), Some(coverage)) =
+            (adjustment_coverage.as_deref_mut(), base_coverage.as_ref())
+        {
+            union_coverage(accumulated, coverage);
+        }
+        for &clipped_id in clipped {
+            let Some(clipped_layer) = self.document.layer(clipped_id) else {
+                continue;
+            };
+            if !clipped_layer.is_visible() {
+                continue;
+            }
+            // Members meet the base's colour as if it were opaque; its alpha
+            // only decides where the group shows, and it is restored after.
+            let base_alpha = group.alpha.clone();
+            let shape = Plane {
+                rect,
+                data: base_alpha
+                    .iter()
+                    .map(|&alpha| if alpha > 0.0 { 1.0 } else { 0.0 })
+                    .collect(),
+            };
+            for alpha in &mut group.alpha {
+                if *alpha > 0.0 {
+                    *alpha = 1.0;
+                }
+            }
+            let clipped_coverage = self.composite_layer(
+                clipped_id,
+                &mut group,
+                Some(&shape),
+                shallow_backdrop,
+                deep_backdrop,
+                false,
+                None,
+            )?;
+            group.alpha = base_alpha;
+            if let (Some(accumulated), Some(coverage)) = (
+                adjustment_coverage.as_deref_mut(),
+                clipped_coverage.as_ref(),
+            ) {
+                union_coverage(accumulated, coverage);
+            }
+        }
+        let content = canvas_to_content(&group);
+        self.blend_content(
+            &content,
+            canvas,
+            layer,
+            None,
+            layer.blend_mode,
+            1.0,
+            None,
+            false,
+        );
         Ok(())
     }
 

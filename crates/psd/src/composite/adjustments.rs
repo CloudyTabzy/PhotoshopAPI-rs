@@ -748,53 +748,58 @@ fn colorize_bytes(rgb: [i32; 3], colorization: HueSaturationValues) -> [i32; 3] 
 }
 
 fn color_balance(color: [f32; 3], settings: &psd_core::adjustments::ColorBalance) -> [f32; 3] {
-    let light = hsl_lightness(color);
-    // Partition the tonal axis instead of overlapping three broad triangles.
-    // The shadow/highlight shoulders transition over a quarter of the axis;
-    // the midtone receives the remaining weight.
-    let shadow = ((1.0 / 3.0 - light) * 4.0 + 0.5).clamp(0.0, 1.0);
-    let highlight = ((light - 2.0 / 3.0) * 4.0 + 0.5).clamp(0.0, 1.0);
-    let midtone = (1.0 - shadow) * (1.0 - highlight);
-    let mut deltas = [0.0f32; 3];
-    let ranges: [(&ColorBalanceValues, f32); 3] = [
-        (&settings.shadows, shadow),
-        (&settings.midtones, midtone),
-        (&settings.highlights, highlight),
-    ];
-    for (values, weight) in ranges {
-        deltas[0] += f32::from(values.cyan_red.clamp(-100, 100)) / 100.0 * weight;
-        deltas[1] += f32::from(values.magenta_green.clamp(-100, 100)) / 100.0 * weight;
-        deltas[2] += f32::from(values.yellow_blue.clamp(-100, 100)) / 100.0 * weight;
-    }
+    let sliders = |values: &ColorBalanceValues| {
+        [
+            i32::from(values.cyan_red.clamp(-100, 100)),
+            i32::from(values.magenta_green.clamp(-100, 100)),
+            i32::from(values.yellow_blue.clamp(-100, 100)),
+        ]
+    };
+    let shadows = sliders(&settings.shadows);
+    let midtones = sliders(&settings.midtones);
+    let highlights = sliders(&settings.highlights);
+    let extreme = |values: [i32; 3], largest: bool| {
+        let iter = values.into_iter();
+        if largest {
+            iter.max().unwrap_or(0)
+        } else {
+            iter.min().unwrap_or(0)
+        }
+    };
+
+    // Each channel gets its own transfer curve, in levels of 255: the shadow
+    // sliders move its black point, the highlight sliders its white point, and
+    // the midtone sliders bend it. With Preserve Luminosity the sliders act
+    // relative to their largest (shadows) / smallest (highlights) member, so
+    // moving all three together changes nothing.
     let mut out = color;
     for channel in 0..3 {
-        out[channel] = (color[channel] + deltas[channel] * 0.7).clamp(0.0, 1.0);
-    }
-    if settings.preserve_luminosity {
-        out = set_hsl_lightness(out, light);
+        let (black, white, bend) = if settings.preserve_luminosity {
+            let centre = (extreme(midtones, true) + extreme(midtones, false)) / 2;
+            (
+                extreme(shadows, true) - shadows[channel],
+                255 + extreme(highlights, false) - highlights[channel],
+                midtones[channel] - centre,
+            )
+        } else {
+            (
+                (-shadows[channel]).max(0),
+                (255 - highlights[channel]).min(255),
+                midtones[channel] + (shadows[channel] + highlights[channel]) / 2,
+            )
+        };
+        let level = color[channel].clamp(0.0, 1.0) * 255.0;
+        let (black, white) = (black as f32, white as f32);
+        out[channel] = if level <= black {
+            0.0
+        } else if level >= white || white - black <= 1.0 {
+            1.0
+        } else {
+            let gamma = 2f32.powf(bend as f32 / 100.0);
+            ((level - black) / (white - black)).powf(1.0 / gamma)
+        };
     }
     out
-}
-
-fn hsl_lightness(color: [f32; 3]) -> f32 {
-    0.5 * (color[0].max(color[1]).max(color[2]) + color[0].min(color[1]).min(color[2]))
-}
-
-/// Preserve hue and saturation while assigning an HSL lightness. Unlike
-/// adding an equal RGB offset, this remains in gamut and keeps both extrema.
-fn set_hsl_lightness(color: [f32; 3], lightness: f32) -> [f32; 3] {
-    let max = color[0].max(color[1]).max(color[2]);
-    let min = color[0].min(color[1]).min(color[2]);
-    let chroma = max - min;
-    let light = 0.5 * (max + min);
-    let target = lightness.clamp(0.0, 1.0);
-    if chroma <= f32::EPSILON {
-        return [target; 3];
-    }
-    let saturation = chroma / (2.0 * light.min(1.0 - light)).max(f32::EPSILON);
-    let target_chroma = saturation.clamp(0.0, 1.0) * 2.0 * target.min(1.0 - target);
-    let target_min = target - target_chroma * 0.5;
-    color.map(|v| (target_min + (v - min) / chroma * target_chroma).clamp(0.0, 1.0))
 }
 
 fn descriptor_number(descriptor: &Descriptor, key: &str) -> Option<f64> {
@@ -853,8 +858,9 @@ fn black_and_white(color: [f32; 3], settings: &BlackAndWhite) -> [f32; 3] {
     else {
         return [gray, gray, gray];
     };
-    // The tint colour's hue and saturation at the gray's lightness.
-    set_hsl_lightness(tint, gray)
+    // The tint colour shifted so its luma becomes the gray.
+    let tint_luma = 0.30 * tint[0] + 0.59 * tint[1] + 0.11 * tint[2];
+    tint.map(|channel| (channel - tint_luma + gray).clamp(0.0, 1.0))
 }
 
 fn photo_filter(color: [f32; 3], settings: &PhotoFilter) -> [f32; 3] {
@@ -871,14 +877,39 @@ fn photo_filter(color: [f32; 3], settings: &PhotoFilter) -> [f32; 3] {
         PhotoFilterColor::Color(raw) => ramp::color_rgb(&raw_color(raw)),
     };
     let density = (settings.density as f32 / 100.0).clamp(0.0, 1.0);
-    let mut out = [0.0; 3];
-    for channel in 0..3 {
-        out[channel] = color[channel] * (1.0 - density + filter[channel] * density);
-    }
+    // The filter acts like a gel: it multiplies the scene's tristimulus
+    // values, here in the D50 connection space, by its own colour relative to
+    // the white point, blended in by density.
+    let filter_xyz = linear_rgb_to_xyz(filter.map(srgb_to_linear));
+    let scene_xyz = linear_rgb_to_xyz(color.map(srgb_to_linear));
+    let filtered_xyz: [f32; 3] = std::array::from_fn(|axis| {
+        scene_xyz[axis] * (1.0 - density + density * filter_xyz[axis] / D50_WHITE[axis])
+    });
+    let mut out = xyz_to_linear_rgb(filtered_xyz).map(linear_to_srgb);
     if settings.preserve_luminosity {
         out = preserve_luminosity(color, out);
     }
     out
+}
+
+/// The D50 reference white of the profile connection space.
+const D50_WHITE: [f32; 3] = [0.9642, 1.0, 0.8249];
+
+/// Linear sRGB to D50 XYZ (Bradford-adapted primaries).
+fn linear_rgb_to_xyz([r, g, b]: [f32; 3]) -> [f32; 3] {
+    [
+        0.436_074_7 * r + 0.385_064_9 * g + 0.143_080_4 * b,
+        0.222_504_5 * r + 0.716_878_6 * g + 0.060_616_9 * b,
+        0.013_932_2 * r + 0.097_104_5 * g + 0.714_173_3 * b,
+    ]
+}
+
+fn xyz_to_linear_rgb([x, y, z]: [f32; 3]) -> [f32; 3] {
+    [
+        3.133_856 * x - 1.616_867 * y - 0.490_614_6 * z,
+        -0.978_768_4 * x + 1.916_141_5 * y + 0.033_454 * z,
+        0.071_945_3 * x - 0.228_991_4 * y + 1.405_242_7 * z,
+    ]
 }
 
 /// Photoshop stores version-3 Photo Filter XYZ values in Q1.15 form. The
@@ -941,29 +972,95 @@ fn vibrance(color: [f32; 3], descriptor: &Descriptor) -> [f32; 3] {
     if amount == 0.0 && saturation == 0.0 {
         return color;
     }
+    let mut out = color;
+    if amount != 0.0 {
+        out = vibrance_boost(out, amount);
+    }
+    if saturation != 0.0 {
+        // The Saturation slider scales each channel's distance from a fixed
+        // gray that leans on red and green, so it can leave the gamut.
+        let scale = 1.0 + saturation;
+        let gray = 0.288 * out[0] + 0.712 * out[1];
+        out = out.map(|value| gray + scale * (value - gray));
+    }
+    out.map(|value| value.clamp(0.0, 1.0))
+}
+
+/// The pixel as (maximum, minimum, hue) in a hexcone: hue runs 0..6 with red
+/// at 0, green at 2 and blue at 4. A gray has no hue.
+fn hexcone(color: [f32; 3]) -> Option<(f32, f32, f32)> {
     let max = color[0].max(color[1]).max(color[2]);
     let min = color[0].min(color[1]).min(color[2]);
     let chroma = max - min;
-    if chroma <= f32::EPSILON {
-        return color;
+    if chroma <= 1e-6 {
+        return None;
     }
-    let light = 0.5 * (max + min);
-    let maximum_chroma = 2.0 * light.min(1.0 - light);
-    let current = (chroma / maximum_chroma.max(f32::EPSILON)).clamp(0.0, 1.0);
-    let rgb = color.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as i32);
-    let (hi, lo) = (*rgb.iter().max().unwrap(), *rgb.iter().min().unwrap());
-    let hue = if hi > lo {
-        wheel_position(rgb, hi, lo) / 4.25
+    let hue = if max == color[0] {
+        ((color[1] - color[2]) / chroma).rem_euclid(6.0)
+    } else if max == color[1] {
+        2.0 + (color[2] - color[0]) / chroma
     } else {
-        0.0
+        4.0 + (color[0] - color[1]) / chroma
     };
-    // Vibrance protects the orange/red region and tapers as saturation grows;
-    // the independent Saturation slider affects every hue equally.
-    let protection = 1.0 - 0.5 * hue_range_weight(hue, [0, 15, 45, 60]);
-    let factor = (1.0 + amount * (1.0 - current) * protection).max(0.0) * (1.0 + saturation);
-    let changed = (chroma * factor).clamp(0.0, maximum_chroma.max(chroma));
-    let floor = light - 0.5 * changed;
-    color.map(|v| (floor + (v - min) / chroma * changed).clamp(0.0, 1.0))
+    Some((max, min, hue))
+}
+
+/// The inverse of [`hexcone`].
+fn from_hexcone(max: f32, min: f32, hue: f32) -> [f32; 3] {
+    let chroma = max - min;
+    let sector = hue.floor();
+    let rising = min + chroma * (hue - sector);
+    let falling = min + chroma * (1.0 - (hue - sector));
+    match sector as usize % 6 {
+        0 => [max, rising, min],
+        1 => [falling, max, min],
+        2 => [min, max, rising],
+        3 => [min, falling, max],
+        4 => [rising, min, max],
+        _ => [max, min, falling],
+    }
+}
+
+/// Vibrance proper, `amount` in -1..1. Positive amounts lift the saturation of
+/// muted pixels more than saturated ones and spare the red-to-orange hues that
+/// carry skin tones; negative amounts pull saturated pixels toward gray. Very
+/// dark pixels are left alone either way.
+fn vibrance_boost(color: [f32; 3], amount: f32) -> [f32; 3] {
+    let Some((value, floor, hue)) = hexcone(color) else {
+        return color;
+    };
+    let saturation = (value - floor) / value;
+    let dark = (value * 16.0).min(1.0);
+    let dark_ramp = dark * (2.0 - dark);
+    let bell = (1.0 - saturation) * saturation;
+    let (new_value, new_floor) = if amount > 0.0 {
+        // The protected band runs from magenta-red through orange.
+        let shifted = (hue + 1.0).rem_euclid(6.0);
+        let window = shifted
+            .clamp(0.0, 1.0)
+            .min((1.0 - (shifted - 1.5) * 4.0).clamp(0.0, 1.0));
+        let spare = (1.0 - saturation * saturation) * window;
+        let gain = amount * (1.0 - spare * (1.0 - amount));
+        let new_value =
+            value * (1.0 + (2.0 - bell) * bell * dark_ramp * gain * 0.25 * (1.0 - value));
+        let denominator = 1.0
+            - dark_ramp
+                * (5.0 / 6.0 - spare * 17.0 / 42.0)
+                * gain
+                * (1.0 - floor)
+                * (1.0 - saturation);
+        (new_value, new_value - saturation / denominator * new_value)
+    } else {
+        let strength = -amount;
+        let new_value = value * (1.0 + (2.0 - bell) * bell * dark_ramp * amount * (1.0 - value));
+        let keep =
+            (saturation * 0.5 + 0.5) * (strength * saturation) * dark_ramp + (1.0 - strength);
+        (
+            new_value,
+            new_value - keep * saturation * (1.0 - strength * 0.25) * new_value,
+        )
+    };
+    from_hexcone(new_value, new_floor, hue)
 }
 
 fn gradient_map(color: [f32; 3], settings: &GradientMap) -> [f32; 3] {
@@ -1252,35 +1349,64 @@ mod tests {
         assert!((color[0] - 0.75).abs() < 1e-6);
     }
 
-    #[test]
-    fn preserve_luminosity_keeps_hsl_lightness_across_tonal_ranges() {
-        let zero = ColorBalanceValues {
-            cyan_red: 0,
-            magenta_green: 0,
-            yellow_blue: 0,
+    fn balance(
+        shadows: [i16; 3],
+        midtones: [i16; 3],
+        highlights: [i16; 3],
+        preserve_luminosity: bool,
+    ) -> psd_core::adjustments::ColorBalance {
+        let values = |[cyan_red, magenta_green, yellow_blue]: [i16; 3]| ColorBalanceValues {
+            cyan_red,
+            magenta_green,
+            yellow_blue,
         };
-        let settings = psd_core::adjustments::ColorBalance {
-            shadows: ColorBalanceValues {
-                cyan_red: 100,
-                ..zero
-            },
-            midtones: ColorBalanceValues {
-                magenta_green: 100,
-                ..zero
-            },
-            highlights: ColorBalanceValues {
-                yellow_blue: 100,
-                ..zero
-            },
-            preserve_luminosity: true,
+        psd_core::adjustments::ColorBalance {
+            shadows: values(shadows),
+            midtones: values(midtones),
+            highlights: values(highlights),
+            preserve_luminosity,
             trailing_bytes: Vec::new(),
-        };
-        for source in [[0.08; 3], [0.5, 0.3, 0.2], [0.92; 3]] {
-            let result = color_balance(source, &settings);
-            assert!((hsl_lightness(source) - hsl_lightness(result)).abs() < 1e-6);
         }
-        assert!(color_balance([0.08; 3], &settings)[0] > 0.08);
-        assert!(color_balance([0.92; 3], &settings)[2] > 0.92);
+    }
+
+    #[test]
+    fn color_balance_with_preserved_luminosity_ignores_moves_shared_by_all_channels() {
+        // Raising all three sliders of a range together shifts no colour.
+        let settings = balance([60; 3], [-30; 3], [45; 3], true);
+        for source in [[0.08; 3], [0.5, 0.3, 0.2], [0.92, 0.8, 0.1]] {
+            let result = color_balance(source, &settings);
+            for channel in 0..3 {
+                assert!(
+                    (result[channel] - source[channel]).abs() < 1e-5,
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn color_balance_ranges_act_on_their_end_of_each_channels_curve() {
+        // Midtones bend one channel's curve without moving its end points.
+        let mid = color_balance(
+            [0.25, 0.25, 0.25],
+            &balance([0; 3], [100, 0, 0], [0; 3], false),
+        );
+        assert!(
+            (mid[0] - 0.5).abs() < 1e-5 && (mid[1] - 0.25).abs() < 1e-5,
+            "{mid:?}"
+        );
+        assert_eq!(
+            color_balance([1.0; 3], &balance([0; 3], [100, 0, 0], [0; 3], false)),
+            [1.0; 3]
+        );
+        // A highlight slider pulls the white point down, so bright values clip.
+        let high = color_balance([0.7; 3], &balance([0; 3], [0; 3], [100, 0, 0], false));
+        assert_eq!(high[0], 1.0);
+        assert!((high[1] - 0.7).abs() < 1e-5);
+        // A negative shadow slider lifts the black point, so dark values clip.
+        let shadow = color_balance([0.3; 3], &balance([-100, 0, 0], [0; 3], [0; 3], false));
+        assert_eq!(shadow[0], 0.0);
+        assert!((shadow[2] - 0.3).abs() < 1e-5);
     }
 
     #[test]
@@ -1300,6 +1426,35 @@ mod tests {
         let orange_gain = max_chroma(vibrance(orange, &descriptor)) / max_chroma(orange);
         let blue_gain = max_chroma(vibrance(blue, &descriptor)) / max_chroma(blue);
         assert!(orange_gain < blue_gain);
+    }
+
+    #[test]
+    fn negative_vibrance_pulls_saturated_pixels_toward_gray() {
+        let mut descriptor = Descriptor::default();
+        descriptor.insert("vibrance", DescriptorValue::Integer(-100));
+        let saturated = [0.8, 0.2, 0.1];
+        assert!(max_chroma(vibrance(saturated, &descriptor)) < 0.8 * max_chroma(saturated));
+        // A gray has no saturation to move, and zero vibrance changes nothing.
+        assert_eq!(vibrance([0.4; 3], &descriptor), [0.4; 3]);
+        assert_eq!(vibrance(saturated, &Descriptor::default()), saturated);
+    }
+
+    #[test]
+    fn photo_filter_preserving_luminosity_keeps_luma_and_tints_toward_the_filter() {
+        let settings = PhotoFilter {
+            version: 2,
+            color: PhotoFilterColor::Color(psd_core::RawColor {
+                color_space: 0,
+                components: [0xffff, 0x8000, 0, 0],
+            }),
+            density: 50,
+            preserve_luminosity: true,
+            trailing_bytes: Vec::new(),
+        };
+        let source = [0.5, 0.5, 0.5];
+        let result = photo_filter(source, &settings);
+        assert!(result[0] > result[1] && result[1] > result[2], "{result:?}");
+        assert!((luminance(result) - luminance(source)).abs() < 1e-3);
     }
 
     fn max_chroma(color: [f32; 3]) -> f32 {
