@@ -12,6 +12,15 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.12] - 2026-10-02
+
+### Added
+
+- The Noise slider of shadows and glows now adds grain: each painted pixel's strength moves by its
+  signed byte from the fixed noise table times the slider, clamped to the valid range, and pixels
+  the effect does not reach stay clear. The grain follows document position, so it is repeatable.
+  No Photoshop render of a noisy effect was available to check the scaling against.
+
 ## [0.12.11] - 2026-10-02
 
 ### Changed

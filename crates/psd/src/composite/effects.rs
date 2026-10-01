@@ -27,7 +27,7 @@
 //! Glows with the Precise technique follow the exact edge distance instead of
 //! a blur.
 //!
-//! Documented gap: noise and jitter.
+//! Documented gap: jitter.
 
 use psd_core::effect_enums::{GlowSource, GlowTechnique, StrokeFill, StrokePosition};
 use psd_core::{BlendMode, Gradient, LayerEffects, Shadow};
@@ -777,6 +777,7 @@ fn paint_interior_into(
         });
         range_gain(&mut field, glow.range.unwrap_or(100.0));
         shape_by_contour(&mut field, glow.contour.as_ref(), glow.anti_aliased);
+        add_noise(&mut field, painter.rect, width, glow.noise);
         if glow.source == Some(GlowSource::Center) {
             // Center source is the exact complement of the gained edge field.
             for value in &mut field {
@@ -806,6 +807,7 @@ fn paint_interior_into(
             interior_mask(&shifted, w, h, size, shadow.spread.unwrap_or(0.0))
         });
         shape_by_contour(&mut field, shadow.contour.as_ref(), shadow.anti_aliased);
+        add_noise(&mut field, painter.rect, width, shadow.noise);
         let paint = EffectPaint::flat(
             shadow.color.as_ref().map(color_rgb).unwrap_or([0.0; 3]),
             opacity_scale(shadow.opacity),
@@ -832,6 +834,31 @@ fn shape_by_contour(
     let smooth = anti_aliased.unwrap_or(false);
     for value in field.iter_mut() {
         *value = lut.sample(value.clamp(0.0, 1.0), smooth);
+    }
+}
+
+/// Grain for a soft effect's Noise slider: each painted pixel's strength moves
+/// by its signed byte from the fixed noise table (read as -128..127) times the
+/// slider, in a field whose full scale is 65280, then stays inside 0..=1.
+/// Pixels the effect does not reach are left alone. `rect` is the field's
+/// document-space rectangle and `width` its row length.
+///
+/// Approximation: the table, its signed reading and the scaling follow the
+/// description of the original; no render of a noisy effect was available.
+fn add_noise(field: &mut [f32], rect: Rect, width: usize, noise: Option<f64>) {
+    let percent = noise.unwrap_or(0.0);
+    if percent <= 0.0 || width == 0 {
+        return;
+    }
+    let scale = (percent as f32) * 512.0 / 256.0 / 65_280.0;
+    for (index, value) in field.iter_mut().enumerate() {
+        if *value <= 0.0 {
+            continue;
+        }
+        let x = rect.left + (index % width) as i32;
+        let y = rect.top + (index / width) as i32;
+        let grain = f32::from(super::noise::at(x, y) as i8);
+        *value = (*value + grain * scale).clamp(0.0, 1.0);
     }
 }
 
@@ -944,6 +971,7 @@ pub(crate) fn build_outer(
             shadow.spread.unwrap_or(0.0),
         );
         shape_by_contour(&mut field, shadow.contour.as_ref(), shadow.anti_aliased);
+        add_noise(&mut field, rect, out_width, shadow.noise);
         // "Layer Knocks Out Drop Shadow" (on by default): the layer's own
         // transparency shape removes its shadow.
         if shadow.layer_knocks_out.unwrap_or(true) {
@@ -969,6 +997,7 @@ pub(crate) fn build_outer(
         );
         range_gain(&mut field, glow.range.unwrap_or(100.0));
         shape_by_contour(&mut field, glow.contour.as_ref(), glow.anti_aliased);
+        add_noise(&mut field, rect, out_width, glow.noise);
         planes.push(plane_from_field(
             rect,
             &field,

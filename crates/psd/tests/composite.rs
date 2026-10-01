@@ -451,6 +451,36 @@ fn a_precise_glow_falls_off_linearly_and_stops_at_its_size() {
 }
 
 #[test]
+fn shadow_noise_roughens_a_straight_falloff() {
+    let render = |noise: f64| {
+        let mut doc = document(40, 40);
+        white_background(&mut doc);
+        let id = doc.add_layer(solid("box", (14, 14, 26, 26), [255, 255, 255]));
+        let mut effects = LayerEffects::default();
+        let mut shadow = Shadow::new(ShadowKind::Drop);
+        shadow.size = Some(8.0);
+        shadow.distance = Some(0.0);
+        shadow.opacity = Some(100.0);
+        shadow.noise = Some(noise);
+        effects.drop_shadows.push(shadow);
+        doc.layer_mut(id)
+            .unwrap()
+            .set_layer_effects(&effects)
+            .unwrap();
+        flatten(&doc)
+    };
+    let column = |image: &psd::CompositeImage| -> Vec<u8> {
+        (16..24).map(|y| image.pixel(11, y)[0]).collect()
+    };
+    let plain = column(&render(0.0));
+    let noisy = column(&render(50.0));
+    // The plain falloff mirrors top to bottom; grain breaks the symmetry.
+    let mirrored = |values: &[u8]| values.iter().rev().copied().collect::<Vec<u8>>();
+    assert_eq!(plain, mirrored(&plain));
+    assert_ne!(noisy, mirrored(&noisy), "{noisy:?}");
+}
+
+#[test]
 fn a_shadow_contour_reshapes_its_falloff() {
     let render = |contour: Option<psd::core::Contour>| {
         let mut doc = document(40, 40);
