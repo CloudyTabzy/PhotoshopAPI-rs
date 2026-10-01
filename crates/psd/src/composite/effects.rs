@@ -959,7 +959,9 @@ fn stroke_band(
     height: usize,
     size: f64,
     position: StrokePosition,
-) -> (Vec<f32>, Vec<f32>) {
+    under_paint: bool,
+    fold_inside: bool,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let size = size.max(0.0) as f32;
     let (band_out, band_in) = match position {
         StrokePosition::Outside => (size, 0.0),
@@ -998,6 +1000,23 @@ fn stroke_band(
                 }
             }
         }
+        if under_paint {
+            // A soft region (a faded gradient) belongs to the shape whole:
+            // a partly painted pixel with no clear neighbour is inside it,
+            // however faint, while a fringe pixel touching clear ground is not.
+            for y in 1..h.saturating_sub(1) {
+                for x in 1..w.saturating_sub(1) {
+                    let index = y * w + x;
+                    if matte[index] > 0.0 && contour[index] == 0.0 {
+                        let enclosed = (y - 1..=y + 1)
+                            .all(|row| (x - 1..=x + 1).all(|column| matte[row * w + column] > 0.0));
+                        if enclosed {
+                            contour[index] = 1.0;
+                        }
+                    }
+                }
+            }
+        }
         let outside = if band_out > 0.0 {
             distance_transform(&contour, w, h)
         } else {
@@ -1011,6 +1030,7 @@ fn stroke_band(
         };
         let mut coverage = vec![0.0f32; w * h];
         let mut burst = vec![0.0f32; w * h];
+        let mut inner = vec![0.0f32; w * h];
         let outer_reach = if band_out > 0.0 { band_out + 1.0 } else { 0.0 };
         let inner_reach = if band_in > 0.0 { band_in + 1.0 } else { 0.0 };
         let span = (outer_reach + inner_reach).max(1.0);
@@ -1026,8 +1046,31 @@ fn stroke_band(
             } else {
                 (band_in + 1.0 - inside[index]).clamp(0.0, 1.0)
             };
-            coverage[index] =
-                (alpha * inside_coverage + (1.0 - alpha) * outside_coverage).clamp(0.0, 1.0);
+            let (px, py) = (index % w, index / w);
+            let soft_interior = fold_inside
+                && alpha > 0.0
+                && alpha < 0.999
+                && px > 0
+                && py > 0
+                && px + 1 < w
+                && py + 1 < h
+                && (py - 1..=py + 1)
+                    .all(|row| (px - 1..=px + 1).all(|column| matte[row * w + column] > 0.0));
+            if soft_interior {
+                // Inside a soft region (a faded gradient) the stroke's part
+                // replaces the layer's colour where it lies, keeping the
+                // layer's alpha; only the outside part paints.
+                coverage[index] = ((1.0 - alpha) * outside_coverage).clamp(0.0, 1.0);
+                inner[index] = inside_coverage;
+            } else {
+                coverage[index] =
+                    (alpha * inside_coverage + (1.0 - alpha) * outside_coverage).clamp(0.0, 1.0);
+            }
+            if under_paint && contour[index] > 0.0 && alpha < 0.999 {
+                // An outside stroke sits behind the layer: it fills the whole
+                // shape and shows through wherever the layer is not opaque.
+                coverage[index] = outside_coverage;
+            }
             let along = if contour[index] > 0.0 {
                 if inside.is_empty() {
                     span
@@ -1041,19 +1084,19 @@ fn stroke_band(
             };
             burst[index] = (along / span).clamp(0.0, 1.0);
         }
-        (coverage, burst)
+        (coverage, burst, inner)
     });
     both
 }
 
-/// [`with_padding`] for a computation producing two fields.
+/// [`with_padding`] for a computation producing three fields.
 fn with_padding_pair(
     matte: &[f32],
     width: usize,
     height: usize,
     pad: f64,
-    compute: impl FnOnce(&[f32], usize, usize) -> (Vec<f32>, Vec<f32>),
-) -> (Vec<f32>, Vec<f32>) {
+    compute: impl FnOnce(&[f32], usize, usize) -> (Vec<f32>, Vec<f32>, Vec<f32>),
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let pad = pad.clamp(0.0, width.max(height) as f64 + 256.0).ceil() as usize + 2;
     let (padded_width, padded_height) = (width + 2 * pad, height + 2 * pad);
     let mut padded = vec![0.0f32; padded_width * padded_height];
@@ -1061,7 +1104,7 @@ fn with_padding_pair(
         let target = (y + pad) * padded_width + pad;
         padded[target..target + width].copy_from_slice(&matte[y * width..(y + 1) * width]);
     }
-    let (first, second) = compute(&padded, padded_width, padded_height);
+    let (first, second, third) = compute(&padded, padded_width, padded_height);
     let crop = |field: &[f32]| {
         let mut out = vec![0.0f32; width * height];
         for y in 0..height {
@@ -1070,13 +1113,16 @@ fn with_padding_pair(
         }
         out
     };
-    (crop(&first), crop(&second))
+    (crop(&first), crop(&second), crop(&third))
 }
 
 /// One stroke effect resolved to planes.
 pub(crate) struct StrokePlane {
     /// Band coverage before any opacity, over the content's rect.
     pub band: Vec<f32>,
+    /// Weight with which the stroke's colour replaces the layer's own colour
+    /// where the stroke lies inside it (the layer's alpha is kept).
+    pub fold: Vec<f32>,
     /// Straight colour, with the band (times the gradient's transparency) as
     /// alpha, over the same rect.
     pub content: Content,
@@ -1086,6 +1132,8 @@ pub(crate) struct StrokePlane {
     /// `overprint`: blend over the layer's own content instead of knocking it
     /// out.
     pub overprint: bool,
+    /// The stroke is painted behind the layer's content (an outside stroke).
+    pub under: bool,
 }
 
 impl StrokePlane {
@@ -1096,7 +1144,7 @@ impl StrokePlane {
     /// content it equals a plain over-composite (a no-op for an opaque solid
     /// stroke).
     pub fn content_factor(&self, index: usize) -> f32 {
-        if self.overprint {
+        if self.overprint || self.under {
             return 1.0;
         }
         let band = self.band[index];
@@ -1117,7 +1165,7 @@ impl StrokePlane {
     /// Whether the stroke draws above the layer's content (Normal, or
     /// overprint); other modes blend against the backdrop below it.
     pub fn above_content(&self) -> bool {
-        self.blend_mode == BlendMode::NORMAL || self.overprint
+        !self.under && (self.blend_mode == BlendMode::NORMAL || self.overprint)
     }
 }
 
@@ -1140,7 +1188,13 @@ pub(crate) fn build_strokes(
             continue;
         }
         let position = stroke.position.unwrap_or(StrokePosition::Outside);
-        let (band, burst) = stroke_band(coverage, width, height, size, position);
+        let under = position == StrokePosition::Outside
+            && stroke.blend_mode.unwrap_or(BlendMode::NORMAL) == BlendMode::NORMAL
+            && !stroke.overprint.unwrap_or(false);
+        let fold = position != StrokePosition::Outside && !stroke.overprint.unwrap_or(false);
+        let (band, burst, inner) =
+            stroke_band(coverage, width, height, size, position, under, fold);
+        let mut fold_weight = vec![0.0f32; width * height];
         let mut plane = Content::new(content.rect);
         match stroke.fill.unwrap_or(StrokeFill::Color) {
             StrokeFill::Gradient => {
@@ -1174,7 +1228,7 @@ pub(crate) fn build_strokes(
                         .map_or((0.0, 0.0), |o| (o.horizontal as f32, o.vertical as f32)),
                 };
                 for index in 0..width * height {
-                    if band[index] <= 0.0 {
+                    if band[index] <= 0.0 && inner[index] <= 0.0 {
                         continue;
                     }
                     let position = if style == psd_core::effect_enums::GradientStyle::ShapeBurst {
@@ -1196,6 +1250,7 @@ pub(crate) fn build_strokes(
                         plane.color[channel][index] = *value;
                     }
                     plane.alpha[index] = band[index] * alpha;
+                    fold_weight[index] = inner[index] * alpha;
                 }
             }
             StrokeFill::Pattern => {
@@ -1209,7 +1264,7 @@ pub(crate) fn build_strokes(
                     continue;
                 };
                 for (index, coverage) in band.iter().enumerate() {
-                    if *coverage <= 0.0 {
+                    if *coverage <= 0.0 && inner[index] <= 0.0 {
                         continue;
                     }
                     let x = content.rect.left + (index % width) as i32;
@@ -1219,27 +1274,31 @@ pub(crate) fn build_strokes(
                         plane.color[channel][index] = *value;
                     }
                     plane.alpha[index] = *coverage * alpha;
+                    fold_weight[index] = inner[index] * alpha;
                 }
             }
             StrokeFill::Color => {
                 let color = stroke.color.as_ref().map(color_rgb).unwrap_or([0.0; 3]);
                 for (index, coverage) in band.iter().enumerate() {
-                    if *coverage <= 0.0 {
+                    if *coverage <= 0.0 && inner[index] <= 0.0 {
                         continue;
                     }
                     for (channel, value) in color.iter().enumerate() {
                         plane.color[channel][index] = *value;
                     }
                     plane.alpha[index] = *coverage;
+                    fold_weight[index] = inner[index];
                 }
             }
         }
         planes.push(StrokePlane {
             band,
+            fold: fold_weight,
             content: plane,
             opacity: opacity_scale(stroke.opacity),
             blend_mode: stroke.blend_mode.unwrap_or(BlendMode::NORMAL),
             overprint: stroke.overprint.unwrap_or(false),
+            under,
         });
     }
     planes

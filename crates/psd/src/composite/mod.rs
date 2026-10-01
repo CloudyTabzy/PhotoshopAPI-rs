@@ -615,7 +615,7 @@ impl<T: BitDepth> Compositor<'_, T> {
             return Ok(());
         }
         let mut adjustment_coverage = adjustment_coverage;
-        if let Some(rect) = self.isolated_clip_group_rect(layer, clipped, canvas) {
+        if let Some(rect) = self.isolated_clip_group_rect(base, layer, clipped, canvas) {
             return self.composite_clip_group(
                 base,
                 layer,
@@ -708,12 +708,16 @@ impl<T: BitDepth> Compositor<'_, T> {
     /// restrictions. Anything else keeps the layer-by-layer path.
     fn isolated_clip_group_rect(
         &self,
+        base: usize,
         layer: &Layer<T>,
         clipped: &[usize],
         canvas: &Canvas,
     ) -> Option<Rect> {
         if clipped.is_empty()
-            || !matches!(layer.kind, LayerKind::Image(_) | LayerKind::Text(_))
+            || !matches!(
+                layer.kind,
+                LayerKind::Image(_) | LayerKind::Text(_) | LayerKind::Group(_)
+            )
             || layer.blend_mode == BlendMode::DISSOLVE
             || knockout_setting(layer) != KnockoutSetting::None
             || blend_if_active(&layer.blending_ranges)
@@ -744,8 +748,51 @@ impl<T: BitDepth> Compositor<'_, T> {
             canvas.origin.1 + canvas.height as i32,
             canvas.origin.0 + canvas.width as i32,
         );
-        let rect = clamp_to_canvas_rect(self.layer_rect(layer), canvas_rect);
+        let rect = if matches!(layer.kind, LayerKind::Group(_)) {
+            // A group isolates for its clipped members only when its content
+            // does not depend on what lies beneath it.
+            if !self.isolation_is_safe(base) {
+                return None;
+            }
+            self.subtree_bounds(base)?
+        } else {
+            self.layer_rect(layer)
+        };
+        let rect = clamp_to_canvas_rect(rect, canvas_rect);
         (rect.width() > 0 && rect.height() > 0).then_some(rect)
+    }
+
+    /// Whether rendering a group over a transparent canvas gives the same
+    /// pixels as rendering it in place: every descendant blends Normally,
+    /// without Blend If, knockout or backdrop-reading adjustments.
+    fn isolation_is_safe(&self, group: usize) -> bool {
+        let Some(children) = self.document.children(Some(group)) else {
+            return true;
+        };
+        children.iter().all(|&child| {
+            let Some(layer) = self.document.layer(child) else {
+                return true;
+            };
+            if !layer.is_visible() {
+                return true;
+            }
+            match &layer.kind {
+                LayerKind::SectionDivider(_) => true,
+                LayerKind::Group(_) => {
+                    matches!(layer.blend_mode, BlendMode::PASSTHROUGH | BlendMode::NORMAL)
+                        && knockout_setting(layer) == KnockoutSetting::None
+                        && !blend_if_active(&layer.blending_ranges)
+                        && self.isolation_is_safe(child)
+                }
+                LayerKind::Adjustment(_) if !self.is_fill_layer(layer) => false,
+                _ => {
+                    layer.blend_mode == BlendMode::NORMAL
+                        && knockout_setting(layer) == KnockoutSetting::None
+                        && !blend_if_active(&layer.blending_ranges)
+                        && layer.clipping == 0
+                }
+            }
+        })
     }
 
     /// Composite a clipping group as one unit: the base and its clipped layers
@@ -1204,6 +1251,27 @@ impl<T: BitDepth> Compositor<'_, T> {
                 }
                 let stroke_context = self.effect_context(layer, canvas_rect);
                 strokes = effects::build_strokes(&content, &shape, &effects, &stroke_context);
+                // The part of a stroke lying inside the layer recolours it
+                // and leaves its alpha alone.
+                for plane in &strokes {
+                    for index in 0..plane.fold.len() {
+                        let weight = plane.fold[index] * plane.opacity;
+                        if weight <= 0.0 {
+                            continue;
+                        }
+                        let stroke_color = std::array::from_fn(|c| plane.content.color[c][index]);
+                        let own = std::array::from_fn(|c| content.color[c][index]);
+                        let painted = if plane.blend_mode == BlendMode::NORMAL {
+                            stroke_color
+                        } else {
+                            blend::blend(plane.blend_mode, own, stroke_color, self.byte_domain)
+                        };
+                        for channel in 0..3 {
+                            content.color[channel][index] =
+                                own[channel] + (painted[channel] - own[channel]) * weight.min(1.0);
+                        }
+                    }
+                }
                 // Bevel and emboss shade from the layer's own matte, before any
                 // stroke knockout, and composite over everything else.
                 let context = self.effect_context(layer, canvas_rect);
@@ -1764,10 +1832,13 @@ impl<T: BitDepth> Compositor<'_, T> {
                 }
             }
         }
+        // A shallow knockout inside an isolated group reaches back only to
+        // the group's own starting canvas; a deep one reaches the document.
+        let group_start = isolated.clone();
         self.composite_children(
             Some(id),
             &mut isolated,
-            Some(&input_backdrop),
+            Some(&group_start),
             Some(&input_backdrop),
             false,
         )?;
@@ -2028,13 +2099,61 @@ impl<T: BitDepth> Compositor<'_, T> {
         clamp_to_canvas(rect, self.document.width, self.document.height)
     }
 
+    /// The document's global light as (angle, altitude) in degrees, when it
+    /// stores one: two image resources hold them as big-endian integers.
+    fn global_light(&self) -> (Option<f64>, Option<f64>) {
+        let read = |id: u16| {
+            self.document
+                .image_resources
+                .blocks()
+                .iter()
+                .find_map(|block| match block {
+                    psd_core::ResourceBlock::Raw(raw) if raw.id == id && raw.data.len() >= 4 => {
+                        Some(f64::from(i32::from_be_bytes(
+                            raw.data[..4].try_into().unwrap_or([0; 4]),
+                        )))
+                    }
+                    _ => None,
+                })
+        };
+        (read(1037), read(1049))
+    }
+
+    /// Effects that follow the global light take the document's angle (and
+    /// altitude) instead of the copy stored in the layer, which goes stale
+    /// when the global light changes.
+    fn apply_global_light(&self, effects: &mut psd_core::LayerEffects) {
+        let (angle, altitude) = self.global_light();
+        let Some(angle) = angle else {
+            return;
+        };
+        for shadow in effects
+            .drop_shadows
+            .iter_mut()
+            .chain(effects.inner_shadows.iter_mut())
+        {
+            if shadow.use_global_light.unwrap_or(false) {
+                shadow.angle = Some(angle);
+            }
+        }
+        if let Some(bevel) = effects.bevel.as_mut() {
+            if bevel.use_global_light.unwrap_or(false) {
+                bevel.angle = Some(angle);
+                if let Some(altitude) = altitude {
+                    bevel.altitude = Some(altitude);
+                }
+            }
+        }
+    }
+
     /// The typed effects of a layer, from the first modern block.
     fn typed_effects(&self, layer: &Layer<T>) -> Option<psd_core::LayerEffects> {
         let blocks = layer.effects().ok()?;
         for block in blocks {
             if let psd_core::LayerEffectsData::Modern(modern) = &block.data {
-                let effects = psd_core::LayerEffects::from_descriptor(&modern.descriptor);
+                let mut effects = psd_core::LayerEffects::from_descriptor(&modern.descriptor);
                 if effects.master_switch.unwrap_or(true) {
+                    self.apply_global_light(&mut effects);
                     return Some(effects);
                 }
             }

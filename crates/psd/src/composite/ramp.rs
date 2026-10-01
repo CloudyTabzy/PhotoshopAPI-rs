@@ -55,8 +55,9 @@ impl Ramp {
         interpolation: Option<GradientInterpolation>,
         endpoint_smoothing: bool,
     ) -> Option<Self> {
-        let GradientKind::Solid(solid) = &gradient.kind else {
-            return None;
+        let solid = match &gradient.kind {
+            GradientKind::Solid(solid) => solid.clone(),
+            GradientKind::Noise(noise) => synthesize_noise_gradient(noise),
         };
         let mut colors: Vec<ColorStop> = solid
             .color_stops
@@ -203,6 +204,83 @@ fn stop_color(source: &StopSource) -> [f32; 3] {
         StopSource::User(color) => color_rgb(color),
         StopSource::Foreground => [0.0; 3],
         StopSource::Background => [1.0; 3],
+    }
+}
+
+/// A noise gradient as ordinary stops. Photoshop's own random sequence is not
+/// reproducible, so this draws a deterministic stand-in from the stored seed:
+/// uniformly random colours inside the stored per-channel ranges, with more
+/// stops (and so faster changes) the rougher the gradient.
+fn synthesize_noise_gradient(noise: &psd_core::NoiseGradient) -> psd_core::SolidGradient {
+    use psd_core::NoiseColorModel;
+
+    let mut state = (noise.seed as u32 as u64) ^ 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        // SplitMix64, mapped to 0..1.
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let range = |index: usize, fallback: (f64, f64)| -> (f64, f64) {
+        match (noise.minimum.get(index), noise.maximum.get(index)) {
+            (Some(&low), Some(&high)) => (f64::from(low.min(high)), f64::from(low.max(high))),
+            _ => fallback,
+        }
+    };
+    let roughness = (f64::from(noise.roughness) / 4096.0).clamp(0.0, 1.0);
+    let segments = 3 + (roughness * 40.0).round() as usize;
+    let mut color_stops = Vec::new();
+    let mut transparency_stops = Vec::new();
+    for index in 0..=segments {
+        let location = (index as f64 / segments as f64 * 4096.0).round() as i32;
+        let mut channel = |slot: usize, scale: f64| {
+            let (low, high) = range(slot, (0.0, 100.0));
+            (low + (high - low) * next()) / 100.0 * scale
+        };
+        let rgb = match noise.color_model {
+            NoiseColorModel::Rgb => [channel(0, 1.0), channel(1, 1.0), channel(2, 1.0)],
+            NoiseColorModel::Hsb => {
+                let hue = channel(0, 1.0);
+                let saturation = channel(1, 1.0);
+                let brightness = channel(2, 1.0);
+                // The hue range is stored in degrees out of 360, not percent.
+                let hue = (hue * 100.0 / 360.0).rem_euclid(1.0);
+                hsb_to_rgb(hue as f32, saturation as f32, brightness as f32).map(f64::from)
+            }
+            NoiseColorModel::Lab => {
+                let lightness = channel(0, 100.0);
+                let a = channel(1, 255.0) - 128.0;
+                let b = channel(2, 255.0) - 128.0;
+                lab_to_rgb(lightness, a, b).map(f64::from)
+            }
+        };
+        color_stops.push(psd_core::ColorStop {
+            source: StopSource::User(Color::Rgb {
+                red: rgb[0].clamp(0.0, 1.0) * 255.0,
+                green: rgb[1].clamp(0.0, 1.0) * 255.0,
+                blue: rgb[2].clamp(0.0, 1.0) * 255.0,
+            }),
+            location,
+            midpoint: 50,
+        });
+        let opacity = if noise.add_transparency {
+            let (low, high) = range(3, (0.0, 100.0));
+            low + (high - low) * next()
+        } else {
+            100.0
+        };
+        transparency_stops.push(psd_core::TransparencyStop {
+            opacity,
+            location,
+            midpoint: 50,
+        });
+    }
+    psd_core::SolidGradient {
+        smoothness: 4096.0,
+        color_stops,
+        transparency_stops,
     }
 }
 
@@ -463,6 +541,38 @@ pub(crate) fn position(placement: &Placement, span: Span, basis: SpanBasis, x: i
 mod tests {
     use super::*;
     use psd_core::{ColorStop as GradientColorStop, SolidGradient, TransparencyStop};
+
+    fn noise(seed: i32, roughness: i32) -> Gradient {
+        Gradient {
+            label: "Gradient".into(),
+            name: "Custom".into(),
+            kind: GradientKind::Noise(psd_core::NoiseGradient {
+                restrict_colors: true,
+                add_transparency: false,
+                color_model: psd_core::NoiseColorModel::Rgb,
+                seed,
+                roughness,
+                minimum: vec![0, 0, 0, 0],
+                maximum: vec![100, 100, 100, 100],
+            }),
+        }
+    }
+
+    #[test]
+    fn a_noise_gradient_draws_a_deterministic_ramp_from_its_seed() {
+        let first = Ramp::new(&noise(7, 2048), None, false).expect("noise gradients render");
+        let again = Ramp::new(&noise(7, 2048), None, false).unwrap();
+        let other = Ramp::new(&noise(8, 2048), None, false).unwrap();
+        let samples = |ramp: &Ramp| -> Vec<[f32; 3]> {
+            (0..=10).map(|i| ramp.sample(i as f32 / 10.0).0).collect()
+        };
+        assert_eq!(samples(&first), samples(&again));
+        assert_ne!(samples(&first), samples(&other));
+        // Opaque, and not a flat colour.
+        assert_eq!(first.sample(0.5).1, 1.0);
+        let reds: Vec<f32> = samples(&first).iter().map(|c| c[0]).collect();
+        assert!(reds.iter().any(|r| (r - reds[0]).abs() > 0.05));
+    }
 
     fn gradient(
         stops: &[(i32, i32, [f64; 3])],

@@ -418,12 +418,28 @@ fn composite_tracks_stored_merges() {
         // Photoshop stores a merge that has transparency already matted
         // against white next to its alpha channel, so the colour channels are
         // the flatten over white as they are.
+        // Some merges instead keep straight colour with black under a clear
+        // alpha; those are composited over white here.
+        let straight = channels == 4 && {
+            let clear: Vec<usize> = (0..width * height)
+                .filter(|index| samples[index * 4 + 3] == 0)
+                .collect();
+            !clear.is_empty()
+                && clear
+                    .iter()
+                    .all(|index| samples[index * 4..index * 4 + 3] == [0, 0, 0])
+        };
         let over_white = |index: usize| -> [u8; 3] {
-            [
+            let color = [
                 samples[index * channels],
                 samples[index * channels + 1],
                 samples[index * channels + 2],
-            ]
+            ];
+            if !straight {
+                return color;
+            }
+            let alpha = f32::from(samples[index * channels + 3]) / 255.0;
+            color.map(|value| (f32::from(value) * alpha + 255.0 * (1.0 - alpha)).round() as u8)
         };
         let mut colors = std::collections::HashSet::new();
         for index in 0..width * height {

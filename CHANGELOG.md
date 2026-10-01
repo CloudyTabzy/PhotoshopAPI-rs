@@ -12,6 +12,37 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.6] - 2026-10-01
+
+### Fixed
+
+- Effects that follow the global light (drop and inner shadows, Bevel & Emboss) now take the
+  document's global angle and altitude instead of the copy stored in the layer, which goes stale
+  when the global light is changed after the effect was made. A reference with a stale shadow angle
+  improves from 6.39 to 1.46 mean error.
+- A shallow knockout inside an isolated group now reaches back to the group's own starting canvas
+  instead of the document's backdrop. The reference with knockout in isolated groups improves from
+  13.9 to 1.2.
+- An Outside stroke on a layer with soft alpha (a raster fade or glow) now sits behind the layer
+  across its whole footprint and shows through the translucent part, as Photoshop draws it, instead
+  of fading toward the backdrop. An Inside or Center stroke over the soft interior of such a layer
+  recolours it and keeps its alpha.
+- A pass-through or isolated group that is the base of a clipping group now blends as a unit with
+  its clipped layers when everything inside it blends Normally, so its soft edges keep their alpha
+  (a reference with a clipped shape on a soft group goes from 4.1 to 0.01).
+
+### Added
+
+- Noise gradients render. Photoshop's random sequence cannot be reproduced, so a gradient is drawn
+  from a deterministic sequence seeded by the stored seed and shaped by its roughness, colour model
+  and ranges; fills, overlays, strokes and gradient maps all use it. The result resembles the
+  original but does not match it pixel for pixel.
+
+### Changed
+
+- The stored-merge probe in the test harness composites a merge that keeps straight colour (black
+  under a clear alpha) over white before comparing.
+
 ## [0.12.5] - 2026-10-01
 
 ### Changed

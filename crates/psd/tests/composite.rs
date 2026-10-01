@@ -308,6 +308,94 @@ fn a_drop_shadow_falls_away_from_the_light() {
 }
 
 #[test]
+fn a_shadow_that_follows_the_global_light_takes_the_documents_angle() {
+    let mut doc = document(40, 40);
+    white_background(&mut doc);
+    // The document's global light comes from the right (0 degrees); the
+    // shadow's stored copy of the angle is stale.
+    doc.image_resources
+        .push(psd::core::ResourceBlock::Raw(psd::core::RawResourceBlock {
+            id: 1037,
+            name: psd::core::PascalString::new("", 2),
+            data: 0i32.to_be_bytes().to_vec(),
+        }));
+    let id = doc.add_layer(solid("box", (10, 10, 20, 20), [255, 255, 255]));
+    let mut effects = LayerEffects::default();
+    let mut shadow = Shadow::new(ShadowKind::Drop);
+    shadow.size = Some(0.0);
+    shadow.distance = Some(6.0);
+    shadow.angle = Some(120.0);
+    shadow.use_global_light = Some(true);
+    shadow.opacity = Some(100.0);
+    effects.drop_shadows.push(shadow);
+    doc.layer_mut(id)
+        .unwrap()
+        .set_layer_effects(&effects)
+        .unwrap();
+    let image = flatten(&doc);
+    assert_eq!(image.pixel(7, 15), [0, 0, 0, 255], "left of the box");
+    assert_eq!(
+        image.pixel(22, 15),
+        [255, 255, 255, 255],
+        "right of the box"
+    );
+}
+
+/// A layer 12 pixels wide whose alpha climbs from clear to opaque, red.
+fn fading_layer() -> Layer<u8> {
+    let mut layer = solid("fade", (2, 4, 9, 16), [255, 0, 0]);
+    layer.image_mut().unwrap().set_channel(
+        ChannelKey::ALPHA,
+        (0..12 * 7)
+            .map(|index| ((index % 12) * 23).min(255) as u8)
+            .collect(),
+    );
+    layer
+}
+
+fn green_stroke(position: psd::core::StrokePosition) -> psd::core::Stroke {
+    let mut stroke = psd::core::Stroke::from_descriptor(&psd::core::Descriptor::default());
+    stroke.enabled = Some(true);
+    stroke.size = Some(2.0);
+    stroke.position = Some(position);
+    stroke.opacity = Some(100.0);
+    stroke.color = Some(Color::Rgb {
+        red: 0.0,
+        green: 255.0,
+        blue: 0.0,
+    });
+    stroke
+}
+
+#[test]
+fn an_outside_stroke_shows_through_the_translucent_part_of_a_layer() {
+    let mut doc = document(24, 12);
+    white_background(&mut doc);
+    let id = doc.add_layer(fading_layer());
+    let mut effects = LayerEffects::default();
+    effects
+        .strokes
+        .push(green_stroke(psd::core::StrokePosition::Outside));
+    doc.layer_mut(id)
+        .unwrap()
+        .set_layer_effects(&effects)
+        .unwrap();
+    // Four pixels in the layer is 69/255 opaque red: the stroke sits behind
+    // the layer across its whole footprint, so the rest of the pixel is green.
+    let pixel = flatten(&doc).pixel(7, 5);
+    let alpha: f32 = 69.0 / 255.0;
+    close(
+        pixel,
+        [
+            (255.0 * alpha).round() as u8,
+            (255.0 * (1.0 - alpha)).round() as u8,
+            0,
+            255,
+        ],
+    );
+}
+
+#[test]
 fn a_blurred_shadow_is_centred_on_the_shifted_matte() {
     let mut doc = document(41, 41);
     white_background(&mut doc);
@@ -580,6 +668,47 @@ fn shallow_knockout_inside_a_pass_through_group_uses_its_entry_backdrop() {
         .unwrap();
 
     close(flatten(&doc).pixel(0, 0), [127, 0, 128, 255]);
+}
+
+#[test]
+fn shallow_knockout_in_an_isolated_group_reaches_back_only_to_the_group() {
+    let mut doc = document(1, 1);
+    white_background(&mut doc);
+    doc.add_layer(solid("red backdrop", (0, 0, 1, 1), [255, 0, 0]));
+    let mut group = Layer::new_group("isolated");
+    group.blend_mode = BlendMode::NORMAL;
+    let group_id = doc.add_layer(group);
+    let mut first = solid("first", (0, 0, 1, 1), [200, 200, 200]);
+    first.blend_mode = BlendMode::MULTIPLY;
+    doc.add_layer_to_group(group_id, first).unwrap();
+    let mut second = solid("second", (0, 0, 1, 1), [100, 200, 255]);
+    second.blend_mode = BlendMode::MULTIPLY;
+    second.blocks.push(TaggedBlock::new(
+        TaggedBlockKey::new(*b"knko"),
+        vec![1, 0, 0, 0],
+    ));
+    doc.add_layer_to_group(group_id, second).unwrap();
+    // The knockout layer multiplies against the group's empty canvas, so it
+    // keeps its own colour and replaces the first layer; the group then
+    // covers the red backdrop.
+    close(flatten(&doc).pixel(0, 0), [100, 200, 255, 255]);
+}
+
+#[test]
+fn a_group_as_clipping_base_keeps_its_soft_edge() {
+    let mut doc = document(1, 1);
+    white_background(&mut doc);
+    let group = doc.add_layer(Layer::new_group("base group"));
+    let mut soft = solid("soft red", (0, 0, 1, 1), [255, 0, 0]);
+    soft.image_mut()
+        .unwrap()
+        .set_channel(ChannelKey::ALPHA, vec![128]);
+    doc.add_layer_to_group(group, soft).unwrap();
+    let id = doc.add_layer(solid("clipped", (0, 0, 1, 1), [0, 255, 0]));
+    doc.layer_mut(id).unwrap().set_clipping_mask(true);
+    // The clipped green replaces the group's colour inside its half alpha,
+    // so only green mixes with the white.
+    close(flatten(&doc).pixel(0, 0), [127, 255, 127, 255]);
 }
 
 #[test]
