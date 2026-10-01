@@ -25,8 +25,10 @@
 //! Approximated, and documented as such: the master saturation ratio is a
 //! measured table with interpolation between pinned samples; Vibrance,
 //! Color Balance, Photo Filter and Selective Color use calibrated models.
-//! Color Lookup and Content Generator are not rendered.
+//! Color Lookup renders when it embeds a `.cube` table; other embedded table
+//! formats and Content Generator are not rendered.
 
+use super::lut::Lut3d;
 use psd_core::adjustments::{
     AdjustmentData, AdjustmentKind, BlackAndWhite, ColorBalanceValues, Curve, CurveData,
     CurvePoint, GradientMap, HueRange, HueSaturation, HueSaturationValues, Levels, PhotoFilter,
@@ -141,6 +143,8 @@ pub fn apply<T: BitDepth>(
 struct Operation {
     data: AdjustmentData,
     supported: bool,
+    /// The table a Color Lookup layer embeds, when it is one we can read.
+    lookup: Option<Lut3d>,
     /// Brightness, contrast and whether the legacy algorithm applies: a
     /// modern layer keeps them in its content-generator block, a legacy one
     /// in the `brit` record.
@@ -175,27 +179,40 @@ impl Operation {
             ),
             _ => (0.0, 0.0, true),
         };
-        let supported = matches!(
-            data,
-            AdjustmentData::BrightnessContrast(_)
-                | AdjustmentData::Levels(_)
-                | AdjustmentData::Curves(_)
-                | AdjustmentData::Exposure(_)
-                | AdjustmentData::HueSaturation(_)
-                | AdjustmentData::ColorBalance(_)
-                | AdjustmentData::BlackAndWhite(_)
-                | AdjustmentData::PhotoFilter(_)
-                | AdjustmentData::ChannelMixer(_)
-                | AdjustmentData::Invert { .. }
-                | AdjustmentData::Posterize(_)
-                | AdjustmentData::Threshold(_)
-                | AdjustmentData::GradientMap(_)
-                | AdjustmentData::Vibrance(_)
-                | AdjustmentData::SelectiveColor(_)
-        );
+        // A Color Lookup layer renders when it embeds a table we can read.
+        let lookup = match data {
+            AdjustmentData::ColorLookup(settings)
+                if settings
+                    .lut_format()
+                    .is_some_and(|format| format.as_bytes() == b"LUTFormatCUBE") =>
+            {
+                settings.lut_file_data().and_then(Lut3d::parse_cube)
+            }
+            _ => None,
+        };
+        let supported = lookup.is_some()
+            || matches!(
+                data,
+                AdjustmentData::BrightnessContrast(_)
+                    | AdjustmentData::Levels(_)
+                    | AdjustmentData::Curves(_)
+                    | AdjustmentData::Exposure(_)
+                    | AdjustmentData::HueSaturation(_)
+                    | AdjustmentData::ColorBalance(_)
+                    | AdjustmentData::BlackAndWhite(_)
+                    | AdjustmentData::PhotoFilter(_)
+                    | AdjustmentData::ChannelMixer(_)
+                    | AdjustmentData::Invert { .. }
+                    | AdjustmentData::Posterize(_)
+                    | AdjustmentData::Threshold(_)
+                    | AdjustmentData::GradientMap(_)
+                    | AdjustmentData::Vibrance(_)
+                    | AdjustmentData::SelectiveColor(_)
+            );
         Self {
             data: data.clone(),
             supported,
+            lookup,
             brightness_contrast,
             gray,
             curves: match data {
@@ -284,6 +301,10 @@ impl Operation {
             AdjustmentData::GradientMap(settings) => gradient_map(color, settings),
             AdjustmentData::Vibrance(settings) => vibrance(color, &settings.descriptor),
             AdjustmentData::SelectiveColor(settings) => selective_color(color, settings),
+            AdjustmentData::ColorLookup(_) => self
+                .lookup
+                .as_ref()
+                .map_or(color, |lookup| lookup.eval(color)),
             _ => color,
         }
     }
@@ -1285,6 +1306,44 @@ mod tests {
             descriptor,
             trailing_bytes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn color_lookup_applies_an_embedded_cube_and_skips_other_formats() {
+        let lookup = |format: &str, data: &[u8]| {
+            let mut descriptor = Descriptor {
+                name: UnicodeString::new("", 1).unwrap(),
+                class_id: DescriptorKey::new("null"),
+                items: Vec::new(),
+            };
+            descriptor.insert(
+                "LUTFormat",
+                DescriptorValue::Enumerated {
+                    type_id: DescriptorKey::new("LUTFormatType"),
+                    value: DescriptorKey::new(format),
+                },
+            );
+            descriptor.insert(
+                "LUT3DFileData",
+                DescriptorValue::RawData {
+                    os_key: *b"tdta",
+                    data: data.to_vec(),
+                },
+            );
+            AdjustmentData::ColorLookup(psd_core::adjustments::ColorLookup {
+                version: 1,
+                descriptor,
+                trailing_bytes: Vec::new(),
+            })
+        };
+        // Red and blue swapped.
+        let cube = b"LUT_3D_SIZE 2\n0 0 0\n0 0 1\n0 1 0\n0 1 1\n1 0 0\n1 0 1\n1 1 0\n1 1 1\n";
+        let operation = Operation::new(&lookup("LUTFormatCUBE", cube), None, false);
+        assert!(operation.supported);
+        assert_eq!(operation.apply([1.0, 0.0, 0.0]), [0.0, 0.0, 1.0]);
+        // Formats we cannot read leave the layer unrendered.
+        assert!(!Operation::new(&lookup("LUTFormat3DL", cube), None, false).supported);
+        assert!(!Operation::new(&lookup("LUTFormatCUBE", b"junk"), None, false).supported);
     }
 
     #[test]

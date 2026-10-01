@@ -42,6 +42,7 @@ mod color;
 mod contour;
 mod effects;
 mod hue_tables;
+mod lut;
 mod masks;
 pub(crate) mod merged;
 mod paths;

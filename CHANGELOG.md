@@ -12,6 +12,14 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-10-01
+
+### Added
+
+- Color Lookup adjustment layers that embed an Iridas `.cube` table now render, using
+  tetrahedral interpolation and honouring a custom `DOMAIN_MIN`/`DOMAIN_MAX`. Layers that embed
+  another table format, a 1D table or a malformed file are still left unrendered.
+
 ## [0.12.2] - 2026-10-01
 
 ### Changed
