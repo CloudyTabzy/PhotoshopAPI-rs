@@ -705,7 +705,9 @@ impl<T: BitDepth> Compositor<'_, T> {
     /// The canvas rect a clipping group renders in when it blends as a unit
     /// ("Blend Clipped Layers as Group", on by default): a plain pixel or text
     /// base without effects, Blend If, knockout, Dissolve or channel
-    /// restrictions. Anything else keeps the layer-by-layer path.
+    /// restrictions. Anything else keeps the layer-by-layer path, which is an
+    /// approximation: it paints a clipped layer over the base already
+    /// composited with the backdrop.
     fn isolated_clip_group_rect(
         &self,
         base: usize,
@@ -2290,6 +2292,9 @@ impl<T: BitDepth> Compositor<'_, T> {
 /// A stable per-document stochastic mask for Dissolve. Fixing the sequence to
 /// layer identity and document coordinates makes repeated compositor calls
 /// agree while retaining the random coverage Photoshop's mode describes.
+///
+/// Approximation by construction: the coverage is statistically right but
+/// cannot match Photoshop's pattern pixel for pixel.
 fn dissolve_sample<T: BitDepth>(layer: &Layer<T>, x: i32, y: i32) -> f32 {
     let mut seed = u64::from(layer.layer_id().unwrap_or(0));
     if seed == 0 {

@@ -768,6 +768,12 @@ fn colorize_bytes(rgb: [i32; 3], colorization: HueSaturationValues) -> [i32; 3] 
     from_wheel(position, light, half)
 }
 
+/// Color Balance as one transfer curve per channel.
+///
+/// Approximation (matches the references we hold to within a level or two, not
+/// byte for byte): checked on 8-bit RGB only, the curve's gamma shape and the
+/// integer rounding of the midtone centre are assumed, and no 8-bit table
+/// quantisation is applied.
 fn color_balance(color: [f32; 3], settings: &psd_core::adjustments::ColorBalance) -> [f32; 3] {
     let sliders = |values: &ColorBalanceValues| {
         [
@@ -839,6 +845,11 @@ fn descriptor_descriptor(value: &DescriptorValue) -> Option<&Descriptor> {
     }
 }
 
+/// Black & White: a hue-interpolated channel mix with an optional tint.
+///
+/// Approximation: the mix and the tint (the tint colour shifted to the gray's
+/// luma) follow the format and the usual model but have not been compared with
+/// a Photoshop render.
 fn black_and_white(color: [f32; 3], settings: &BlackAndWhite) -> [f32; 3] {
     // Percent weights in slider order: reds, yellows, greens, cyans, blues,
     // magentas. Photoshop's defaults fill any the descriptor omits.
@@ -884,6 +895,9 @@ fn black_and_white(color: [f32; 3], settings: &BlackAndWhite) -> [f32; 3] {
     tint.map(|channel| (channel - tint_luma + gray).clamp(0.0, 1.0))
 }
 
+/// Approximation: the multiply in the D50 connection space and the additive
+/// luma restore reproduce a chained reference to a few levels; the density
+/// mapping, custom-colour handling and the luminosity restore are assumed.
 fn photo_filter(color: [f32; 3], settings: &PhotoFilter) -> [f32; 3] {
     let filter = match &settings.color {
         PhotoFilterColor::Xyz(components) => {
@@ -982,6 +996,9 @@ fn raw_color(raw: &psd_core::RawColor) -> Color {
     }
 }
 
+/// Approximation: the Vibrance kernel and the Saturation slider's pivot are
+/// modelled, but only a small negative amount has been checked against a
+/// render; the constants and the hue window are not verified.
 fn vibrance(color: [f32; 3], descriptor: &Descriptor) -> [f32; 3] {
     let amount =
         (descriptor_number(descriptor, "vibrance").unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0) as f32;

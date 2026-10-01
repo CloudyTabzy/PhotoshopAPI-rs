@@ -62,6 +62,9 @@ impl Lut3d {
 
     /// The table's colour for `color`, by tetrahedral interpolation, clamped
     /// to the unit range.
+    ///
+    /// Approximation: checked only on synthetic tables, with one interpolation
+    /// for every bit depth and no dithering.
     pub fn eval(&self, color: [f32; 3]) -> [f32; 3] {
         let last = (self.size - 1) as f32;
         let mut base = [0usize; 3];

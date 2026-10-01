@@ -12,6 +12,15 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.9] - 2026-10-01
+
+### Changed
+
+- The compositor's approximate models (Color Balance, Photo Filter, Vibrance, Black & White,
+  Color Lookup, bevel contour/texture, stroke handling of soft layers, noise gradients, Dissolve,
+  Precise glow, effect contours and the layer-by-layer clipping path) are now marked in their
+  documentation as not yet pixel-exact, with what each was checked against. No rendering changes.
+
 ## [0.12.8] - 2026-10-01
 
 ### Added

@@ -331,6 +331,8 @@ fn exterior_mask(
     field
 }
 
+/// Approximation (no Photoshop render of this technique was available).
+///
 /// The Precise glow technique: no blur, the field follows the exact distance
 /// from the matte. It stays full out to the spread's share of `size`, then
 /// falls away linearly to nothing at `size` pixels.
@@ -816,6 +818,9 @@ fn paint_interior_into(
 /// Shape a soft field through the effect's contour: the contour maps the
 /// field's strength (0 outside the effect's reach, 1 at its core) to the
 /// strength actually painted. A linear contour changes nothing.
+///
+/// Approximation: the point in the pipeline (after the blur and range gain) is
+/// confirmed only by a shaped shadow and glow reference.
 fn shape_by_contour(
     field: &mut [f32],
     contour: Option<&psd_core::Contour>,
@@ -1032,6 +1037,12 @@ fn plane_from_field(rect: Rect, field: &[f32], paint: &EffectPaint) -> OuterPlan
 /// `size / 2` each way. A band limit's coverage ramps over one more pixel,
 /// `clamp(band + 1 − distance)`, and the sum `alpha × inside + (1 − alpha) ×
 /// outside` keeps the band seamless across anti-aliased contour pixels.
+///
+/// Approximation: how a stroke treats a layer's soft (partly transparent)
+/// pixels uses thresholds fitted to two references: an outside stroke sits
+/// behind the layer and shows through its translucent part, an inside stroke
+/// recolours the soft interior. The Center position over soft pixels is not
+/// yet reproduced.
 fn stroke_band(
     matte: &[f32],
     width: usize,

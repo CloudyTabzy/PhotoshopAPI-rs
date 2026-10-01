@@ -96,6 +96,12 @@ fn soften_blur(field: &mut [f32], width: usize, height: usize, soften: f64) {
 const TEXTURE_RELIEF_REACH: f32 = 4.0;
 
 /// Build the highlight and shadow planes of a layer's bevel.
+///
+/// Approximation (the smooth cases match to a fraction of a level; the
+/// contour, texture and large-size cases do not yet match pixel for pixel): a
+/// tent-blurred height field, central-difference lighting scaled empirically,
+/// nine-sample lighting for anti-aliased contours, a fitted cap on texture
+/// shading, and a signed-distance field for the chisel techniques.
 pub(crate) fn build(
     content: &Content,
     coverage: &[f32],

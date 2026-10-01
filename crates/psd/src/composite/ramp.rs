@@ -211,6 +211,9 @@ fn stop_color(source: &StopSource) -> [f32; 3] {
 /// reproducible, so this draws a deterministic stand-in from the stored seed:
 /// uniformly random colours inside the stored per-channel ranges, with more
 /// stops (and so faster changes) the rougher the gradient.
+///
+/// Approximation by construction: the result resembles the original gradient
+/// but cannot match it pixel for pixel until the original generator is known.
 fn synthesize_noise_gradient(noise: &psd_core::NoiseGradient) -> psd_core::SolidGradient {
     use psd_core::NoiseColorModel;
 
