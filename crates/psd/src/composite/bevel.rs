@@ -192,14 +192,22 @@ pub(crate) fn build(
             BevelTechnique::Smooth => tent(&mut field, pw, ph, shaping),
             BevelTechnique::ChiselHard | BevelTechnique::ChiselSoft => {
                 let shaping = shaping.max(0.01) as f32;
-                let to_painted = distance_transform(&matte, pw, ph);
-                let inverse: Vec<f32> = matte.iter().map(|value| 1.0 - *value).collect();
-                let to_clear = distance_transform(&inverse, pw, ph);
+                // Signed distance, in pixels, to the 50 % coverage contour:
+                // whole-pixel distances to the other side, corrected by how
+                // far the pixel's own coverage sits from one half. One pixel
+                // beyond `size` reaches the top or bottom of the range.
+                let inside: Vec<f32> = matte.iter().map(|a| f32::from(*a >= 0.5)).collect();
+                let to_inside = distance_transform(&inside, pw, ph);
+                let outside: Vec<f32> = inside.iter().map(|v| 1.0 - *v).collect();
+                let to_outside = distance_transform(&outside, pw, ph);
                 for (index, slot) in field.iter_mut().enumerate() {
                     let alpha = matte[index].clamp(0.0, 1.0);
-                    let inside = 0.5 + 0.5 * (to_clear[index] / shaping).clamp(0.0, 1.0);
-                    let outside = 0.5 - 0.5 * (to_painted[index] / shaping).clamp(0.0, 1.0);
-                    *slot = outside * (1.0 - alpha) + inside * alpha;
+                    let signed = if inside[index] > 0.5 {
+                        to_outside[index] - 1.0 + (alpha - 0.5)
+                    } else {
+                        -(to_inside[index] - 1.0) + (alpha - 0.5)
+                    };
+                    *slot = 0.5 + 0.5 * (signed / (shaping + 1.0)).clamp(-1.0, 1.0);
                 }
                 if technique == BevelTechnique::ChiselSoft {
                     box_blur(&mut field, pw, ph, 1);
@@ -291,6 +299,41 @@ pub(crate) fn build(
             height_field[y as usize * pw + x as usize]
         }
     };
+    // An anti-aliased profile contour is evaluated on a 3 x 3 grid of
+    // sub-pixel positions reaching forward from each pixel (0, 0.33 and
+    // 0.66 px in both axes). The raw field is interpolated first, then the
+    // contour is applied per sample, then each position is lit on its own
+    // and the nine shadings are averaged.
+    let supersampled =
+        texture.is_none() && contour_lut.is_some() && bevel.contour_anti_aliased.unwrap_or(false);
+    let steps = [0.0f32, 0.33, 0.66];
+    let offsets: Vec<(f32, f32)> = if supersampled {
+        steps
+            .iter()
+            .flat_map(|&oy| steps.iter().map(move |&ox| (ox, oy)))
+            .collect()
+    } else {
+        vec![(0.0, 0.0)]
+    };
+    let raw_at = |x: i64, y: i64| -> f32 {
+        if x < 0 || y < 0 || x >= pw as i64 || y >= ph as i64 {
+            0.0
+        } else {
+            edge_mask[y as usize * pw + x as usize]
+        }
+    };
+    let sub_sample = |fx: f32, fy: f32| -> f32 {
+        let (x0, y0) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - x0, fy - y0);
+        let (x0, y0) = (x0 as i64, y0 as i64);
+        let value = raw_at(x0, y0) * (1.0 - tx) * (1.0 - ty)
+            + raw_at(x0 + 1, y0) * tx * (1.0 - ty)
+            + raw_at(x0, y0 + 1) * (1.0 - tx) * ty
+            + raw_at(x0 + 1, y0 + 1) * tx * ty;
+        contour_lut.as_ref().map_or(value, |lut| {
+            lut.sample((value / contour_range).clamp(0.0, 1.0), true)
+        })
+    };
 
     for y in 0..height {
         for x in 0..width {
@@ -305,75 +348,93 @@ pub(crate) fn build(
             if effect_alpha <= 0.0 {
                 continue;
             }
-            let (left, right) = (sample(px - 1, py), sample(px + 1, py));
-            let (top, bottom) = (sample(px, py - 1), sample(px, py + 1));
-            let base = [(left - right) * normal_scale, (top - bottom) * normal_scale];
-            let flat = left == right && top == bottom;
+            for &(ox, oy) in &offsets {
+                let share = 1.0 / offsets.len() as f32;
+                let (left, right, top, bottom) = if supersampled {
+                    (
+                        sub_sample(px as f32 - 1.0 + ox, py as f32 + oy),
+                        sub_sample(px as f32 + 1.0 + ox, py as f32 + oy),
+                        sub_sample(px as f32 + ox, py as f32 - 1.0 + oy),
+                        sub_sample(px as f32 + ox, py as f32 + 1.0 + oy),
+                    )
+                } else {
+                    (
+                        sample(px - 1, py),
+                        sample(px + 1, py),
+                        sample(px, py - 1),
+                        sample(px, py + 1),
+                    )
+                };
+                let base = [(left - right) * normal_scale, (top - bottom) * normal_scale];
+                let flat = left == right && top == bottom;
 
-            let mut shade = |sign: f32, mut weight: f32| {
-                if weight <= 0.0 {
-                    return;
-                }
-                let gradient = [base[0] * sign, base[1] * sign];
-                let length = (gradient[0] * gradient[0] + gradient[1] * gradient[1] + 1.0).sqrt();
-                let raw = gradient[0] * light[0] + gradient[1] * light[1] + light[2];
-                let surface = raw / length.max(0.0001);
-                let split = |value: f32| -> f32 {
-                    if value >= light[2] {
-                        (value - light[2]) / (1.0 - light[2]).max(0.01)
-                    } else {
-                        -((light[2] - value) / light[2].max(0.01))
+                let mut shade = |sign: f32, mut weight: f32| {
+                    if weight <= 0.0 {
+                        return;
+                    }
+                    let gradient = [base[0] * sign, base[1] * sign];
+                    let length =
+                        (gradient[0] * gradient[0] + gradient[1] * gradient[1] + 1.0).sqrt();
+                    let raw = gradient[0] * light[0] + gradient[1] * light[1] + light[2];
+                    let surface = raw / length.max(0.0001);
+                    let split = |value: f32| -> f32 {
+                        if value >= light[2] {
+                            (value - light[2]) / (1.0 - light[2]).max(0.01)
+                        } else {
+                            -((light[2] - value) / light[2].max(0.01))
+                        }
+                    };
+                    let mut lighting = split(surface);
+                    if pillow_family && raw < light[2] {
+                        lighting = -((light[2] - raw) / light[2].max(0.01));
+                    }
+                    if let Some(lut) = &gloss_lut {
+                        // The gloss contour remaps the light value itself; flat
+                        // exterior ground stays clean because a locally flat pixel
+                        // weighs its shading by the matte.
+                        if flat {
+                            weight *= matte_alpha;
+                            if weight <= 0.0 {
+                                return;
+                            }
+                        }
+                        let remapped = lut.sample(surface.clamp(0.0, 1.0), gloss_smooth);
+                        lighting = split(remapped);
+                        if pillow_family && remapped < light[2] {
+                            let remapped_raw = lut.sample(raw.clamp(0.0, 1.0), gloss_smooth);
+                            if remapped_raw < light[2] {
+                                lighting = -((light[2] - remapped_raw) / light[2].max(0.01));
+                            }
+                        }
+                    }
+                    if textured {
+                        // Texture relief reaches no farther than the bevel's own
+                        // footprint: shading is capped by the pixel's edge mask.
+                        let cap = (edge_mask[py as usize * pw + px as usize]
+                            * TEXTURE_RELIEF_REACH
+                            / light[2].max(0.05))
+                        .clamp(0.0, 1.0);
+                        lighting = lighting.clamp(-cap, cap);
+                    }
+                    if lighting > 0.0 {
+                        let strength = lighting.clamp(0.0, 1.0) * weight * highlight_paint.1;
+                        accumulate(&mut highlight, index, highlight_paint.0, strength);
+                    } else if lighting < 0.0 {
+                        let strength = (-lighting).clamp(0.0, 1.0) * weight * shadow_paint.1;
+                        accumulate(&mut shadow, index, shadow_paint.0, strength);
                     }
                 };
-                let mut lighting = split(surface);
-                if pillow_family && raw < light[2] {
-                    lighting = -((light[2] - raw) / light[2].max(0.01));
-                }
-                if let Some(lut) = &gloss_lut {
-                    // The gloss contour remaps the light value itself; flat
-                    // exterior ground stays clean because a locally flat pixel
-                    // weighs its shading by the matte.
-                    if flat {
-                        weight *= matte_alpha;
-                        if weight <= 0.0 {
-                            return;
-                        }
-                    }
-                    let remapped = lut.sample(surface.clamp(0.0, 1.0), gloss_smooth);
-                    lighting = split(remapped);
-                    if pillow_family && remapped < light[2] {
-                        let remapped_raw = lut.sample(raw.clamp(0.0, 1.0), gloss_smooth);
-                        if remapped_raw < light[2] {
-                            lighting = -((light[2] - remapped_raw) / light[2].max(0.01));
-                        }
-                    }
-                }
-                if textured {
-                    // Texture relief reaches no farther than the bevel's own
-                    // footprint: shading is capped by the pixel's edge mask.
-                    let cap = (edge_mask[py as usize * pw + px as usize] * TEXTURE_RELIEF_REACH
-                        / light[2].max(0.05))
-                    .clamp(0.0, 1.0);
-                    lighting = lighting.clamp(-cap, cap);
-                }
-                if lighting > 0.0 {
-                    let strength = lighting.clamp(0.0, 1.0) * weight * highlight_paint.1;
-                    accumulate(&mut highlight, index, highlight_paint.0, strength);
-                } else if lighting < 0.0 {
-                    let strength = (-lighting).clamp(0.0, 1.0) * weight * shadow_paint.1;
-                    accumulate(&mut shadow, index, shadow_paint.0, strength);
-                }
-            };
 
-            if pillow {
-                // The valley mirrors the rim, and an anti-aliased edge carries
-                // both: exterior-signed shading over the backdrop fraction and
-                // the flipped interior shading over the content fraction.
-                let base_sign = if direction_up { -1.0 } else { 1.0 };
-                shade(base_sign, effect_alpha * (1.0 - matte_alpha));
-                shade(-base_sign, effect_alpha * matte_alpha);
-            } else {
-                shade(direction, effect_alpha);
+                if pillow {
+                    // The valley mirrors the rim, and an anti-aliased edge carries
+                    // both: exterior-signed shading over the backdrop fraction and
+                    // the flipped interior shading over the content fraction.
+                    let base_sign = if direction_up { -1.0 } else { 1.0 };
+                    shade(base_sign, effect_alpha * (1.0 - matte_alpha) * share);
+                    shade(-base_sign, effect_alpha * matte_alpha * share);
+                } else {
+                    shade(direction, effect_alpha * share);
+                }
             }
         }
     }

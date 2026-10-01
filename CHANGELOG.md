@@ -12,6 +12,20 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.5] - 2026-10-01
+
+### Changed
+
+- A Bevel & Emboss profile contour with the anti-aliased option on is now lit at nine sub-pixel
+  positions (0, 0.33 and 0.66 px in both axes) instead of once per pixel: the raw height is
+  interpolated, the contour is applied per sample, each position is shaded separately and the nine
+  shadings are averaged. The Photoshop-rendered contour reference improves from 2.81 to 1.93 mean
+  error (worst pixel 127 to 67).
+- Chisel bevels build their height from the signed distance to the 50 % coverage contour,
+  corrected for each pixel's own coverage and scaled over `size + 1` pixels, instead of a distance
+  to the nearest fully painted or clear pixel. A gloss-contour reference improves from 0.82 to
+  0.78.
+
 ## [0.12.4] - 2026-10-01
 
 ### Changed
