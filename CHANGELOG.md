@@ -12,6 +12,19 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-10-01
+
+### Changed
+
+- Bevel textures on Inner, Outer and Stroke bevels now add a one-sided, unsmoothed relief
+  (bright texture pixels sink the surface, or lift it when inverted) instead of a centred relief
+  smoothed and faded toward the flat parts of the bevel, and their shading is capped near the
+  bevel's own footprint. Emboss and Pillow Emboss keep the earlier centred relief.
+- A texture that is not linked to the layer ignores its stored phase offset and sits at the
+  document origin; the offset only applies to a linked texture.
+- The Photoshop-rendered bevel references with textures improve from 1.23 / 0.37 to 0.79 / 0.30
+  mean error, and the document mixing a contour and a texture sub-option from 6.13 to 2.81.
+
 ## [0.12.3] - 2026-10-01
 
 ### Added

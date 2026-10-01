@@ -91,6 +91,10 @@ fn soften_blur(field: &mut [f32], width: usize, height: usize, soften: f64) {
     }
 }
 
+/// How many multiples of the edge mask (per unit of light altitude sine)
+/// texture shading may reach; fitted to a rendered reference.
+const TEXTURE_RELIEF_REACH: f32 = 4.0;
+
 /// Build the highlight and shadow planes of a layer's bevel.
 pub(crate) fn build(
     content: &Content,
@@ -164,13 +168,17 @@ pub(crate) fn build(
                 bevel.texture_scale,
                 Some(0.0),
                 bevel.texture_linked,
-                bevel.texture_phase,
+                // An unlinked texture sits at the document origin: the stored
+                // phase only offsets a texture linked to the layer.
+                bevel
+                    .texture_phase
+                    .filter(|_| bevel.texture_linked.unwrap_or(true)),
             )
         })
         .flatten();
 
     // Everything below runs on the matte padded with transparent pixels.
-    let (height_field, matte, pw, ph, pad_px) = {
+    let (height_field, matte, pw, ph, pad_px, edge_mask) = {
         let pad_px = pad.ceil() as usize + 2;
         let (pw, ph) = (width + 2 * pad_px, height + 2 * pad_px);
         let mut matte = vec![0.0f32; pw * ph];
@@ -202,6 +210,9 @@ pub(crate) fn build(
         for value in &mut field {
             *value = value.clamp(0.0, 1.0);
         }
+        // How far a pixel sits inside the bevel's own footprint, before any
+        // contour or texture reshapes the height.
+        let edge_mask = field.clone();
         if let Some(lut) = &contour_lut {
             let smooth = bevel.contour_anti_aliased.unwrap_or(false);
             for value in &mut field {
@@ -218,24 +229,31 @@ pub(crate) fn build(
                     let document_y = content.rect.top + y as i32 - pad_px as i32;
                     let (color, _) = sampler.sample(document_x, document_y);
                     let luminance = 0.299 * color[0] + 0.59 * color[1] + 0.111 * color[2];
-                    bump[y * pw + x] = if invert {
-                        luminance - 0.5
-                    } else {
-                        0.5 - luminance
+                    // Bright texture pixels sink the surface (dark ones lift it
+                    // when inverted). Bevels take the relief one-sided and
+                    // unsmoothed; the emboss family keeps a centred, lightly
+                    // smoothed relief faded toward the surface's flat parts.
+                    bump[y * pw + x] = match (pillow_family, invert) {
+                        (false, true) => luminance,
+                        (false, false) => -luminance,
+                        (true, true) => luminance - 0.5,
+                        (true, false) => 0.5 - luminance,
                     };
                 }
             }
-            box_blur(&mut bump, pw, ph, 1);
+            if pillow_family {
+                box_blur(&mut bump, pw, ph, 1);
+            }
             for index in 0..pw * ph {
-                let face = if matches!(style, BevelStyle::InnerBevel | BevelStyle::StrokeEmboss) {
-                    matte[index]
-                } else {
+                let face = if pillow_family {
                     1.0 - (field[index].clamp(0.0, 1.0) * 2.0 - 1.0).abs()
+                } else {
+                    1.0
                 };
-                field[index] += bump[index] * texture_depth * face.clamp(0.0, 1.0);
+                field[index] += bump[index] * texture_depth * face;
             }
         }
-        (field, matte, pw, ph, pad_px)
+        (field, matte, pw, ph, pad_px, edge_mask)
     };
 
     let gloss_lut = bevel.gloss_contour.as_ref().and_then(ContourLut::new);
@@ -263,6 +281,7 @@ pub(crate) fn build(
         bevel.shadow_blend_mode.unwrap_or(BlendMode::MULTIPLY),
     );
 
+    let textured = texture.is_some() && !pillow_family;
     let mut highlight = Content::new(content.rect);
     let mut shadow = Content::new(content.rect);
     let sample = |x: i64, y: i64| -> f32 {
@@ -328,6 +347,14 @@ pub(crate) fn build(
                             lighting = -((light[2] - remapped_raw) / light[2].max(0.01));
                         }
                     }
+                }
+                if textured {
+                    // Texture relief reaches no farther than the bevel's own
+                    // footprint: shading is capped by the pixel's edge mask.
+                    let cap = (edge_mask[py as usize * pw + px as usize] * TEXTURE_RELIEF_REACH
+                        / light[2].max(0.05))
+                    .clamp(0.0, 1.0);
+                    lighting = lighting.clamp(-cap, cap);
                 }
                 if lighting > 0.0 {
                     let strength = lighting.clamp(0.0, 1.0) * weight * highlight_paint.1;
