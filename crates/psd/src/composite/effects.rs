@@ -24,9 +24,12 @@
 //! A shadow, glow or satin contour reshapes the soft field's falloff after the
 //! blur and range gain.
 //!
-//! Documented gaps: noise and jitter, and the "Precise" glow techniques.
+//! Glows with the Precise technique follow the exact edge distance instead of
+//! a blur.
+//!
+//! Documented gap: noise and jitter.
 
-use psd_core::effect_enums::{GlowSource, StrokeFill, StrokePosition};
+use psd_core::effect_enums::{GlowSource, GlowTechnique, StrokeFill, StrokePosition};
 use psd_core::{BlendMode, Gradient, LayerEffects, Shadow};
 
 use super::blend;
@@ -326,6 +329,48 @@ fn exterior_mask(
     let radius = if size == 0 { 0 } else { blur.max(2) };
     blur_tent(&mut field, width, height, radius);
     field
+}
+
+/// The Precise glow technique: no blur, the field follows the exact distance
+/// from the matte. It stays full out to the spread's share of `size`, then
+/// falls away linearly to nothing at `size` pixels.
+fn precise_exterior_mask(
+    matte: &[f32],
+    width: usize,
+    height: usize,
+    size: f64,
+    spread_percent: f64,
+) -> Vec<f32> {
+    let size = size.max(0.0) as f32;
+    let hold = ((spread_percent / 100.0).clamp(0.0, 1.0) as f32) * size;
+    let painted: Vec<f32> = matte.iter().map(|a| f32::from(*a >= 0.5)).collect();
+    let distance = distance_transform(&painted, width, height);
+    matte
+        .iter()
+        .zip(&distance)
+        .map(|(&alpha, &distance)| {
+            // Distances run from pixel centres; the edge sits half a pixel out.
+            let reach = (distance - 0.5).max(0.0);
+            let falloff = if size <= hold {
+                f32::from(reach <= hold)
+            } else {
+                (1.0 - (reach - hold) / (size - hold)).clamp(0.0, 1.0)
+            };
+            falloff.max(alpha.clamp(0.0, 1.0))
+        })
+        .collect()
+}
+
+/// The interior mirror of [`precise_exterior_mask`].
+fn precise_interior_mask(
+    matte: &[f32],
+    width: usize,
+    height: usize,
+    size: f64,
+    choke_percent: f64,
+) -> Vec<f32> {
+    let inverse: Vec<f32> = matte.iter().map(|value| 1.0 - value).collect();
+    precise_exterior_mask(&inverse, width, height, size, choke_percent)
 }
 
 /// The interior mirror: the inverse matte dilates by the choke, then blurs.
@@ -720,8 +765,13 @@ fn paint_interior_into(
     if let Some(glow) = effects.inner_glow.as_ref().filter(|g| enabled(g.enabled)) {
         let size = glow.size.unwrap_or(0.0);
         let choke = glow.spread.unwrap_or(0.0);
+        let precise = glow.technique == Some(GlowTechnique::Precise);
         let mut field = with_padding(coverage, width, height, size, |matte, w, h| {
-            interior_mask(matte, w, h, size, choke)
+            if precise {
+                precise_interior_mask(matte, w, h, size, choke)
+            } else {
+                interior_mask(matte, w, h, size, choke)
+            }
         });
         range_gain(&mut field, glow.range.unwrap_or(100.0));
         shape_by_contour(&mut field, glow.contour.as_ref(), glow.anti_aliased);
@@ -900,7 +950,12 @@ pub(crate) fn build_outer(
     }
 
     if let Some(glow) = effects.outer_glow.as_ref().filter(|g| enabled(g.enabled)) {
-        let mut field = exterior_mask(
+        let mask = if glow.technique == Some(GlowTechnique::Precise) {
+            precise_exterior_mask
+        } else {
+            exterior_mask
+        };
+        let mut field = mask(
             &own,
             out_width,
             out_height,

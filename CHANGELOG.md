@@ -12,6 +12,15 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.8] - 2026-10-01
+
+### Added
+
+- Glows with the Precise technique follow the exact distance from the layer's edge instead of a
+  blur: full out to the spread's share of the size, then a linear fall to nothing at the size.
+  This is an approximation drawn from how the technique is described; no Photoshop render of it was
+  available to check against.
+
 ## [0.12.7] - 2026-10-01
 
 ### Added

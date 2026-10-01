@@ -396,6 +396,43 @@ fn an_outside_stroke_shows_through_the_translucent_part_of_a_layer() {
 }
 
 #[test]
+fn a_precise_glow_falls_off_linearly_and_stops_at_its_size() {
+    let mut doc = document(40, 40);
+    white_background(&mut doc);
+    let id = doc.add_layer(solid("box", (14, 14, 26, 26), [255, 255, 255]));
+    let mut effects = LayerEffects::default();
+    let mut glow = psd::core::Glow::new(psd::core::GlowKind::Outer);
+    glow.size = Some(8.0);
+    glow.spread = Some(0.0);
+    glow.opacity = Some(100.0);
+    glow.technique = Some(psd::core::GlowTechnique::Precise);
+    glow.range = Some(100.0);
+    glow.blend_mode = Some(BlendMode::NORMAL);
+    glow.color = Some(Color::Rgb {
+        red: 0.0,
+        green: 0.0,
+        blue: 0.0,
+    });
+    effects.outer_glow = Some(glow);
+    doc.layer_mut(id)
+        .unwrap()
+        .set_layer_effects(&effects)
+        .unwrap();
+    let image = flatten(&doc);
+    let value = |distance: u32| i32::from(image.pixel(13 - (distance - 1), 20)[0]);
+    // Strength falls by about an eighth of full per pixel out to the size.
+    assert!(value(1) < 60, "{}", value(1));
+    assert!(
+        value(4) > value(1) && value(7) > value(4),
+        "{} {} {}",
+        value(1),
+        value(4),
+        value(7)
+    );
+    assert_eq!(value(9), 255, "beyond the size the backdrop is untouched");
+}
+
+#[test]
 fn a_shadow_contour_reshapes_its_falloff() {
     let render = |contour: Option<psd::core::Contour>| {
         let mut doc = document(40, 40);
