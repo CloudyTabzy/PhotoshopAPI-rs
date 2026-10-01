@@ -28,9 +28,9 @@
 //! Color Lookup and Content Generator are not rendered.
 
 use psd_core::adjustments::{
-    AdjustmentData, AdjustmentKind, ColorBalanceValues, Curve, CurveData, CurvePoint, GradientMap,
-    HueRange, HueSaturation, HueSaturationValues, Levels, PhotoFilter, PhotoFilterColor,
-    SelectiveColor,
+    AdjustmentData, AdjustmentKind, BlackAndWhite, ColorBalanceValues, Curve, CurveData,
+    CurvePoint, GradientMap, HueRange, HueSaturation, HueSaturationValues, Levels, PhotoFilter,
+    PhotoFilterColor, SelectiveColor,
 };
 use psd_core::{
     Color, Descriptor, DescriptorValue, GradientKind, Result, SolidGradient, StopSource,
@@ -244,21 +244,26 @@ impl Operation {
             }
             AdjustmentData::HueSaturation(settings) => hue_saturation(color, settings),
             AdjustmentData::ColorBalance(settings) => color_balance(color, settings),
-            AdjustmentData::BlackAndWhite(settings) => black_and_white(color, &settings.descriptor),
+            AdjustmentData::BlackAndWhite(settings) => black_and_white(color, settings),
             AdjustmentData::PhotoFilter(settings) => photo_filter(color, settings),
             AdjustmentData::ChannelMixer(settings) => {
-                let mut out = [0.0; 3];
-                for (channel, mix) in settings.mixes.iter().take(3).enumerate() {
+                let mix_channel = |mix: &psd_core::adjustments::ChannelMix| -> f32 {
                     let mut value = f32::from(mix.constant) / 100.0;
                     for (source, amount) in mix.sources.iter().take(3).enumerate() {
                         value += color[source] * f32::from(*amount) / 100.0;
                     }
-                    out[channel] = value.clamp(0.0, 1.0);
-                }
+                    value.clamp(0.0, 1.0)
+                };
                 if settings.monochrome {
-                    let gray = luminance(out);
-                    [gray, gray, gray]
+                    // Monochrome mixes one Gray output, stored in the first
+                    // output record; the other records are unused.
+                    let gray = settings.mixes.first().map_or(0.0, mix_channel);
+                    [gray; 3]
                 } else {
+                    let mut out = color;
+                    for (channel, mix) in settings.mixes.iter().take(3).enumerate() {
+                        out[channel] = mix_channel(mix);
+                    }
                     out
                 }
             }
@@ -808,90 +813,48 @@ fn descriptor_descriptor(value: &DescriptorValue) -> Option<&Descriptor> {
     }
 }
 
-/// A descriptor colour (`Rd  `/`Grn `/`Bl  ` doubles) as 0..1 RGB.
-fn descriptor_rgb(value: &DescriptorValue) -> Option<[f32; 3]> {
-    let descriptor = descriptor_descriptor(value)?;
-    Color::from_descriptor(descriptor)
-        .as_ref()
-        .map(ramp::color_rgb)
-}
+fn black_and_white(color: [f32; 3], settings: &BlackAndWhite) -> [f32; 3] {
+    // Percent weights in slider order: reds, yellows, greens, cyans, blues,
+    // magentas. Photoshop's defaults fill any the descriptor omits.
+    const DEFAULTS: [f32; 6] = [0.4, 0.6, 0.4, 0.6, 0.2, 0.8];
+    let stored = settings.weights();
+    let weights: [f32; 6] = std::array::from_fn(|index| {
+        stored[index].map_or(DEFAULTS[index], |value| (value / 100.0) as f32)
+    });
 
-fn black_and_white(color: [f32; 3], descriptor: &Descriptor) -> [f32; 3] {
-    let weight = |key: &str, fallback: f32| -> f32 {
-        descriptor_number(descriptor, key).map_or(fallback, |value| (value / 100.0) as f32)
-    };
-    let reds = weight("reds", 0.4);
-    let yellows = weight("yellows", 0.6);
-    let greens = weight("greens", 0.4);
-    let cyans = weight("cyans", 0.6);
-    let blues = weight("blues", 0.2);
-    let magentas = weight("magentas", 0.8);
-
-    // Each pixel takes the mix of the two primaries its hue sits between.
-    let (r, g, b) = (color[0], color[1], color[2]);
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
+    // The gray part of the pixel (its minimum channel) stays; the saturated
+    // part scales by the slider weight at its hue, interpolated linearly
+    // between the neighbouring sliders.
+    let max = color[0].max(color[1]).max(color[2]);
+    let min = color[0].min(color[1]).min(color[2]);
     let chroma = max - min;
     let gray = if chroma <= 1e-6 {
         max
     } else {
-        let mut value = 0.0f32;
-        // Primary shares: how far each channel is above the minimum.
-        let shares = [r - min, g - min, b - min];
-        let total: f32 = shares.iter().sum();
-        let pair_weights = [
-            (reds, yellows, greens),  // red-dominant
-            (greens, yellows, cyans), // green-dominant
-            (blues, cyans, magentas), // blue-dominant
-        ];
-        for (index, share) in shares.iter().enumerate() {
-            if *share <= 0.0 {
-                continue;
-            }
-            let (primary, secondary, _tertiary) = pair_weights[index];
-            // The two secondaries split the remainder by their own shares.
-            let other: Vec<(usize, f32)> = shares
-                .iter()
-                .enumerate()
-                .filter(|(other, share)| *other != index && **share > 0.0)
-                .map(|(other, share)| (other, *share))
-                .collect();
-            let other_total: f32 = other.iter().map(|(_, share)| *share).sum();
-            let mut local = primary * share;
-            for (other_index, other_share) in other {
-                let secondary_weight = match (index, other_index) {
-                    (0, 1) => yellows,
-                    (0, 2) => magentas,
-                    (1, 0) => yellows,
-                    (1, 2) => cyans,
-                    (2, 0) => magentas,
-                    _ => cyans,
-                };
-                let _ = secondary;
-                let portion = if other_total > 0.0 {
-                    other_share / other_total
-                } else {
-                    0.0
-                };
-                local += secondary_weight * other_share * portion;
-            }
-            value += local;
-        }
-        (value / total.max(1e-6)).clamp(0.0, 1.0)
+        let sector = if max == color[0] {
+            ((color[1] - color[2]) / chroma).rem_euclid(6.0)
+        } else if max == color[1] {
+            2.0 + (color[2] - color[0]) / chroma
+        } else {
+            4.0 + (color[0] - color[1]) / chroma
+        };
+        let index = (sector.floor() as usize) % 6;
+        let fraction = sector - sector.floor();
+        let weight = weights[index] * (1.0 - fraction) + weights[(index + 1) % 6] * fraction;
+        (min + chroma * weight).clamp(0.0, 1.0)
     };
 
-    let Some(outer) = descriptor.get("tintColor").and_then(descriptor_descriptor) else {
+    if settings.use_tint() != Some(true) {
         return [gray, gray, gray];
-    };
-    let amount = (descriptor_number(outer, "tint").unwrap_or(0.0) / 100.0) as f32;
-    let Some(tint) = outer.get("tintColor").and_then(descriptor_rgb) else {
-        return [gray, gray, gray];
-    };
-    let mut out = [0.0; 3];
-    for channel in 0..3 {
-        out[channel] = gray * (1.0 - amount) + tint[channel] * gray * amount;
     }
-    out
+    let Some(tint) = settings
+        .tint_color()
+        .and_then(|tint| Color::from_descriptor(tint).as_ref().map(ramp::color_rgb))
+    else {
+        return [gray, gray, gray];
+    };
+    // The tint colour's hue and saturation at the gray's lightness.
+    set_hsl_lightness(tint, gray)
 }
 
 fn photo_filter(color: [f32; 3], settings: &PhotoFilter) -> [f32; 3] {
@@ -1209,6 +1172,66 @@ pub(super) fn paint_content<T: BitDepth>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use psd_core::{DescriptorKey, UnicodeString};
+
+    fn black_and_white_settings(weights: [i32; 6]) -> BlackAndWhite {
+        let mut descriptor = Descriptor {
+            name: UnicodeString::new("", 1).unwrap(),
+            class_id: DescriptorKey::new("null"),
+            items: Vec::new(),
+        };
+        let keys = ["Rd  ", "Yllw", "Grn ", "Cyn ", "Bl  ", "Mgnt"];
+        for (key, value) in keys.into_iter().zip(weights) {
+            descriptor.insert(key, DescriptorValue::Integer(value));
+        }
+        BlackAndWhite {
+            descriptor,
+            trailing_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn monochrome_channel_mixer_uses_only_the_first_record() {
+        let record = |sources: [i16; 4]| psd_core::adjustments::ChannelMix {
+            sources,
+            constant: 0,
+        };
+        let mixer = psd_core::adjustments::ChannelMixer {
+            version: 1,
+            monochrome: true,
+            mixes: vec![
+                record([50, 50, 0, 0]),
+                record([0, 100, 0, 0]),
+                record([0, 0, 100, 0]),
+                record([0, 0, 0, 100]),
+            ],
+            trailing_bytes: Vec::new(),
+        };
+        let operation = Operation::new(&AdjustmentData::ChannelMixer(mixer), None, false);
+        let out = operation.apply([0.8, 0.4, 0.1]);
+        assert!(
+            out.iter().all(|value| (value - 0.6).abs() < 1e-5),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn black_and_white_reads_the_slider_keys_and_keeps_pale_colours_light() {
+        let settings = black_and_white_settings([10, 60, 40, 60, 20, 80]);
+        // A pure red takes its slider weight; a pale red keeps its gray floor.
+        let red = black_and_white([1.0, 0.0, 0.0], &settings);
+        assert!((red[0] - 0.1).abs() < 1e-5, "{red:?}");
+        let pale = black_and_white([1.0, 0.8, 0.8], &settings);
+        assert!((pale[0] - (0.8 + 0.2 * 0.1)).abs() < 1e-5, "{pale:?}");
+        // Halfway between red and yellow the weights interpolate.
+        let orange = black_and_white([1.0, 0.5, 0.0], &settings);
+        assert!(
+            (orange[0] - 0.5 * (0.1 + 0.6) / 1.0 * 1.0).abs() < 1e-5,
+            "{orange:?}"
+        );
+        // A gray passes through unchanged.
+        assert_eq!(black_and_white([0.3; 3], &settings), [0.3; 3]);
+    }
 
     #[test]
     fn modern_brightness_contrast_follows_photoshops_curve() {

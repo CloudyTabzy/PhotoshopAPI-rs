@@ -12,6 +12,19 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-10-01
+
+### Fixed
+
+- Black & White adjustment layers now render from their stored slider weights. The compositor
+  looked up the wrong descriptor keys, so every layer used the default weights, and it dropped the
+  gray floor of pale colours (a pale red rendered as a dark gray). A pixel now keeps its minimum
+  channel and scales the rest by the slider weight at its hue, interpolated between neighbouring
+  sliders. A tinted layer renders the tint colour at the gray's lightness (not yet checked against
+  a Photoshop render).
+- Monochrome Channel Mixer layers mix the single gray output stored in the first record instead of
+  taking the luma of the three colour outputs.
+
 ## [0.12.0] - 2026-10-01
 
 ### Added
