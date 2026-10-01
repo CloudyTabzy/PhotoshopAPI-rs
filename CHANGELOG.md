@@ -12,6 +12,26 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.13] - 2026-10-02
+
+### Fixed
+
+- A stroked shape layer is no longer clipped to its own path. A stroke that sits on or outside the
+  path put half its ring beyond the outline, and the composite cut that half away, leaving a
+  ring about half as wide. Stored pixels of stroked shape layers now composite whole, which brings
+  the shape documents of one reference set, and a stroke-only shape saved by an older Photoshop
+  at 182.88 ppi, to an exact match (merged-reference mean error over the 202-document set
+  1.252 → 1.153).
+- Shape layers that keep their paint in a `vscg` content block (the form newer Photoshop versions
+  write, in place of a `SoCo`/`GdFl`/`PtFl` fill block) are recognised as fill layers. They render
+  from their path when the pixels stored beside them are missing or hold clearly less ink than the
+  stroke should; otherwise the stored pixels stay in use, which agrees better with every
+  reference on hand.
+- The live stroke of a shape with several subpaths (combine, subtract, intersect, exclude) now
+  follows the outline of the combined shape: arcs of one subpath that end up inside another are no
+  longer stroked.
+
+
 ## [0.12.12] - 2026-10-02
 
 ### Added

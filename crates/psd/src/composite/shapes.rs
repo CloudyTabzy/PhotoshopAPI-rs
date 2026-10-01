@@ -91,6 +91,36 @@ impl<T: BitDepth> Compositor<'_, T> {
         Some((stroke, style))
     }
 
+    /// Whether the pixels stored beside a stroked shape hold clearly less ink
+    /// than its stroke should. Some writers keep the ring at an unscaled
+    /// width in a document whose resolution is not 72 ppi; the stored ring is
+    /// then thinner than the stroke the document asks for, and the live
+    /// stroke is the better source.
+    pub(super) fn stored_pixels_miss_stroke(&self, layer: &Layer<T>) -> bool {
+        let Some((_, style)) = self.vector_stroke(layer) else {
+            return false;
+        };
+        let Some(mask) = layer.vector_mask().ok().flatten() else {
+            return false;
+        };
+        let Some(alpha) = layer
+            .channels()
+            .and_then(|channels| channels.get(crate::ChannelKey::ALPHA))
+        else {
+            return false;
+        };
+        let stored: f64 = alpha.iter().map(|sample| f64::from(sample.to_f32())).sum();
+        let (doc_w, doc_h) = (self.document.width, self.document.height);
+        let rect = Rect::new(0, 0, doc_h as i32, doc_w as i32);
+        let shape = rasterize_path(&mask.path, doc_w, doc_h, rect);
+        let live: f64 = stroke_coverage(&mask.path, (doc_w, doc_h), rect, &style, &shape)
+            .iter()
+            .map(|value| f64::from(*value))
+            .sum();
+        // A quarter of slack, and a few pixels for rounding on tiny shapes.
+        live > stored * 1.25 + 4.0
+    }
+
     /// Shape a fill with its layer's vector path and stroke. `fill` covers the
     /// canvas with the fill's colours; the result does too, with the path, the
     /// stroke, the feather and the density folded into its alpha.

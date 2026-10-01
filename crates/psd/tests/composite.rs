@@ -572,6 +572,77 @@ fn generated_shape_layers_render_from_their_paths() {
     assert!(band[1] > 120 && band[0] < 100, "{band:?}");
     assert_eq!(image.pixel(16, 45), background);
 }
+/// A shape layer whose paint sits in a `vscg` content block (the form newer
+/// Photoshop versions write) renders from its path and stroke, not from the
+/// pixels stored beside them.
+#[test]
+fn shape_paint_in_a_content_block_renders_live() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/generated/Vectors/vector_shapes_8bit.psd");
+    let mut doc = LayeredFile::<u8>::read(path).unwrap();
+    let expected = flatten(&doc);
+    let ids: Vec<_> = doc.layers_with_ids().map(|(id, _)| id).collect();
+    let mut blanked = 0;
+    for id in ids {
+        let layer = doc.layer_mut(id).unwrap();
+        if !layer
+            .blocks
+            .blocks
+            .iter()
+            .any(|block| block.key == TaggedBlockKey::new(*b"vscg"))
+        {
+            continue;
+        }
+        for (_, samples) in layer.channels_mut().unwrap().iter_mut() {
+            samples.fill(0);
+        }
+        blanked += 1;
+    }
+    assert!(blanked >= 2);
+    let live = flatten(&doc);
+    // The ellipse fill, the frame's band and its empty middle all survive.
+    for (x, y) in [(46, 12), (6, 45), (16, 45), (36, 4), (1, 1)] {
+        assert_eq!(live.pixel(x, y), expected.pixel(x, y), "({x}, {y})");
+    }
+}
+
+/// The stored pixels of a stroked shape already hold its stroke, including
+/// the half that lies outside the path: the path must not clip them.
+#[test]
+fn a_stroke_outside_the_path_is_not_clipped_by_it() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/generated/Vectors/vector_shapes_8bit.psd");
+    let mut doc = LayeredFile::<u8>::read(path).unwrap();
+    let id = doc
+        .layers_with_ids()
+        .find(|(_, layer)| layer.name == "Ellipse")
+        .map(|(id, _)| id)
+        .unwrap();
+    let layer = doc.layer_mut(id).unwrap();
+    // The ellipse spans x 34..58; leave room on its left for the ring.
+    layer.bounds = Rect::new(4, 30, 24, 58);
+    let (width, height) = (28usize, 20usize);
+    let mut ink = vec![0u8; width * height];
+    // Enough ink in the stored pixels that they stay the source: a block of
+    // columns, starting two pixels left of the path's leftmost point.
+    for row in 0..height {
+        for column in 2..8 {
+            ink[row * width + column] = 255;
+        }
+    }
+    let channels = layer.channels_mut().unwrap();
+    for key in [
+        ChannelKey::color(0),
+        ChannelKey::color(1),
+        ChannelKey::color(2),
+    ] {
+        channels.insert(key, vec![0u8; width * height]);
+    }
+    channels.insert(ChannelKey::ALPHA, ink);
+    let image = flatten(&doc);
+    let dark = image.pixel(32, 14);
+    assert!(dark[0] < 40 && dark[1] < 40 && dark[2] < 40, "{dark:?}");
+}
 
 #[test]
 fn lazy_pixels_require_explicit_decoding_without_mutating_the_document() {

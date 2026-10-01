@@ -2277,19 +2277,9 @@ impl<T: BitDepth> Compositor<'_, T> {
         // A solid, gradient or pattern fill layer, or a shape layer, which
         // Photoshop stores as a fill layer with a vector mask and no pixels.
         match &layer.kind {
-            LayerKind::Adjustment(_) | LayerKind::Shape(_) => layer
-                .adjustments()
-                .map(|blocks| {
-                    blocks.iter().any(|block| {
-                        matches!(
-                            block.kind,
-                            psd_core::AdjustmentKind::SolidColor
-                                | psd_core::AdjustmentKind::GradientFill
-                                | psd_core::AdjustmentKind::PatternFill
-                        )
-                    })
-                })
-                .unwrap_or(false),
+            LayerKind::Adjustment(_) | LayerKind::Shape(_) => {
+                adjustments::fill_source(self, layer).is_some()
+            }
             _ => false,
         }
     }

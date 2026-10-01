@@ -8,6 +8,7 @@
 
 use psd_core::vector::VectorPath;
 
+use super::effects::distance_transform;
 use super::paths::{fill, flatten_subpath, FillRule, Polygon};
 use crate::layer::Rect;
 
@@ -365,7 +366,57 @@ pub(crate) fn stroke_coverage(
             coverage[index] = coverage[index] + side - coverage[index] * side;
         }
     }
+    if subpaths.len() > 1 {
+        let reach = if style.alignment == Alignment::Center {
+            style.width / 2.0
+        } else {
+            style.width
+        };
+        keep_near_outline(&mut coverage, fill_coverage, rect, reach as f32);
+    }
     coverage
+}
+
+/// Strokes belong to the outline of the combined shape, not to each subpath:
+/// where subpaths overlap, the arcs that end up inside the shape (or, for a
+/// subtraction, outside it) are not stroked. Zero the stroke wherever the
+/// pixel is farther than `reach` (plus a margin that keeps anti-aliased band
+/// edges intact) from the outline of `fill_coverage`.
+///
+/// Pixels within `reach` of the plane's edge are left alone: a band that is
+/// visible there may belong to an outline that lies beyond the plane.
+fn keep_near_outline(coverage: &mut [f32], fill_coverage: &[f32], rect: Rect, reach: f32) {
+    let (width, height) = (rect.width().max(0) as usize, rect.height().max(0) as usize);
+    if width == 0 || height == 0 || fill_coverage.len() < width * height {
+        return;
+    }
+    let margin = 0.0f32;
+    let inside: Vec<f32> = fill_coverage
+        .iter()
+        .take(width * height)
+        .map(|value| if *value >= 0.5 { 1.0 } else { 0.0 })
+        .collect();
+    if inside.iter().all(|value| *value == inside[0]) {
+        return;
+    }
+    let outside: Vec<f32> = inside.iter().map(|value| 1.0 - value).collect();
+    let to_inside = distance_transform(&inside, width, height);
+    let to_outside = distance_transform(&outside, width, height);
+    let edge = reach + margin;
+    for y in 0..height {
+        for x in 0..width {
+            let from_edge = x.min(y).min(width - 1 - x).min(height - 1 - y) as f32;
+            if from_edge <= edge {
+                continue;
+            }
+            let index = y * width + x;
+            // Each transform is zero on its own set; the other one measures
+            // how far the pixel is from the outline.
+            // Centre-to-centre distances overshoot the outline by half a pixel.
+            let distance = to_inside[index].max(to_outside[index]) - 0.5;
+            coverage[index] *= (edge - distance + 1.0).clamp(0.0, 1.0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +474,32 @@ mod tests {
         // The pixel at the outer corner, (9, 1).
         assert_eq!(miter[12 + 9], 1.0);
         assert!(bevel[12 + 9] < 0.6);
+    }
+
+    #[test]
+    fn strokes_far_from_the_combined_outline_are_dropped() {
+        // A disc of radius 12 in a 64 × 64 plane, with a stroke plane that is
+        // everywhere set: only the pixels near the disc's outline survive.
+        let size = 64usize;
+        let rect = Rect::new(0, 0, size as i32, size as i32);
+        let disc: Vec<f32> = (0..size * size)
+            .map(|index| {
+                let (x, y) = ((index % size) as f32 - 32.0, (index / size) as f32 - 32.0);
+                if x * x + y * y <= 144.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let mut coverage = vec![1.0f32; size * size];
+        keep_near_outline(&mut coverage, &disc, rect, 1.0);
+        let at = |x: usize, y: usize| coverage[y * size + x];
+        // The centre is deep inside; the outline pixel stays; the corner is
+        // outside the plane's edge margin and is left alone.
+        assert_eq!(at(32, 32), 0.0);
+        assert_eq!(at(44, 32), 1.0);
+        assert_eq!(at(1, 1), 1.0);
     }
 
     #[test]

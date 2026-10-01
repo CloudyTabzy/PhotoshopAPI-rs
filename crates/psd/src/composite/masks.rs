@@ -128,6 +128,19 @@ impl<T: BitDepth> Compositor<'_, T> {
         if mask.disabled() {
             return None;
         }
+        // A stroked shape's stored pixels already hold the stroke, which
+        // reaches past the path on its outer side; clipping them to the path
+        // would cut the ring in half. (Upstream's mask handling has no such
+        // case: it never composites a vector mask.)
+        if layer.vector_blocks().is_ok_and(|blocks| {
+            blocks.iter().any(|block| {
+                matches!(&block.data, psd_core::vector::VectorData::Stroke(stroke)
+                    if stroke.stroke_enabled() != Some(false))
+            })
+        }) && layer.is_shape_layer()
+        {
+            return None;
+        }
         let params = Self::params(layer);
         let feather = params.vector_mask_feather.unwrap_or(0.0);
         let margin = if feather > 0.0 {

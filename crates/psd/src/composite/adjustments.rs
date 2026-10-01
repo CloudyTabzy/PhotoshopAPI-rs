@@ -34,6 +34,7 @@ use psd_core::adjustments::{
     CurvePoint, GradientMap, HueRange, HueSaturation, HueSaturationValues, Levels, PhotoFilter,
     PhotoFilterColor, SelectiveColor,
 };
+use psd_core::vector::VectorData;
 use psd_core::{
     Color, Descriptor, DescriptorValue, GradientKind, Result, SolidGradient, StopSource,
     TransparencyStop,
@@ -1123,22 +1124,53 @@ fn gradient_map(color: [f32; 3], settings: &GradientMap) -> [f32; 3] {
     super::effects::gradient_sample(&gradient, luminance(color))
 }
 
+/// The paint a fill layer or a shape layer carries: an adjustment-block fill
+/// (`SoCo`, `GdFl`, `PtFl`), or the fill content block (`vscg`) that newer
+/// Photoshop versions write for a shape layer instead.
+///
+/// Approximation: a content-block shape with an enabled stroke is drawn live
+/// only when the pixels stored beside it hold clearly less ink than its
+/// stroke should (`stored_pixels_miss_stroke`). Otherwise the stored pixels
+/// stay in use: against the references they agree better than the live
+/// stroke does, which still differs in dash phase on closed paths, in how an
+/// inside stroke meets a combined outline, and in the placement of the ring.
+pub(super) fn fill_source<T: BitDepth>(
+    compositor: &Compositor<'_, T>,
+    layer: &Layer<T>,
+) -> Option<(AdjustmentKind, Descriptor)> {
+    let from_adjustment = layer.adjustments().ok().and_then(|blocks| {
+        blocks.into_iter().find_map(|block| match block.data {
+            AdjustmentData::Fill(settings) if block.kind.is_fill() => {
+                Some((block.kind, settings.descriptor))
+            }
+            _ => None,
+        })
+    });
+    from_adjustment.or_else(|| {
+        let blocks = layer.vector_blocks().ok()?;
+        let stroked = blocks.iter().any(|block| match &block.data {
+            VectorData::Stroke(stroke) => stroke.stroke_enabled() != Some(false),
+            _ => false,
+        });
+        if stroked && !compositor.stored_pixels_miss_stroke(layer) {
+            return None;
+        }
+        blocks.into_iter().find_map(|block| match block.data {
+            VectorData::Content(content) => {
+                content.kind().map(|kind| (kind, content.fill.descriptor))
+            }
+            _ => None,
+        })
+    })
+}
+
 /// A fill layer's content: solid color, gradient or pattern over the whole
 /// canvas, with the layer's masks.
 pub fn fill_content<T: BitDepth>(
     compositor: &Compositor<'_, T>,
     layer: &Layer<T>,
 ) -> Result<Option<Content>> {
-    let blocks = layer.adjustments()?;
-    let Some(block) = blocks.iter().find(|block| {
-        matches!(
-            block.kind,
-            AdjustmentKind::SolidColor | AdjustmentKind::GradientFill | AdjustmentKind::PatternFill
-        )
-    }) else {
-        return Ok(None);
-    };
-    let AdjustmentData::Fill(settings) = &block.data else {
+    let Some((kind, descriptor)) = fill_source(compositor, layer) else {
         return Ok(None);
     };
     let rect = Rect::new(
@@ -1147,9 +1179,7 @@ pub fn fill_content<T: BitDepth>(
         compositor.document.height as i32,
         compositor.document.width as i32,
     );
-    let Some(mut content) =
-        paint_content(compositor, layer, &settings.descriptor, block.kind, rect)
-    else {
+    let Some(mut content) = paint_content(compositor, layer, &descriptor, kind, rect) else {
         return Ok(None);
     };
     // A shape's path is part of its content (`shapes`); a plain fill layer
