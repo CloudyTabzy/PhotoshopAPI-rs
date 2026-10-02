@@ -7,15 +7,16 @@
 #[allow(unused_imports)]
 use std::sync::Arc;
 
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
+use numpy::ndarray::Array3;
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray2};
 use psd::core::{
     ArtboardBackground, ArtboardRect, ArtboardSettings, BitDepth as CoreBitDepth, Color, ColorMode,
     FileHeader, TaggedBlockKey, Version,
 };
 use psd::{
-    color_channel_count, AntiAliasMethod, BitDepth, ChannelKey, FontScript, FontType, Layer,
-    LayerId, LayeredFile, LinkedStorage, Rect, TextBoxBounds, TextLayerBuilder, TextWarpRotation,
-    TextWritingDirection,
+    color_channel_count, AntiAliasMethod, BitDepth, ChannelKey, CompositeOptions, FontScript,
+    FontType, Layer, LayerId, LayeredFile, LinkedStorage, Rect, TextBoxBounds, TextLayerBuilder,
+    TextWarpRotation, TextWritingDirection,
 };
 use pyo3::exceptions::{
     PyFileExistsError, PyIndexError, PyKeyError, PyRuntimeError, PyTypeError, PyValueError,
@@ -25,7 +26,7 @@ use pyo3::types::{PyBytes, PyDict};
 
 use crate::convert::{
     bit_depth_to_py, color_mode_from_py, compression_from_py, enum_value, icc_bytes, index_value,
-    linkage_from_py, linkage_number, py_enum, read_options_from_py, Io,
+    linkage_from_py, linkage_number, py_enum, read_options_from_py, target_bit_depth_from_py, Io,
 };
 use crate::layer_ops::{self, check_name};
 use crate::smart_warp::PySmartWarp;
@@ -62,6 +63,34 @@ depth_module!(
     "TextLayer_8bit",
     "SmartObjectLayer_8bit"
 );
+
+/// Convert and wrap a document at the requested depth-specific Python class.
+pub(crate) fn convert_document<T: BitDepth>(
+    py: Python<'_>,
+    source: &LayeredFile<T>,
+    target_depth: u16,
+) -> PyResult<Py<PyAny>> {
+    match target_depth {
+        8 => Ok(Py::new(
+            py,
+            depth8::PyDocument::from_rust(source.convert_bit_depth::<u8>().map_err(psd_error)?),
+        )?
+        .into_any()),
+        16 => Ok(Py::new(
+            py,
+            depth16::PyDocument::from_rust(source.convert_bit_depth::<u16>().map_err(psd_error)?),
+        )?
+        .into_any()),
+        32 => Ok(Py::new(
+            py,
+            depth32::PyDocument::from_rust(source.convert_bit_depth::<f32>().map_err(psd_error)?),
+        )?
+        .into_any()),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(
+            "target bit depth must be 8, 16 or 32",
+        )),
+    }
+}
 depth_module!(
     depth16,
     u16,

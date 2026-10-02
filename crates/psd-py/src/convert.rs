@@ -176,6 +176,29 @@ pub fn bit_depth_to_py(py: Python<'_>, depth: u16) -> PyResult<Py<PyAny>> {
     py_enum(py, "BitDepth", raw)
 }
 
+/// Target sample depth accepted by `LayeredFile.convert_bit_depth`.
+/// Plain integers use bit counts; the Python `BitDepth` enum keeps its
+/// upstream discriminants.
+pub fn target_bit_depth_from_py(value: &Bound<'_, PyAny>) -> PyResult<u16> {
+    let raw = enum_value(value)?;
+    if is_enum_member(value, "BitDepth")? {
+        return match raw {
+            1 => Ok(8),
+            2 => Ok(16),
+            3 => Ok(32),
+            _ => Err(PyValueError::new_err(
+                "target bit depth must be bd_8, bd_16 or bd_32",
+            )),
+        };
+    }
+    match raw {
+        8 | 16 | 32 => Ok(raw as u16),
+        _ => Err(PyValueError::new_err(
+            "target bit depth must be 8, 16 or 32, or a matching BitDepth enum",
+        )),
+    }
+}
+
 /// Python truthiness, the way pybind11's converting `bool` caster reads
 /// setter arguments (so `layer.is_visible = 0` works as it does upstream).
 pub fn truthy(value: &Bound<'_, PyAny>) -> PyResult<bool> {

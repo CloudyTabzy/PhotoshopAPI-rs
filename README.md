@@ -189,6 +189,11 @@ pip install photoshopapi-rs
 Requires Python 3.9 or newer. Wheels are built with
 [maturin](https://github.com/PyO3/maturin).
 
+The depth-specific document classes provide `convert_bit_depth(8|16|32)` and
+`composite_rgba8()`. Composites are returned as NumPy `uint8` arrays in
+`(height, width, 4)` RGBA order; `composite_rgba8_with()` accepts switches for
+effects, Blend If, and adjustment/fill layers.
+
 ## Quickstart
 
 The primary type is `LayeredFile<T>`, where `T` is `u8`, `u16` or `f32` for the

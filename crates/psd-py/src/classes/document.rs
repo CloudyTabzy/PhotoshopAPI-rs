@@ -58,6 +58,25 @@ macro_rules! document_class {
                     Ok(())
                 })
             }
+
+            fn composite_rgba8_array<'py>(
+                &self,
+                py: Python<'py>,
+                options: CompositeOptions,
+            ) -> PyResult<Bound<'py, PyArray3<u8>>> {
+                let image = read_document(&self.inner, |file| {
+                    file.composite_rgba8_with(options).map_err(psd_error)
+                })?;
+                let height = usize::try_from(image.height)
+                    .map_err(|_| PyValueError::new_err("composite height is unaddressable"))?;
+                let width = usize::try_from(image.width)
+                    .map_err(|_| PyValueError::new_err("composite width is unaddressable"))?;
+                Array3::from_shape_vec((height, width, 4), image.rgba)
+                    .map(|array| array.into_pyarray(py))
+                    .map_err(|error| {
+                        PyValueError::new_err(format!("invalid RGBA composite shape: {error}"))
+                    })
+            }
         }
 
         #[pymethods]
@@ -136,6 +155,43 @@ macro_rules! document_class {
             fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
                 let bytes = read_document(&self.inner, |file| file.to_bytes().map_err(psd_error))?;
                 Ok(PyBytes::new(py, &bytes))
+            }
+
+            /// Flatten to a NumPy `uint8` array shaped `(height, width, 4)` in RGBA order.
+            fn composite_rgba8<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<u8>>> {
+                self.composite_rgba8_array(py, CompositeOptions::default())
+            }
+
+            /// Flatten to RGBA, optionally disabling effects, Blend If, or adjustment/fill layers.
+            #[pyo3(signature = (effects=true, blend_if=true, adjustments=true))]
+            fn composite_rgba8_with<'py>(
+                &self,
+                py: Python<'py>,
+                effects: bool,
+                blend_if: bool,
+                adjustments: bool,
+            ) -> PyResult<Bound<'py, PyArray3<u8>>> {
+                self.composite_rgba8_array(
+                    py,
+                    CompositeOptions {
+                        effects,
+                        blend_if,
+                        adjustments,
+                    },
+                )
+            }
+
+            /// Return a converted copy at `8`, `16`, or `32` bits per channel.
+            /// `target` may also be `photoshopapi.enum.BitDepth.bd_8`, `bd_16` or `bd_32`.
+            fn convert_bit_depth(
+                &self,
+                py: Python<'_>,
+                target: &Bound<'_, PyAny>,
+            ) -> PyResult<Py<PyAny>> {
+                let target_depth = target_bit_depth_from_py(target)?;
+                read_document(&self.inner, |file| {
+                    crate::depth::convert_document(py, file, target_depth)
+                })
             }
 
             // --- document settings --------------------------------------

@@ -10,6 +10,82 @@ import photoshopapi as psapi
 
 
 class DocumentBindingsTest(unittest.TestCase):
+    def test_compositor_returns_rgba_numpy_arrays(self):
+        pixels = np.array(
+            [
+                [[10, 40]],
+                [[20, 50]],
+                [[30, 60]],
+                [[255, 128]],
+            ],
+            dtype=np.uint8,
+        )
+        document = psapi.LayeredFile_8bit(psapi.enum.ColorMode.rgb, 2, 1)
+        document.add_layer(
+            psapi.ImageLayer_8bit(pixels, "Pixels", width=2, height=1, pos_x=1, pos_y=0.5)
+        )
+
+        composite = document.composite_rgba8()
+        self.assertEqual(composite.dtype, np.uint8)
+        self.assertEqual(composite.shape, (1, 2, 4))
+        np.testing.assert_array_equal(
+            composite,
+            np.array([[[10, 20, 30, 255], [40, 50, 60, 128]]], dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            document.composite_rgba8_with(effects=False, adjustments=False), composite
+        )
+
+    def test_depth_conversion_dispatches_and_preserves_the_source(self):
+        pixels = np.array(
+            [
+                [[0, 255]],
+                [[1, 128]],
+                [[64, 32]],
+                [[255, 128]],
+            ],
+            dtype=np.uint8,
+        )
+        document = psapi.LayeredFile_8bit(psapi.enum.ColorMode.rgb, 2, 1)
+        document.add_layer(
+            psapi.ImageLayer_8bit(pixels, "Pixels", width=2, height=1, pos_x=1, pos_y=0.5)
+        )
+        source_bytes = document.to_bytes()
+
+        sixteen = document.convert_bit_depth(psapi.enum.BitDepth.bd_16)
+        self.assertIsInstance(sixteen, psapi.LayeredFile_16bit)
+        self.assertEqual(sixteen.bit_depth, psapi.enum.BitDepth.bd_16)
+        np.testing.assert_array_equal(sixteen["Pixels"][0], pixels[0].astype(np.uint16) * 257)
+        self.assertEqual(document.to_bytes(), source_bytes)
+
+        thirty_two = sixteen.convert_bit_depth(32)
+        self.assertIsInstance(thirty_two, psapi.LayeredFile_32bit)
+        np.testing.assert_allclose(
+            thirty_two["Pixels"][0],
+            sixteen["Pixels"][0].astype(np.float32) / 65535.0,
+            rtol=0,
+            atol=1e-7,
+        )
+
+    def test_float_depth_conversion_clips_for_integer_targets(self):
+        pixels = np.array(
+            [[[-0.5, 2.0]], [[0.25, 1.5]], [[0.5, -1.0]], [[1.0, 1.0]]],
+            dtype=np.float32,
+        )
+        document = psapi.LayeredFile_32bit(psapi.enum.ColorMode.rgb, 2, 1)
+        document.add_layer(
+            psapi.ImageLayer_32bit(pixels, "HDR", width=2, height=1, pos_x=1, pos_y=0.5)
+        )
+        eight = document.convert_bit_depth(8)
+        self.assertIsInstance(eight, psapi.LayeredFile_8bit)
+        np.testing.assert_array_equal(eight["HDR"][0], [[0, 255]])
+        with self.assertRaises(ValueError):
+            document.convert_bit_depth(psapi.enum.BitDepth.bd_1)
+
+        indexed = psapi.LayeredFile_8bit(2, 1, 1)
+        with self.assertRaises(ValueError):
+            indexed.convert_bit_depth(16)
+
     def test_icc_numpy_and_metadata_roundtrip(self):
         document = psapi.LayeredFile_8bit(psapi.enum.ColorMode.rgb, 3, 2)
         document.icc = np.array([1, 2, 3, 4], dtype=np.uint8)

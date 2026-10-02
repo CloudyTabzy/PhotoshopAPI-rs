@@ -12,6 +12,16 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.19] - 2026-10-02
+
+### Added
+
+- PyO3 documents now expose `composite_rgba8()` and `composite_rgba8_with()`, returning a
+  NumPy `uint8` RGBA array, and `convert_bit_depth()`, returning the matching typed document
+  class. The generated native stubs include these methods.
+- The README now marks the compositor as best-effort and identifies the remaining gaps for
+  users who need Photoshop-matched flattened output.
+
 ## [0.12.18] - 2026-10-02
 
 ### Added
