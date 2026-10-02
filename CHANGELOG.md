@@ -12,6 +12,23 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-10-03
+
+### Fixed
+
+- **Mask, vector-mask and shape feather now use Photoshop's three-box approximation instead of a
+  true Gaussian.** The reference editor pins the rule it calibrated against Photoshop
+  (`mask_feather_box_radii`): Kutskir's three-box approximation with the narrow/wide pass split —
+  ideal box width `sqrt(12 sigma^2 / 3 + 1)` floored to an odd width, the passes that fit the
+  narrower width taking it — and a padded plane whose reach is the *sum of the box radii*, not a
+  `3 * sigma` guess. Our feather was a separable Gaussian with a `ceil(3 * sigma)` radius, which
+  is a different kernel. Measured on the Photoshop-export oracle: `photoshop-vector-mask-feather`
+  went from mean 0.60 / 5.76 % of pixels off by more than 2 to **0.52 / 4.82 %**, with no
+  regression anywhere (stored-merge median mean error unchanged at 0.120; the mask-density
+  residuals are density, not feather, and are untouched). A unit test pins the radii mapping for
+  `sigma = 3` (`[2, 2, 3]`, reach 7) and that the kernel conserves a constant plane.
+
+
 ## [0.13.5] - 2026-10-03
 
 ### Fixed

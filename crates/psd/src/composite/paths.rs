@@ -271,44 +271,126 @@ pub(crate) fn rasterize_path(path: &VectorPath, width: u32, height: u32, rect: R
     accumulated
 }
 
-/// Separable Gaussian blur with `sigma` pixels, edges replicated.
-pub(crate) fn gaussian_blur(plane: &mut [f32], width: usize, height: usize, sigma: f64) {
+/// The three box radii Photoshop's feather approximates a Gaussian with.
+///
+/// Kutskir's three-box approximation, with the narrow/wide pass split: the
+/// ideal box width for `sigma` over three passes is `sqrt(12 sigma^2 / 3 + 1)`,
+/// rounded down to an odd width, and the passes that can take the narrower
+/// width do. The reference editor pins this as Photoshop's own behaviour for
+/// mask and vector-mask feather (its `mask_feather_box_radii`), and its
+/// fixtures are Photoshop exports.
+pub(crate) fn feather_box_radii(sigma: f64) -> [i32; 3] {
+    const PASSES: f64 = 3.0;
+    let ideal = (12.0 * sigma * sigma / PASSES + 1.0).sqrt();
+    let mut lower = ideal.floor() as i32;
+    if lower % 2 == 0 {
+        lower -= 1;
+    }
+    lower = lower.max(1);
+    let lower_d = f64::from(lower);
+    let narrow =
+        (12.0 * sigma * sigma - PASSES * lower_d * lower_d - 4.0 * PASSES * lower_d - 3.0 * PASSES)
+            / (-4.0 * lower_d - 4.0);
+    let narrow_passes = (narrow + 0.5).floor().clamp(0.0, 3.0) as i32;
+    let mut radii = [0i32; 3];
+    for (pass, radius) in radii.iter_mut().enumerate() {
+        let width = if (pass as i32) < narrow_passes {
+            lower
+        } else {
+            lower + 2
+        };
+        *radius = (width - 1) / 2;
+    }
+    radii
+}
+
+/// A box blur pass along rows or columns, edge-clamped.
+fn feather_box_pass(
+    plane: &mut [f32],
+    scratch: &mut [f32],
+    width: usize,
+    height: usize,
+    radius: i32,
+    horizontal: bool,
+) {
+    if radius <= 0 {
+        return;
+    }
+    let window = (2 * radius + 1) as f32;
+    let (lines, length, step) = if horizontal {
+        (height, width, 1usize)
+    } else {
+        (width, height, width)
+    };
+    for line in 0..lines {
+        let base = if horizontal { line * width } else { line };
+        let at = |index: i64| -> f32 {
+            let clamped = index.clamp(0, length as i64 - 1) as usize;
+            plane[base + clamped * step]
+        };
+        let mut sum = 0.0f32;
+        for index in -radius..=radius {
+            sum += at(i64::from(index));
+        }
+        for index in 0..length {
+            scratch[base + index * step] = sum / window;
+            sum += at(index as i64 + i64::from(radius) + 1) - at(index as i64 - i64::from(radius));
+        }
+    }
+    plane.copy_from_slice(scratch);
+}
+
+/// Photoshop's feather: a three-box approximation of a Gaussian with `sigma`
+/// pixels, edges replicated. The reach is the sum of the box radii, which is
+/// what a caller padding the plane has to allow for.
+pub(crate) fn feather_blur(plane: &mut [f32], width: usize, height: usize, sigma: f64) {
     if sigma <= 0.0 || width == 0 || height == 0 {
         return;
     }
-    let radius = (sigma * 3.0).ceil().max(1.0) as i64;
-    let mut kernel: Vec<f32> = (-radius..=radius)
-        .map(|offset| (-(offset * offset) as f64 / (2.0 * sigma * sigma)).exp() as f32)
-        .collect();
-    let total: f32 = kernel.iter().sum();
-    for weight in &mut kernel {
-        *weight /= total;
-    }
-
     let mut scratch = vec![0.0f32; plane.len()];
-    // Horizontal.
-    for y in 0..height {
-        let row = &plane[y * width..(y + 1) * width];
-        let out = &mut scratch[y * width..(y + 1) * width];
-        for (x, slot) in out.iter_mut().enumerate() {
-            let mut sum = 0.0;
-            for (k, weight) in kernel.iter().enumerate() {
-                let source = (x as i64 + k as i64 - radius).clamp(0, width as i64 - 1) as usize;
-                sum += weight * row[source];
-            }
-            *slot = sum;
+    for radius in feather_box_radii(sigma) {
+        if radius > 0 {
+            feather_box_pass(plane, &mut scratch, width, height, radius, true);
+            feather_box_pass(plane, &mut scratch, width, height, radius, false);
         }
     }
-    // Vertical.
-    for y in 0..height {
-        for x in 0..width {
-            let mut sum = 0.0;
-            for (k, weight) in kernel.iter().enumerate() {
-                let source = (y as i64 + k as i64 - radius).clamp(0, height as i64 - 1) as usize;
-                sum += weight * scratch[source * width + x];
-            }
-            plane[y * width + x] = sum;
+}
+
+/// The reach of [`feather_blur`] in pixels: how far a padded plane must extend
+/// past the painted area for the blur to see its default colour.
+pub(crate) fn feather_reach(sigma: f64) -> i32 {
+    feather_box_radii(sigma).iter().sum()
+}
+
+#[cfg(test)]
+mod feather_tests {
+    use super::*;
+
+    #[test]
+    fn the_three_box_radii_match_the_pinned_mapping() {
+        // `sigma = 3` is a worked case of the pinned formula: ideal width
+        // sqrt(12*9/3 + 1) = 6.08 floors to 6, goes odd to 5, the narrow-pass
+        // count comes out 2, so the first two boxes are width 5 and the third
+        // width 7 — radii 2, 2, 3 and a reach of 7.
+        assert_eq!(feather_box_radii(3.0), [2, 2, 3]);
+        assert_eq!(feather_reach(3.0), 7);
+        // Every radius is odd-width and positive, and the reach grows with sigma.
+        for sigma in [0.5, 1.0, 2.5, 5.0, 10.0, 25.0] {
+            let radii = feather_box_radii(sigma);
+            assert!(radii.iter().all(|&radius| radius >= 0), "sigma {sigma}");
+            assert!(feather_reach(sigma) >= 0, "sigma {sigma}");
         }
+        assert!(feather_reach(10.0) > feather_reach(3.0));
+        // A box blur conserves a constant plane (edge clamping included).
+        let (width, height) = (41usize, 41usize);
+        let mut plane = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                plane[y * width + x] = 1.0;
+            }
+        }
+        feather_blur(&mut plane, width, height, 3.0);
+        assert!(plane.iter().all(|value| (value - 1.0).abs() < 1e-4));
     }
 }
 
@@ -358,16 +440,5 @@ mod tests {
         let plane = fill_even_odd(&[square(21.0, 11.0, 23.0, 13.0)], rect);
         assert_eq!(plane[4 + 1], 1.0);
         assert_eq!(plane[0], 0.0);
-    }
-
-    #[test]
-    fn a_blur_keeps_the_total_away_from_the_edges() {
-        let mut plane = vec![0.0f32; 21 * 21];
-        plane[10 * 21 + 10] = 1.0;
-        gaussian_blur(&mut plane, 21, 21, 1.5);
-        let total: f32 = plane.iter().sum();
-        assert!((total - 1.0).abs() < 1e-4);
-        assert!(plane[10 * 21 + 10] > plane[10 * 21 + 12]);
-        assert!((plane[10 * 21 + 8] - plane[10 * 21 + 12]).abs() < 1e-6);
     }
 }

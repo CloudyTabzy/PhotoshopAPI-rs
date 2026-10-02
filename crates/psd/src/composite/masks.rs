@@ -10,7 +10,7 @@
 use crate::layer::{Layer, Rect};
 use crate::BitDepth;
 
-use super::paths::{gaussian_blur, rasterize_path};
+use super::paths::{feather_blur, feather_reach, rasterize_path};
 use super::Compositor;
 
 impl<T: BitDepth> Compositor<'_, T> {
@@ -53,8 +53,10 @@ impl<T: BitDepth> Compositor<'_, T> {
 
         // Build over the rect plus the blur margin, clamped to the canvas, so
         // the feather sees real mask samples and replicates the canvas edge.
+        // The reach of the three-box feather, not a `3 * sigma` guess: the
+        // boxes' radii are what decide how far the blur needs real samples.
         let margin = if feather > 0.0 {
-            (feather * 3.0).ceil() as i32 + 1
+            feather_reach(feather)
         } else {
             0
         };
@@ -89,7 +91,7 @@ impl<T: BitDepth> Compositor<'_, T> {
             }
         }
         if feather > 0.0 {
-            gaussian_blur(&mut plane, width, height, feather);
+            feather_blur(&mut plane, width, height, feather);
         }
         if let Some(density) = params.user_mask_density {
             apply_density(&mut plane, density);
@@ -143,8 +145,10 @@ impl<T: BitDepth> Compositor<'_, T> {
         }
         let params = Self::params(layer);
         let feather = params.vector_mask_feather.unwrap_or(0.0);
+        // The reach of the three-box feather, not a `3 * sigma` guess: the
+        // boxes' radii are what decide how far the blur needs real samples.
         let margin = if feather > 0.0 {
-            (feather * 3.0).ceil() as i32 + 1
+            feather_reach(feather)
         } else {
             0
         };
@@ -170,7 +174,7 @@ impl<T: BitDepth> Compositor<'_, T> {
             }
         }
         if feather > 0.0 {
-            gaussian_blur(&mut plane, width, height, feather);
+            feather_blur(&mut plane, width, height, feather);
         }
         if let Some(density) = params.vector_mask_density {
             apply_density(&mut plane, density);

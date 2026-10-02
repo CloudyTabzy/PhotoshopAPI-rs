@@ -12,7 +12,7 @@ use psd_core::vector::{VectorData, VectorStroke};
 use psd_core::{AdjustmentKind, MaskParams};
 
 use super::adjustments::paint_content;
-use super::paths::{gaussian_blur, rasterize_path};
+use super::paths::{feather_blur, rasterize_path};
 use super::stroke::{stroke_coverage, Alignment, Cap, Join, StrokeStyle};
 use super::{Compositor, Content, Rect};
 use crate::layer::Layer;
@@ -266,10 +266,12 @@ impl<T: BitDepth> Compositor<'_, T> {
             }
         }
         if feather > 0.0 {
-            gaussian_blur(&mut alpha, width, height, feather);
-            gaussian_blur(&mut silhouette, width, height, feather);
+            // Shape (vector) feather is the same three-box approximation
+            // Photoshop applies to mask feather.
+            feather_blur(&mut alpha, width, height, feather);
+            feather_blur(&mut silhouette, width, height, feather);
             for plane in &mut premult {
-                gaussian_blur(plane, width, height, feather);
+                feather_blur(plane, width, height, feather);
             }
         }
 
