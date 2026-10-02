@@ -12,6 +12,20 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.4] - 2026-10-03
+
+### Fixed
+
+- **Per-layer tagged blocks tolerate the even pad being declared outside the length.**
+  Photoshop counts that pad inside an even declared length — every block in the 691-document
+  corpus reads that way — but some writers declare the unpadded length and put the pad byte
+  after it, which this port rejected with a signature error at the next block. The reader now
+  rounds the declared length up to even, accepting both shapes; the writer keeps Photoshop's
+  shape, so such a file's bytes are unchanged on a round trip and only the declared length
+  reads one larger. A generated fixture from a MoonBit parser's suite exposed it; the
+  Photoshop-authored corpora still round-trip byte-exactly.
+
+
 ## [0.13.3] - 2026-10-03
 
 ### Fixed

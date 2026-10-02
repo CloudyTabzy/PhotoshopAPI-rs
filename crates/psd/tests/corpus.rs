@@ -538,6 +538,37 @@ const EXTRA_CORPUS_KNOWN: &[(&str, &str, &str)] = &[
             "the design, and the robustness probe covers them instead"
         ),
     ),
+    (
+        "gap_ali_keys.psd",
+        "roundtrip",
+        concat!(
+            "a generated fixture declares an odd block length and puts the even pad ",
+            "byte outside it; the reader tolerates that shape and the writer ",
+            "normalizes to Photoshop's (pad inside an even declared length), so the ",
+            "file bytes are unchanged but the declared length reads one larger"
+        ),
+    ),
+    (
+        "phase15_effects.psd",
+        "roundtrip",
+        concat!("same odd-declared-length shape as gap_ali_keys.psd"),
+    ),
+    (
+        "phase4_multi_layer.psd",
+        "roundtrip",
+        concat!(
+            "the record carries no transparency channel, which Photoshop reads as ",
+            "its Background layer; the writer synthesizes one (the 0.6.14 rule)"
+        ),
+    ),
+    (
+        "phase6_layer_group.psd",
+        "roundtrip",
+        concat!(
+            "the record carries no transparency channel, which Photoshop reads as ",
+            "its Background layer; the writer synthesizes one (the 0.6.14 rule)"
+        ),
+    ),
 ];
 
 #[test]

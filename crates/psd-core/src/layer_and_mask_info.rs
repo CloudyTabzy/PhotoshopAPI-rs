@@ -689,8 +689,13 @@ impl<'a> LayerRecord<'a> {
 
         let remaining = extra_end - reader.position();
         let (additional_layer_info, content_end) = if remaining >= 12 {
+            // Per-layer blocks are padded to an even length. Photoshop counts
+            // that pad *inside* the declared length (every block in the corpus
+            // reads that way), but some writers declare the unpadded length and
+            // put the pad byte outside it — so round the length up to even
+            // rather than assuming, which accepts both shapes.
             let (blocks, content_end) =
-                AdditionalLayerInfo::read_tracking_end(reader, header, remaining, 1)?;
+                AdditionalLayerInfo::read_tracking_end(reader, header, remaining, 2)?;
             (Some(Cow::Owned(blocks)), content_end)
         } else {
             // Too short for a block; the whole remainder is a candidate gap.
