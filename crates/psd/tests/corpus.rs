@@ -551,7 +551,7 @@ const EXTRA_CORPUS_KNOWN: &[(&str, &str, &str)] = &[
     (
         "phase15_effects.psd",
         "roundtrip",
-        concat!("same odd-declared-length shape as gap_ali_keys.psd"),
+        "same odd-declared-length shape as gap_ali_keys.psd",
     ),
     (
         "phase4_multi_layer.psd",
