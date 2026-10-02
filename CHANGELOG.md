@@ -12,6 +12,25 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.5] - 2026-10-03
+
+### Fixed
+
+- **A freshly regenerated `SoLd` now matches a Photoshop-authored block field for field.**
+  Compared against a Photoshop-authored `soLD` v4 block for an unwarped placed layer: twelve keys
+  are byte-identical (`PgNm`, `totalPages`, `Crop`, `frameStep`, `duration`, `frameCount`, `Annt`,
+  `Type`, `Rslt`, `comp`, `compInfo`, `ClMg`), the warp descriptor matches except its bounds, and
+  every other difference is a value that must vary per document (the two uuids, the placement
+  quads, the two size fields). Two fixes made that true:
+  - the missing trailing **`ClMg`** key — `placedLayerOCIOConversion` →
+    `placedLayerOCIOConvertEmbedded`, in a descriptor whose class id is `ClMg` and not `null`;
+  - a smart object created **without** a warp now writes `warpStyle = warpNone`; the
+    `warpCustom` from `generate_default` was leaking into the descriptor, and `warpCustom`
+    belongs to a warp the caller actually set.
+- A new test pins the field list, the key order and the `ClMg` encodings; the per-document
+  values are the only ones it does not pin.
+
+
 ## [0.13.4] - 2026-10-03
 
 ### Fixed

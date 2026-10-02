@@ -162,7 +162,16 @@ impl<T: BitDepth> LayeredFile<T> {
         let (source_width, source_height) = (decoded.raster.width(), decoded.raster.height());
         let warp = match warp {
             Some(warp) => warp,
-            None => Warp::generate_default(source_width, source_height)?,
+            None => {
+                // No warp given means no warp, and Photoshop writes that as
+                // `warpStyle = warpNone` in the `SoLd` descriptor — a
+                // Photoshop-authored block for an unwarped placed layer carries
+                // exactly that. The generated warp is the identity, so only the
+                // style name has to change.
+                let mut warp = Warp::generate_default(source_width, source_height)?;
+                warp.set_style("warpNone")?;
+                warp
+            }
         };
         let rendered = warp.apply(&decoded.raster, WarpRenderOptions::default())?;
         drop(decoded.raster);
@@ -885,6 +894,25 @@ fn new_placed_layer_data(
                 item(explicit("compID"), integer(-1)),
                 item(explicit("originalCompID"), integer(-1)),
             ])?),
+        ),
+        // A 2020-era trailing key Photoshop writes: the OCIO conversion
+        // setting for the placed layer. Note the enum's spelling —
+        // `placedLayerOCIOConvertEmbedded`, not `...Conversion...` — and that
+        // the descriptor's class id is `ClMg`, not `null`: both are what a
+        // Photoshop-authored block carries byte for byte.
+        item(
+            explicit("ClMg"),
+            DescriptorValue::Descriptor(Descriptor {
+                name: UnicodeString::new("\0", 1)?,
+                class_id: DescriptorKey::char_id(*b"ClMg"),
+                items: vec![item(
+                    explicit("placedLayerOCIOConversion"),
+                    DescriptorValue::Enumerated {
+                        type_id: DescriptorKey::new("placedLayerOCIOConversion"),
+                        value: DescriptorKey::new("placedLayerOCIOConvertEmbedded"),
+                    },
+                )],
+            }),
         ),
     ])?;
     Ok(PlacedLayerData {
@@ -2286,6 +2314,107 @@ mod tests {
         assert!(
             !incumbent_error.contains("CRC mismatch in"),
             "the incumbent's message is not distinguishable from psd-png's: {incumbent_error}"
+        );
+    }
+
+    /// Pins the field list, the key order and the `ClMg` encodings of a freshly
+    /// regenerated `SoLd` against a Photoshop-authored block for an unwarped
+    /// placed layer. The fields that must vary per document — the two uuids,
+    /// the placement quads and the two size fields — are the only ones not
+    /// pinned here.
+    #[cfg(feature = "image")]
+    #[test]
+    fn a_fresh_sold_matches_the_photoshop_authored_field_list() {
+        // The key list, its order and the `ClMg` encodings are copied from a
+        // Photoshop-authored `soLD` block for an unwarped placed layer.
+        let path = corpus_pngs()
+            .into_iter()
+            .next()
+            .expect("no PNG fixtures found");
+        let bytes = read_source_file(&path).unwrap();
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 64, 64).unwrap();
+        let layer = document
+            .create_smart_object_from_bytes("SO", "probe.png", &bytes, None)
+            .unwrap();
+        let payload = layer
+            .blocks
+            .blocks
+            .iter()
+            .find(|block| block.key.as_bytes() == *b"SoLd")
+            .expect("a created smart object carries SoLd")
+            .data
+            .clone();
+        let mut reader = BeReader::new(&payload);
+        let data = PlacedLayerData::read(&mut reader).unwrap();
+        let keys: Vec<String> = data
+            .descriptor
+            .items
+            .iter()
+            .map(|item| item.key.as_str().into_owned())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "Idnt",
+                "placed",
+                "PgNm",
+                "totalPages",
+                "Crop",
+                "frameStep",
+                "duration",
+                "frameCount",
+                "Annt",
+                "Type",
+                "Trnf",
+                "nonAffineTransform",
+                "warp",
+                "Sz  ",
+                "Rslt",
+                "comp",
+                "compInfo",
+                "ClMg",
+            ]
+        );
+
+        let item = |key: &str| {
+            data.descriptor
+                .items
+                .iter()
+                .find(|item| item.key.as_str() == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+                .value
+                .clone()
+        };
+        // No warp given: Photoshop writes `warpNone`, and so do we.
+        let DescriptorValue::Descriptor(warp) = item("warp") else {
+            panic!("warp is not a descriptor")
+        };
+        let style = warp
+            .items
+            .iter()
+            .find(|item| item.key.as_str() == "warpStyle")
+            .expect("warpStyle");
+        assert_eq!(
+            style.value,
+            DescriptorValue::Enumerated {
+                type_id: DescriptorKey::new("warpStyle"),
+                value: DescriptorKey::new("warpNone"),
+            }
+        );
+        // `ClMg` is a 2020-era key whose descriptor class id and enum spelling
+        // are both easy to get wrong.
+        let DescriptorValue::Descriptor(clmg) = item("ClMg") else {
+            panic!("ClMg is not a descriptor")
+        };
+        assert_eq!(clmg.class_id, DescriptorKey::char_id(*b"ClMg"));
+        assert_eq!(clmg.items.len(), 1);
+        assert_eq!(clmg.items[0].key.as_str(), "placedLayerOCIOConversion");
+        assert_eq!(
+            clmg.items[0].value,
+            DescriptorValue::Enumerated {
+                type_id: DescriptorKey::new("placedLayerOCIOConversion"),
+                value: DescriptorKey::new("placedLayerOCIOConvertEmbedded"),
+            }
         );
     }
 
