@@ -12,6 +12,19 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-10-03
+
+### Fixed
+
+- **The PSB eight-byte-length key list now carries the whole linked-layer family** (`lnkD`,
+  `lnk3`, `lnkE`) and `Ink2` from the specification's large-block list. Corpus evidence (687
+  documents): a PSB's `lnk2` under an `8BIM` signature reads 0 as a u32 and 17584 as a u64,
+  while the PSD of the same document reads 17576 as a u32 — the width really is version-based,
+  so a key the list omits is misparsed in a PSB. A PSB with `8BIM lnkE` and a 64-bit length now
+  round-trips; the same key in a PSD still reads 32-bit. Found by comparing against a
+  BSD-licensed Python writer that shares this project's lineage.
+
+
 ## [0.13.2] - 2026-10-03
 
 ### Changed

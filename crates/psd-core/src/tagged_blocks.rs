@@ -78,10 +78,17 @@ impl fmt::Display for TaggedBlockKey {
 }
 
 /// Keys whose length field is 8 bytes wide in PSB containers
-/// (upstream `isTaggedBlockSizeUint64`).
-const UINT64_LENGTH_KEYS: [[u8; 4]; 14] = [
-    *b"LMsk", *b"Lr16", *b"Lr32", *b"Layr", *b"Mtrn", *b"Mt16", *b"Mt32", *b"Alph", *b"FMsk",
-    *b"FXid", *b"FEid", *b"lnk2", *b"PxSD", *b"cinf",
+/// (upstream `isTaggedBlockSizeUint64`): the specification's large-block list
+/// plus the linked layer family (`lnkD`/`lnk2`/`lnk3`/`lnkE`) and `cinf`.
+///
+/// Corpus evidence (687 documents): a PSB's `lnk2` under an `8BIM` signature
+/// reads 0 as a u32 and 17584 as a u64, while the PSD of the same document
+/// reads 17576 as a u32 — the width really is version-based, so the key list
+/// has to carry the whole family. `cinf` and `FMsk` are always written with an
+/// `8B64` signature in PSB, which makes their entries redundant but harmless.
+const UINT64_LENGTH_KEYS: [[u8; 4]; 18] = [
+    *b"LMsk", *b"Lr16", *b"Lr32", *b"Layr", *b"Mt16", *b"Mt32", *b"Mtrn", *b"Alph", *b"FMsk",
+    *b"Ink2", *b"FEid", *b"FXid", *b"PxSD", *b"lnkD", *b"lnk2", *b"lnk3", *b"lnkE", *b"cinf",
 ];
 
 /// Whether the key uses a `u64` length field in PSB files.
@@ -507,8 +514,8 @@ mod tests {
 
     #[test]
     fn eight_b_64_signature_forces_u64_length_even_for_unknown_keys() {
-        // Photoshop writes external links as `8B64 lnkE` + u64 length; `lnkE`
-        // is not in the key-based u64 list.
+        // Photoshop writes external links as `8B64 lnkE` + u64 length; the
+        // signature decides, so the key list does not have to name `lnkE`.
         let mut block = TaggedBlock::new(TaggedBlockKey::new(*b"lnkE"), vec![0xAB; 3]);
         block.signature = *b"8B64";
         let mut w = BeWriter::new();
@@ -521,6 +528,30 @@ mod tests {
             block
         );
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn psb_linked_layer_keys_take_u64_lengths_under_an_8bim_signature() {
+        // A PSB writes the linked layer family with 8-byte lengths even when
+        // the signature is `8BIM`: corpus evidence reads 17584 as a u64 where
+        // a u32 read gives 0 (and the PSD of the same document gives 17576).
+        for key in [*b"lnkD", *b"lnk2", *b"lnk3", *b"lnkE", *b"Ink2"] {
+            let block = TaggedBlock::new(TaggedBlockKey::new(key), vec![0x5A; 9]);
+            assert_eq!(block.signature, *b"8BIM");
+            let mut w = BeWriter::new();
+            block.write(&mut w, &header(Version::Psb), 4).unwrap();
+            assert_eq!(&w.as_slice()[8..16], &9u64.to_be_bytes(), "{key:?}");
+            let mut r = BeReader::new(w.as_slice());
+            assert_eq!(
+                TaggedBlock::read(&mut r, &header(Version::Psb), 4).unwrap(),
+                block,
+                "{key:?}"
+            );
+            // The same key in a PSD stays 32-bit.
+            let mut w = BeWriter::new();
+            block.write(&mut w, &header(Version::Psd), 4).unwrap();
+            assert_eq!(&w.as_slice()[8..12], &9u32.to_be_bytes(), "{key:?}");
+        }
     }
 
     #[test]
