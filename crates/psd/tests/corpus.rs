@@ -267,6 +267,22 @@ fn block_diff(before: Option<&AdditionalLayerInfo>, after: Option<&AdditionalLay
     format!("{:?} -> {:?}", describe(before), describe(after))
 }
 
+/// An absent block list and an empty one are the same file: a zero-length
+/// section either way, so the bytes round-trip and only the in-memory shape
+/// differs. Compare them as equal, and keep `block_diff` for the real cases.
+fn same_blocks(before: Option<&AdditionalLayerInfo>, after: Option<&AdditionalLayerInfo>) -> bool {
+    let keys = |info: Option<&AdditionalLayerInfo>| -> Vec<([u8; 4], Vec<u8>)> {
+        info.map(|info| {
+            info.blocks
+                .iter()
+                .map(|block| (block.key.as_bytes(), block.data.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+    };
+    keys(before) == keys(after)
+}
+
 fn compare<T: BitDepth>(before: &LayeredFile<T>, after: &LayeredFile<T>) -> Result<(), String> {
     let header = |file: &LayeredFile<T>| (file.width, file.height, file.color_mode, file.dpi);
     if header(before) != header(after) {
@@ -290,7 +306,7 @@ fn compare<T: BitDepth>(before: &LayeredFile<T>, after: &LayeredFile<T>) -> Resu
             })
     };
     let (document_before, document_after) = (preserved(before), preserved(after));
-    if document_before != document_after {
+    if !same_blocks(document_before.as_ref(), document_after.as_ref()) {
         return Err(format!(
             "document tagged blocks differ: {}",
             block_diff(document_before.as_ref(), document_after.as_ref())
@@ -536,6 +552,33 @@ const EXTRA_CORPUS_KNOWN: &[(&str, &str, &str)] = &[
             "one corpus keeps deliberately malformed files here (a bad signature, ",
             "an out-of-range depth, a patched divider type, ...); rejecting them is ",
             "the design, and the robustness probe covers them instead"
+        ),
+    ),
+    (
+        "psd_hdr_routing/cmyk16_blank_p1_layers.psd",
+        "roundtrip",
+        concat!(
+            "the generated CMYK layer carries no transparency channel, which ",
+            "Photoshop reads as its Background layer; the writer synthesizes one ",
+            "(the 0.6.14 rule)"
+        ),
+    ),
+    (
+        "psd_format/divider_only/",
+        "*",
+        concat!(
+            "the generator writes a lone folder divider with no bounding record; ",
+            "the reader forms the group it opens and the writer emits the matching ",
+            "bounding divider, so the record count grows by one — deliberate ",
+            "normalization of a shape Photoshop itself does not write"
+        ),
+    ),
+    (
+        "psd_format/section_type/",
+        "*",
+        concat!(
+            "same lone-divider shape as divider_only/: a folder-start record with ",
+            "no matching bounding record is normalized into a complete group"
         ),
     ),
     (
