@@ -216,6 +216,41 @@ fn combine(accumulated: &mut [f32], incoming: &[f32], operation: i16) {
     }
 }
 
+/// An axis-aligned rectangle's edges go to whole pixels.
+///
+/// Photoshop draws a rectangle shape with crisp edges even when the stored
+/// path is fractional (a 31.959 px right edge fills its last column whole, and
+/// a top edge at 23.471 starts on row 23); the pixels it stores beside the path
+/// show it. Curves and slanted outlines keep their anti-aliased edges. Upstream
+/// never rasterises vector paths.
+fn snap_axis_aligned_rectangle(polygon: &mut Polygon) {
+    let mut points: Vec<(f64, f64)> = polygon.clone();
+    if points.len() > 1 && points.first() == points.last() {
+        points.pop();
+    }
+    if points.len() != 4 {
+        return;
+    }
+    let tolerance = 1e-6;
+    let horizontal = |a: (f64, f64), b: (f64, f64)| (a.1 - b.1).abs() < tolerance;
+    let vertical = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < tolerance;
+    let rectangle = (horizontal(points[0], points[1])
+        && vertical(points[1], points[2])
+        && horizontal(points[2], points[3])
+        && vertical(points[3], points[0]))
+        || (vertical(points[0], points[1])
+            && horizontal(points[1], points[2])
+            && vertical(points[2], points[3])
+            && horizontal(points[3], points[0]));
+    if !rectangle {
+        return;
+    }
+    for point in polygon.iter_mut() {
+        point.0 = point.0.round();
+        point.1 = point.1.round();
+    }
+}
+
 /// Coverage of a whole path (shape-group semantics) over `rect`, in document
 /// pixels of a `width` × `height` canvas.
 pub(crate) fn rasterize_path(path: &VectorPath, width: u32, height: u32, rect: Rect) -> Vec<f32> {
@@ -236,7 +271,8 @@ pub(crate) fn rasterize_path(path: &VectorPath, width: u32, height: u32, rect: R
     }
     let mut groups: Vec<Group> = Vec::new();
     for subpath in &subpaths {
-        let polygon = flatten_subpath(subpath, width, height);
+        let mut polygon = flatten_subpath(subpath, width, height);
+        snap_axis_aligned_rectangle(&mut polygon);
         let index = subpath.record.origination_index();
         let operation = subpath.record.operation;
         let continuation = operation == -1 && groups.last().is_some_and(|g| g.index == index);
@@ -440,5 +476,41 @@ mod tests {
         let plane = fill_even_odd(&[square(21.0, 11.0, 23.0, 13.0)], rect);
         assert_eq!(plane[4 + 1], 1.0);
         assert_eq!(plane[0], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod snap_tests {
+    use super::*;
+
+    #[test]
+    fn a_rectangle_snaps_to_whole_pixels_and_a_slanted_quad_does_not() {
+        let mut rectangle: Polygon = vec![
+            (0.0, 23.471),
+            (31.959, 23.471),
+            (31.959, 33.006),
+            (0.0, 33.006),
+        ];
+        snap_axis_aligned_rectangle(&mut rectangle);
+        assert_eq!(
+            rectangle,
+            vec![(0.0, 23.0), (32.0, 23.0), (32.0, 33.0), (0.0, 33.0)]
+        );
+
+        // A closed polygon repeating its first point is still a rectangle.
+        let mut closed: Polygon = vec![(1.2, 1.4), (5.6, 1.4), (5.6, 4.5), (1.2, 4.5), (1.2, 1.4)];
+        snap_axis_aligned_rectangle(&mut closed);
+        assert_eq!(closed[0], (1.0, 1.0));
+        assert_eq!(closed[2], (6.0, 5.0));
+
+        let mut slanted: Polygon = vec![(0.0, 0.3), (9.7, 1.3), (9.7, 5.3), (0.0, 4.3)];
+        let before = slanted.clone();
+        snap_axis_aligned_rectangle(&mut slanted);
+        assert_eq!(slanted, before);
+
+        // A triangle is left alone too.
+        let mut triangle: Polygon = vec![(0.5, 0.5), (4.5, 0.5), (0.5, 4.5)];
+        snap_axis_aligned_rectangle(&mut triangle);
+        assert_eq!(triangle[0], (0.5, 0.5));
     }
 }

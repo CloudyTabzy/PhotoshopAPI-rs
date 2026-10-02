@@ -12,6 +12,20 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.8] - 2026-10-03
+
+### Fixed
+
+- **Rectangle shapes and vector masks now have crisp edges.** A closed axis-aligned rectangle path
+  is rasterised with its edges rounded to whole pixels, the way Photoshop draws it and stores its
+  pixels: a path whose right edge is 31.959 px fills its last column whole and a top edge at
+  23.471 starts on row 23, where this port used to anti-alias both (coverage 0.96 and 0.53). Curves
+  and slanted outlines keep anti-aliased edges. This was the cause of the "mask density" residual:
+  `mask-density-layermask` fell from mean 1.94 to **0.00**, and the same rule took
+  `rgb-blend-modes` 1.68 → 0.14, `gray-blend-modes` 1.85 → 0.76 and `gradient-sizes` 0.64 → 0.18
+  in the stored-merge set, with no regression in it or in the Photoshop-export set. The density
+  curve itself was right all along.
+
 ## [0.13.7] - 2026-10-03
 
 ### Fixed
