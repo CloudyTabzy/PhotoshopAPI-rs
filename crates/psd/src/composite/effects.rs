@@ -761,7 +761,7 @@ fn paint_interior_into(
             opacity_scale(satin.opacity),
             satin.blend_mode.unwrap_or(BlendMode::NORMAL),
         );
-        apply_interior(painter, coverage, &field, &paint);
+        apply_interior(painter, &field, &paint);
     }
 
     if let Some(glow) = effects.inner_glow.as_ref().filter(|g| enabled(g.enabled)) {
@@ -785,7 +785,7 @@ fn paint_interior_into(
             }
         }
         let paint = glow_paint(glow, BlendMode::SCREEN);
-        apply_interior(painter, coverage, &field, &paint);
+        apply_interior(painter, &field, &paint);
     }
 
     for shadow in effects.inner_shadows.iter().filter(|s| enabled(s.enabled)) {
@@ -813,7 +813,7 @@ fn paint_interior_into(
             opacity_scale(shadow.opacity),
             shadow.blend_mode.unwrap_or(BlendMode::MULTIPLY),
         );
-        apply_interior(painter, coverage, &field, &paint);
+        apply_interior(painter, &field, &paint);
     }
 }
 
@@ -880,17 +880,18 @@ fn glow_paint(glow: &psd_core::Glow, default_mode: BlendMode) -> EffectPaint {
     }
 }
 
-fn apply_interior(
-    painter: &mut InteriorPainter<'_>,
-    coverage: &[f32],
-    field: &[f32],
-    paint: &EffectPaint,
-) {
+fn apply_interior(painter: &mut InteriorPainter<'_>, field: &[f32], paint: &EffectPaint) {
     painter.begin(paint.blend_mode);
     let pixels = painter.rect.width().max(0) as usize * painter.rect.height().max(0) as usize;
-    for index in 0..pixels {
-        let (color, field_alpha) = paint.at(field[index]);
-        let strength = field_alpha * paint.alpha * coverage[index];
+    for (index, field_value) in field.iter().enumerate().take(pixels) {
+        let (color, field_alpha) = paint.at(*field_value);
+        // The field is the interior's own falloff, so it is *not* scaled by the
+        // pixel's coverage again: an interior effect folds into the layer's
+        // straight colour inside the base pass, and the layer's alpha, masks and
+        // opacity apply once at the composite. Scaling by coverage here
+        // double-attenuates anti-aliased edges, which is exactly where a hard
+        // 1 px inner shadow lives.
+        let strength = field_alpha * paint.alpha;
         if strength <= 0.0 {
             continue;
         }

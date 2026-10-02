@@ -12,6 +12,25 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-10-03
+
+### Fixed
+
+- **Interior effects are no longer scaled by the pixel's own coverage.** The interior field
+  (inner shadow, inner glow, satin) already describes the effect's falloff inside the shape, so
+  multiplying it by coverage as well double-attenuated anti-aliased edges — exactly where a
+  hard 1 px inner shadow lives. This matches the calibration record's own model: interior
+  effects fold into the layer's straight colour inside the base pass, so the layer's alpha,
+  masks and opacity apply once at the composite.
+
+  Measured on the stored-merge oracle with a 2012-era corpus's fixtures: `test.psd` and its
+  group variants went from mean 0.26 / max 48 / **0.29 % of pixels off by more than 2** to
+  mean 0.21 / max 19 / **0.02 %** — a 15x reduction in the worst-pixel share, driven by a white
+  75 % normal inner shadow on a text layer. The Photoshop-export oracle is unchanged where the
+  registry pins it (Hue/Saturation 0.07-0.12, interior soft effects mean <= 1), and the full
+  207-document merge oracle's median mean error is 0.120.
+
+
 ## [0.13.0] - 2026-10-03
 
 ### Changed (breaking)
