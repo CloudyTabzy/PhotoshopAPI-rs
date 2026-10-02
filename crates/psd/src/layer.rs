@@ -1145,29 +1145,69 @@ impl<T: BitDepth> Layer<T> {
 
     /// Move the layer by whole pixels.
     ///
-    /// The pixel mask moves with the layer (Photoshop's default linked-mask
-    /// behavior); upstream's `center_x`/`center_y` setters leave the mask
-    /// behind. Text layers also move their `TySh`
-    /// transform so Photoshop re-renders the text at the new position.
-    /// Smart objects must be moved through the document so their warp is
-    /// re-rendered (see [`LayeredFile::move_smart_object`](crate::LayeredFile::move_smart_object)).
+    /// What moves: the pixel bounds, and a text layer's `TySh` transform so
+    /// Photoshop re-renders the text at the new position. **Mask rects are
+    /// never rewritten** — a mask's stored rect is interpreted relative to the
+    /// layer when its link flag is set and as absolute otherwise, so a linked
+    /// mask follows implicitly and an unlinked one stays where it is, which is
+    /// what Photoshop's Move tool does.
+    ///
+    /// What this method cannot do, and refuses instead of doing halfway:
+    ///
+    /// - **smart objects** need the document to re-render their warp; move them
+    ///   through [`LayeredFile::move_smart_object`](crate::LayeredFile::move_smart_object);
+    /// - **vector geometry** (a shape layer's path, or any `vmsk`/`vsms` vector
+    ///   mask) is stored as fractions of the document, so moving it needs the
+    ///   document size; use [`LayeredFile::translate_layer`](crate::LayeredFile::translate_layer),
+    ///   which also carries a group's children. Moving only the bounds would
+    ///   leave the path behind and Photoshop would snap the layer back on its
+    ///   next re-render.
     pub fn translate(&mut self, dx: i32, dy: i32) -> Result<()> {
+        self.translate_with_path_delta(dx, dy, None)
+    }
+
+    /// [`translate`](Self::translate) with the document-relative delta vector
+    /// geometry needs: `path_delta` is in 8.24 fixed point, the unit path
+    /// points are stored in, and is `Some` only when the caller knows the
+    /// document size.
+    pub fn translate_with_path_delta(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        path_delta: Option<(i32, i32)>,
+    ) -> Result<()> {
         if self.is_smart_object() {
             return Err(invalid(
                 "smart-object layers move through LayeredFile::move_smart_object",
             ));
         }
+        let has_vector_geometry = self
+            .blocks
+            .blocks
+            .iter()
+            .any(|block| is_vector_mask_key(block.key));
+        let (path_dx, path_dy) = match path_delta {
+            Some(delta) => delta,
+            None => {
+                if has_vector_geometry {
+                    return Err(invalid(
+                        "a layer with vector geometry moves through LayeredFile::translate_layer, \
+                         which converts the pixel move into the document-relative units a path \
+                         is stored in",
+                    ));
+                }
+                (0, 0)
+            }
+        };
         let bounds = self.bounds.translated(dx, dy)?;
-        let mut mask = self.mask.clone();
-        if let Some(data) = mask.as_mut() {
-            for record in [data.pixel_mask.as_mut(), data.vector_mask.as_mut()]
-                .into_iter()
-                .flatten()
-            {
-                let moved = Rect::new(record.top, record.left, record.bottom, record.right)
-                    .translated(dx, dy)?;
-                (record.top, record.left, record.bottom, record.right) =
-                    (moved.top, moved.left, moved.bottom, moved.right);
+        if has_vector_geometry {
+            for block in &mut self.blocks.blocks {
+                if !is_vector_mask_key(block.key) {
+                    continue;
+                }
+                let mut mask = VectorMask::read(&block.data)?;
+                mask.translate(path_dx, path_dy)?;
+                block.data = mask.to_payload()?;
             }
         }
         if self.is_text_layer() {
@@ -1176,7 +1216,6 @@ impl<T: BitDepth> Layer<T> {
             }
         }
         self.bounds = bounds;
-        self.mask = mask;
         Ok(())
     }
 
@@ -1630,7 +1669,10 @@ mod tests {
         assert!(group.has_mask());
         assert_eq!(group.center(), (22.0, 11.0));
         group.translate(-20, -10).unwrap();
-        assert_eq!(group.mask_rect(), Some(Rect::new(0, 0, 2, 4)));
+        // The mask's stored rect is not rewritten by a move: its link flag says
+        // whether it follows the layer, and this mask is unlinked (absolute).
+        assert_eq!(group.mask_rect(), Some(Rect::new(10, 20, 12, 24)));
+        assert_eq!(group.bounds, Rect::new(-10, -20, -10, -20));
     }
 
     #[test]

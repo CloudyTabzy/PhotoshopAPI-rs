@@ -279,12 +279,14 @@ fn image_mask_settings_round_trip_on_the_masks_fixture() {
 }
 
 #[test]
-fn moving_a_layer_moves_its_mask_and_text() {
+fn moving_a_layer_keeps_its_mask_rect_and_moves_its_text() {
     let mut layer = image::<u8>("Layer", 2, 2);
     layer.set_mask(vec![255; 4], Rect::new(0, 0, 2, 2)).unwrap();
     layer.translate(10, 5).unwrap();
     assert_eq!(layer.bounds, Rect::new(5, 10, 7, 12));
-    assert_eq!(layer.mask_rect(), Some(Rect::new(5, 10, 7, 12)));
+    // A move never rewrites a mask rect: the link flag decides whether the mask
+    // follows the layer, and this one is unlinked (absolute).
+    assert_eq!(layer.mask_rect(), Some(Rect::new(0, 0, 2, 2)));
 
     let document = LayeredFile::<u8>::read(fixture("TextLayers/TextLayers_Basic.psd")).unwrap();
     let mut text = document

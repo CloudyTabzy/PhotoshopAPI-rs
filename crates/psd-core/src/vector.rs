@@ -61,6 +61,21 @@ impl PathPoint {
     pub fn to_pixels(&self, width: u32, height: u32) -> (f64, f64) {
         (self.x() * f64::from(width), self.y() * f64::from(height))
     }
+
+    /// Move the point by a delta in 8.24 fixed point — the unit the point is
+    /// stored in, a fraction of the document.
+    pub fn translated(&self, dx: i32, dy: i32) -> Result<Self> {
+        Ok(Self {
+            vertical: self
+                .vertical
+                .checked_add(dy)
+                .ok_or_else(|| invalid_vector("path point overflows the 8.24 range"))?,
+            horizontal: self
+                .horizontal
+                .checked_add(dx)
+                .ok_or_else(|| invalid_vector("path point overflows the 8.24 range"))?,
+        })
+    }
 }
 
 /// Convert a signed 8.24 fixed-point value.
@@ -269,6 +284,47 @@ impl VectorPath {
         writer.into_inner()
     }
 
+    /// Move every knot and the clipboard bounds by a delta in 8.24 fixed point.
+    ///
+    /// Path coordinates are **fractions of the document**, not pixels, so the
+    /// caller converts a pixel move with the document size — a path is
+    /// document-relative geometry and cannot be moved without it. Records that
+    /// carry no coordinates (the fill rule, subpath headers, knot flags) are
+    /// left alone.
+    pub fn translate(&mut self, dx: i32, dy: i32) -> Result<()> {
+        for record in &mut self.records {
+            match record {
+                PathRecord::Knot(knot) => {
+                    knot.preceding = knot.preceding.translated(dx, dy)?;
+                    knot.anchor = knot.anchor.translated(dx, dy)?;
+                    knot.leaving = knot.leaving.translated(dx, dy)?;
+                }
+                PathRecord::Clipboard {
+                    top,
+                    left,
+                    bottom,
+                    right,
+                    ..
+                } => {
+                    *top = top.checked_add(dy).ok_or_else(|| {
+                        invalid_vector("clipboard bound overflows the 8.24 range")
+                    })?;
+                    *left = left.checked_add(dx).ok_or_else(|| {
+                        invalid_vector("clipboard bound overflows the 8.24 range")
+                    })?;
+                    *bottom = bottom.checked_add(dy).ok_or_else(|| {
+                        invalid_vector("clipboard bound overflows the 8.24 range")
+                    })?;
+                    *right = right.checked_add(dx).ok_or_else(|| {
+                        invalid_vector("clipboard bound overflows the 8.24 range")
+                    })?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     fn read_from(reader: &mut BeReader) -> Result<Self> {
         let mut records = Vec::with_capacity(reader.remaining() / PATH_RECORD_SIZE);
         while reader.remaining() >= PATH_RECORD_SIZE {
@@ -355,6 +411,12 @@ impl VectorMask {
 
     pub fn inverted(&self) -> bool {
         self.flags & 1 != 0
+    }
+
+    /// Move the mask's path by a delta in 8.24 fixed point; see
+    /// [`VectorPath::translate`] for the unit and why it needs the document.
+    pub fn translate(&mut self, dx: i32, dy: i32) -> Result<()> {
+        self.path.translate(dx, dy)
     }
 
     pub fn not_linked(&self) -> bool {

@@ -486,15 +486,23 @@ pub fn set_center<T: BitDepth>(
             },
         );
     }
-    handle.with_layer_mut(|layer| {
-        let (current_x, current_y) = layer.center();
-        let dx = x.map_or(0.0, |x| x - current_x).round();
-        let dy = y.map_or(0.0, |y| y - current_y).round();
-        if dx.abs() > f64::from(i32::MAX) || dy.abs() > f64::from(i32::MAX) {
-            return Err(PyValueError::new_err("layer center is out of range"));
-        }
-        layer.translate(dx as i32, dy as i32).map_err(psd_error)
-    })
+    let (current_x, current_y) = handle.with_layer(|layer| Ok(layer.center()))?;
+    let dx = x.map_or(0.0, |x| x - current_x).round();
+    let dy = y.map_or(0.0, |y| y - current_y).round();
+    if dx.abs() > f64::from(i32::MAX) || dy.abs() > f64::from(i32::MAX) {
+        return Err(PyValueError::new_err("layer center is out of range"));
+    }
+    handle.with_document_mut(
+        |file, id| {
+            file.translate_layer(id, dx as i32, dy as i32)
+                .map_err(psd_error)
+        },
+        |layer| {
+            layer
+                .translate_with_path_delta(dx as i32, dy as i32, None)
+                .map_err(psd_error)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

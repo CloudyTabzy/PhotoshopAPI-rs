@@ -23,6 +23,7 @@ use crate::channels::{
     compress_channel, decompress_channel, ChannelKey, ChannelStore, RawChannelData,
 };
 use crate::composite::merged::MergedImageData;
+use crate::geometry::Point2;
 use crate::layer::upsert_block;
 use crate::layer::{
     AdjustmentLayer, GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Rect, ShapeLayer, TextLayer,
@@ -986,6 +987,46 @@ impl<T: BitDepth> LayeredFile<T> {
 
     pub fn layer_mut(&mut self, id: LayerId) -> Option<&mut Layer<T>> {
         self.layers.get_mut(id)?.as_mut()
+    }
+
+    /// Move a layer and everything it carries, the way Photoshop's Move tool
+    /// does.
+    ///
+    /// Every layer in the subtree moves — a group takes its children with it —
+    /// and each layer moves what it owns: pixel bounds, a text layer's
+    /// transform, and vector geometry (a shape's path or a `vmsk`/`vsms` vector
+    /// mask). Paths are stored as fractions of the document, so this is the
+    /// entry point that can convert a pixel move for them; a layer on its own
+    /// cannot, and [`Layer::translate`] refuses rather than moving halfway.
+    ///
+    /// Mask **rects** are never rewritten: a mask's stored rect is relative to
+    /// the layer when its link flag is set and absolute otherwise, so a linked
+    /// mask follows implicitly and an unlinked one stays where it is. A smart
+    /// object routes through [`move_smart_object`](Self::move_smart_object) so
+    /// its warp re-renders.
+    pub fn translate_layer(&mut self, id: LayerId, dx: i32, dy: i32) -> Result<()> {
+        if self.layer(id).is_none() {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "unknown layer id",
+            });
+        }
+        let path_dx = fraction_delta(dx, self.width)?;
+        let path_dy = fraction_delta(dy, self.height)?;
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            if let Some(children) = self.children(Some(current)) {
+                stack.extend(children.iter().copied());
+            }
+            if self.layer(current).is_some_and(Layer::is_smart_object) {
+                self.move_smart_object(current, Point2::new(f64::from(dx), f64::from(dy)))?;
+                continue;
+            }
+            if let Some(layer) = self.layer_mut(current) {
+                layer.translate_with_path_delta(dx, dy, Some((path_dx, path_dy)))?;
+            }
+        }
+        Ok(())
     }
 
     /// Decode one raw-backed layer or mask channel into the layer's
@@ -2446,6 +2487,22 @@ impl<T: BitDepth> LayeredFile<T> {
         }
         patterns
     }
+}
+
+/// A pixel delta in the 8.24 fixed-point unit path coordinates use — a fraction
+/// of the document extent.
+fn fraction_delta(pixels: i32, extent: u32) -> Result<i32> {
+    if extent == 0 {
+        return Ok(0);
+    }
+    let fraction = f64::from(pixels) / f64::from(extent) * f64::from(1 << 24);
+    if !fraction.is_finite() || fraction.abs() > f64::from(i32::MAX) {
+        return Err(PsdError::InvalidData {
+            offset: 0,
+            message: "layer move is outside the path coordinate range",
+        });
+    }
+    Ok(fraction.round() as i32)
 }
 
 #[cfg(test)]

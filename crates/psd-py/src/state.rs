@@ -265,6 +265,35 @@ impl<T: BitDepth> LayerHandle<T> {
         }
     }
 
+    /// Document-level operations that only make sense with the document around
+    /// the layer: `attached` gets the document and the layer's id, `detached`
+    /// gets the layer alone (no document, so anything that needs the document's
+    /// size or the layer's siblings has to refuse there).
+    pub fn with_document_mut<R>(
+        &self,
+        attached: impl FnOnce(&mut LayeredFile<T>, LayerId) -> PyResult<R>,
+        detached: impl FnOnce(&mut Layer<T>) -> PyResult<R>,
+    ) -> PyResult<R> {
+        let mut target = self.target.lock().map_err(|_| lock_error())?;
+        match &mut *target {
+            LayerTarget::Attached { document, id } => {
+                let id = *id;
+                write_document(document, |file| attached(file, id))
+            }
+            LayerTarget::Detached { tree, .. } => detached(&mut tree.layer),
+            LayerTarget::Nested { root, path } => {
+                let mut root = root.lock().map_err(|_| lock_error())?;
+                match &mut *root {
+                    LayerTarget::Detached { tree, .. } => {
+                        detached(&mut tree.get_mut(path).ok_or_else(stale_error)?.layer)
+                    }
+                    _ => Err(stale_error()),
+                }
+            }
+            LayerTarget::Moving => Err(stale_error()),
+        }
+    }
+
     /// Smart-object operations need the document holding the link records:
     /// `attached` gets the document and id, `detached` the home document and
     /// the layer itself.

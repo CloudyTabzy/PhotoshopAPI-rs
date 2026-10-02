@@ -12,6 +12,41 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-03
+
+### Changed (breaking)
+
+- `Layer::translate` no longer rewrites mask rects, and **refuses** a layer that carries vector
+  geometry instead of moving it halfway. A mask's stored rect is relative to the layer when its
+  link flag is set and absolute otherwise, so a move must leave it alone: Photoshop's Move tool
+  carries a *linked* mask implicitly and leaves an *unlinked* one where it is. Vector geometry
+  (a shape's path, or any `vmsk`/`vsms` vector mask) is stored as fractions of the document, so
+  a layer on its own cannot move it — moving only the bounds would leave the path behind and
+  Photoshop would snap the layer back on its next re-render.
+- `Layer::translate_with_path_delta` is the primitive that takes the document-relative delta;
+  `Layer::translate` delegates to it with `None`.
+
+### Added
+
+- `LayeredFile::translate_layer`: the document-level move, the way Photoshop's Move tool works.
+  It walks the subtree (a group takes its children and grandchildren), converts the pixel delta
+  into the 8.24 fixed-point unit paths are stored in, moves each layer's pixel bounds, a text
+  layer's transform and its vector geometry, and routes smart objects through
+  `move_smart_object`.
+- `psd-core`: `VectorPath::translate`, `VectorMask::translate` and `PathPoint::translated` —
+  checked geometry moves over the knots and the clipboard record, leaving records that carry no
+  coordinates alone.
+- The Python bindings' layer `move` uses the document-level move when the layer belongs to a
+  document, so groups and vector-bearing layers behave like Photoshop's Move tool; a detached
+  layer still uses the primitive (and refuses vector geometry, which needs the document).
+
+### Tests
+
+- New `crates/psd/tests/layer_move.rs`: mask rects never move in either link state, a shape
+  path moves by the document-relative delta while the layer-level move refuses it, a group
+  carries its children and grandchildren, and a text layer's transform moves.
+- Two existing tests asserted the old mask-moving behavior; they now assert the pinned rule.
+
 ## [0.12.19] - 2026-10-02
 
 ### Added
