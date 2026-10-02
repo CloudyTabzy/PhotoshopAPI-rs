@@ -1986,9 +1986,11 @@ mod tests {
         assert_eq!(decoded.file_type, *b"8BPB");
         assert_eq!((decoded.raster.width(), decoded.raster.height()), (2, 1));
         for channel in 0..3 {
+            // The synthesized merged section is a white fill (Photoshop's own
+            // matte convention), at the document's depth.
             assert_eq!(
                 decoded.raster.channel(ChannelKey::color(channel)),
-                Some(&[0, 0][..])
+                Some(&[u16::MAX, u16::MAX][..])
             );
         }
         assert!(decoded.raster.channel(ChannelKey::ALPHA).is_none());

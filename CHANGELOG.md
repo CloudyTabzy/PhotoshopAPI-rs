@@ -12,6 +12,18 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-10-03
+
+### Changed
+
+- **The merged-image placeholder is a white fill, not a black one.** Photoshop stores a
+  transparent merge already matted over white (`[255, 255, 255, 0]`) and a document saved
+  without a merge carries a solid fill of that shape; a three-channel document has no alpha to
+  hide behind, so white is also what a reader that only shows the merged image expects. The
+  RLE framing is unchanged (`write_fill_scanline` takes the fill byte), and `MERGED_FILL`
+  names it.
+
+
 ## [0.13.1] - 2026-10-03
 
 ### Fixed
