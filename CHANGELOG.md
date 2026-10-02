@@ -12,6 +12,16 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.18] - 2026-10-02
+
+### Added
+
+- `LayeredFile::convert_bit_depth` converts channel samples between 8-, 16- and 32-bit
+  documents while preserving layer structure, masks, profiles, metadata and layerless merged
+  pixels. It decodes lazy channels in the output copy and charges the copy to the remaining
+  bitmap memory budget. Unsupported mode/depth pairs are rejected. Float-to-integer conversion
+  clips HDR and negative samples; widening integer data does not restore lost precision.
+
 ## [0.12.17] - 2026-10-02
 
 ### Fixed

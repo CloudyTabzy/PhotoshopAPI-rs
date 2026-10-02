@@ -46,6 +46,17 @@ pub trait BitDepth: BeConvert + Copy + PartialEq + Default + Send + Sync + 'stat
     fn widen_sixteen(source: u16) -> Self;
 }
 
+/// Convert one normalized sample using the port's bit-depth widening and
+/// rounding rules. Integer destinations clip out-of-range float samples.
+pub(crate) fn convert_sample<S: BitDepth, D: BitDepth>(sample: S) -> D {
+    match S::DEPTH {
+        8 => D::widen_eight(u8::from_f32(sample.to_f32())),
+        16 => D::widen_sixteen(u16::from_f32(sample.to_f32())),
+        32 => D::from_f32(sample.to_f32()),
+        _ => unreachable!("BitDepth is sealed to supported sample widths"),
+    }
+}
+
 impl BitDepth for u8 {
     const DEPTH: u16 = 8;
     const ZERO: Self = 0;

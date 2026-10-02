@@ -190,6 +190,83 @@ impl<T> ChannelStore<T> {
     }
 }
 
+impl<T: BitDepth> ChannelStore<T> {
+    /// Additional decoded-channel memory needed by a depth conversion.
+    pub(crate) fn conversion_footprint<U: BitDepth>(
+        &self,
+        target_bytes: &mut usize,
+        raw_scratch_peak: &mut usize,
+    ) -> Result<()> {
+        for entry in self.channels.values() {
+            let (samples, raw) = match entry {
+                ChannelEntry::Decoded(samples) => (samples.len(), false),
+                ChannelEntry::Raw(data) => (
+                    data.width
+                        .checked_mul(data.height)
+                        .ok_or(PsdError::InvalidData {
+                            offset: 0,
+                            message: "channel dimensions overflow during bit-depth conversion",
+                        })?,
+                    true,
+                ),
+            };
+            let output_bytes = samples.checked_mul(U::SIZE).ok_or(PsdError::InvalidData {
+                offset: 0,
+                message: "converted channel size overflows",
+            })?;
+            *target_bytes =
+                target_bytes
+                    .checked_add(output_bytes)
+                    .ok_or(PsdError::InvalidData {
+                        offset: 0,
+                        message: "converted document channel size overflows",
+                    })?;
+            if raw {
+                // Decompression temporarily holds both the decoded source
+                // samples and the codec's byte buffer.
+                let scratch = samples
+                    .checked_mul(T::SIZE)
+                    .and_then(|bytes| bytes.checked_mul(2))
+                    .ok_or(PsdError::InvalidData {
+                        offset: 0,
+                        message: "channel decode workspace overflows",
+                    })?;
+                *raw_scratch_peak = (*raw_scratch_peak).max(scratch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Convert every decoded or lazy channel while keeping its key and order.
+    pub(crate) fn convert_bit_depth<U: BitDepth>(
+        &self,
+        source_depth: u16,
+    ) -> Result<ChannelStore<U>> {
+        let mut converted = ChannelStore::new();
+        for (&key, entry) in &self.channels {
+            let samples = match entry {
+                ChannelEntry::Decoded(samples) => samples.clone(),
+                ChannelEntry::Raw(raw) => decompress_channel::<T>(
+                    raw.compression,
+                    &raw.payload,
+                    raw.width,
+                    raw.height,
+                    raw.version,
+                    source_depth,
+                )?,
+            };
+            converted.insert(
+                key,
+                samples
+                    .into_iter()
+                    .map(crate::bitdepth::convert_sample::<T, U>)
+                    .collect(),
+            );
+        }
+        Ok(converted)
+    }
+}
+
 /// Map a codec failure into the workspace error type.
 fn codec_error(error: psd_codecs::CodecError) -> PsdError {
     PsdError::Compression(error.to_string())

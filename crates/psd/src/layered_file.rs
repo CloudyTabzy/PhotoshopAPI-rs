@@ -321,6 +321,112 @@ impl<T: BitDepth> PartialEq for LayeredFile<T> {
 }
 
 impl<T: BitDepth> LayeredFile<T> {
+    /// Return a copy of this document with channel samples converted to
+    /// another PSD bit depth. Layer structure, masks, tagged blocks, profiles,
+    /// and unknown passthrough data are preserved. Lazy channels are decoded
+    /// and converted in the returned document.
+    ///
+    /// Samples are normalized, then rounded to the destination integer range.
+    /// Converting 32-bit float samples to integer depth clips values outside
+    /// `0..=1`; converting from integer depth cannot restore precision that was
+    /// discarded in the source. This is a sample conversion, not Photoshop's
+    /// color-managed bit-depth conversion.
+    ///
+    /// The source document remains unchanged. The target's decoded layer
+    /// channels and the temporary work for lazy channels must fit the remaining
+    /// bitmap memory budget.
+    pub fn convert_bit_depth<U: BitDepth>(&self) -> Result<LayeredFile<U>> {
+        let mode_supports_depth = match self.color_mode {
+            ColorMode::Bitmap => U::DEPTH == 8,
+            ColorMode::Indexed | ColorMode::Duotone => U::DEPTH == 8,
+            ColorMode::Cmyk | ColorMode::Lab | ColorMode::Multichannel => {
+                matches!(U::DEPTH, 8 | 16)
+            }
+            ColorMode::Grayscale | ColorMode::Rgb => matches!(U::DEPTH, 8 | 16 | 32),
+        };
+        if !mode_supports_depth {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "target bit depth is not supported by the document color mode",
+            });
+        }
+        let _ = FileHeader::new(
+            self.version,
+            self.num_channels,
+            self.width,
+            self.height,
+            depth_enum::<U>(),
+            self.color_mode,
+        )?;
+
+        let mut target_bytes = 0usize;
+        let mut raw_scratch_peak = 0usize;
+        for layer in self.layers.iter().flatten() {
+            layer.conversion_footprint::<U>(&mut target_bytes, &mut raw_scratch_peak)?;
+        }
+        if let Some(available) = self.remaining_bitmap_memory {
+            let requested =
+                target_bytes
+                    .checked_add(raw_scratch_peak)
+                    .ok_or(PsdError::InvalidData {
+                        offset: 0,
+                        message: "bit-depth conversion memory size overflows",
+                    })?;
+            if requested > available {
+                return Err(PsdError::ExceededMemoryLimit {
+                    requested,
+                    available,
+                });
+            }
+        }
+
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .as_ref()
+                    .map(|layer| layer.convert_bit_depth::<U>(self.source_depth))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let stored_merged_image = self
+            .stored_merged_image
+            .as_ref()
+            .map(MergedImageData::convert_depth::<T, U>)
+            .transpose()?;
+
+        Ok(LayeredFile {
+            version: self.version,
+            width: self.width,
+            height: self.height,
+            color_mode: self.color_mode,
+            num_channels: self.num_channels,
+            source_depth: if self.source_depth == 1 && U::DEPTH == 8 {
+                1
+            } else {
+                U::DEPTH
+            },
+            dpi: self.dpi,
+            icc_profile: self.icc_profile.clone(),
+            color_mode_data: self.color_mode_data.clone(),
+            image_resources: self.image_resources.clone(),
+            global_layer_mask_info: self.global_layer_mask_info.clone(),
+            document_blocks: self.document_blocks.clone(),
+            has_merged_alpha: self.has_merged_alpha,
+            compression: self.compression,
+            source_path: self.source_path.clone(),
+            text_cache: self.text_cache.clone(),
+            linked_sources: self.linked_sources.clone(),
+            remaining_bitmap_memory: self
+                .remaining_bitmap_memory
+                .map(|remaining| remaining - target_bytes),
+            stored_merged_image,
+            layers,
+            root_children: self.root_children.clone(),
+        })
+    }
+
     /// Create an empty document (no layers). Defaults to a PSD container.
     pub fn new(color_mode: ColorMode, width: u32, height: u32) -> Result<Self> {
         let num_channels = color_channel_count(color_mode);

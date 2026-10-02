@@ -194,6 +194,19 @@ Requires Python 3.9 or newer. Wheels are built with
 The primary type is `LayeredFile<T>`, where `T` is `u8`, `u16` or `f32` for the
 three bit depths. Layers are addressed by `LayerId` or by path.
 
+Convert a document to another channel sample depth with `convert_bit_depth`:
+
+```rust
+let sixteen_bit = document.convert_bit_depth::<u16>()?;
+sixteen_bit.write("output-16bit.psd")?;
+```
+
+The source remains unchanged. Float samples outside `0.0..=1.0` are clipped
+when converting to an integer depth; widening integer samples cannot restore
+detail discarded at a lower depth. The conversion observes the document's
+bitmap memory budget and rejects color-mode/depth combinations Photoshop
+doesn't support, such as 32-bit CMYK and 16-bit Indexed.
+
 ### Rust
 
 ```rust

@@ -28,6 +28,70 @@ pub(crate) struct MergedImageData {
 }
 
 impl MergedImageData {
+    /// Convert a retained layerless composite to another sample depth. The
+    /// plane order, transparency flag and document geometry are kept; its raw
+    /// image payload is rewritten without changing the pixel values beyond
+    /// the source and target sample conversion rules.
+    pub(crate) fn convert_depth<S: BitDepth, D: BitDepth>(&self) -> Result<Self> {
+        if S::DEPTH == D::DEPTH {
+            return Ok(self.clone());
+        }
+        let pixels = usize::try_from(self.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(self.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or_else(|| invalid("merged conversion dimensions overflow"))?;
+        let decoded_size = pixels
+            .checked_mul(usize::from(self.channels))
+            .and_then(|samples| samples.checked_mul(D::SIZE))
+            .ok_or_else(|| invalid("converted merged image size overflows"))?;
+        if decoded_size > MAX_MERGED_DECODED_BYTES {
+            return Err(PsdError::ExceededMemoryLimit {
+                requested: decoded_size,
+                available: MAX_MERGED_DECODED_BYTES,
+            });
+        }
+        let section_size = decoded_size
+            .checked_add(2)
+            .ok_or_else(|| invalid("converted merged section size overflows"))?;
+        if section_size > MAX_MERGED_SECTION_BYTES {
+            return Err(PsdError::ExceededMemoryLimit {
+                requested: section_size,
+                available: MAX_MERGED_SECTION_BYTES,
+            });
+        }
+
+        // A depth change cannot reuse the packed source stream; write a valid
+        // planar Raw section for the target sample width.
+        let mut section = Vec::with_capacity(section_size);
+        section.extend_from_slice(&Compression::Raw.as_raw().to_be_bytes());
+        for plane in self.decode::<S>()? {
+            let converted: Vec<D> = plane
+                .into_iter()
+                .map(crate::bitdepth::convert_sample::<S, D>)
+                .collect();
+            section.extend_from_slice(&psd_codecs::endian::encode_be_bytes(&converted));
+        }
+        Ok(Self {
+            version: self.version,
+            width: self.width,
+            height: self.height,
+            depth: match D::DEPTH {
+                8 => CoreBitDepth::Eight,
+                16 => CoreBitDepth::Sixteen,
+                32 => CoreBitDepth::ThirtyTwo,
+                _ => unreachable!("BitDepth is sealed to supported sample widths"),
+            },
+            color_mode: self.color_mode,
+            channels: self.channels,
+            transparency: self.transparency,
+            section,
+        })
+    }
+
     pub fn read(section: &[u8], header: &FileHeader, transparency: bool) -> Result<Option<Self>> {
         if section.len() < 2 {
             return Ok(None);

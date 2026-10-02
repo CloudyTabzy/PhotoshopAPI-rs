@@ -209,6 +209,68 @@ pub struct Layer<T: BitDepth> {
 }
 
 impl<T: BitDepth> Layer<T> {
+    pub(crate) fn conversion_footprint<U: BitDepth>(
+        &self,
+        target_bytes: &mut usize,
+        raw_scratch_peak: &mut usize,
+    ) -> Result<()> {
+        match &self.kind {
+            LayerKind::Image(layer) => layer
+                .channels
+                .conversion_footprint::<U>(target_bytes, raw_scratch_peak),
+            LayerKind::Text(layer) => layer
+                .channels
+                .conversion_footprint::<U>(target_bytes, raw_scratch_peak),
+            LayerKind::Adjustment(layer) => layer
+                .channels
+                .conversion_footprint::<U>(target_bytes, raw_scratch_peak),
+            LayerKind::Shape(layer) => layer
+                .channels
+                .conversion_footprint::<U>(target_bytes, raw_scratch_peak),
+            LayerKind::Group(layer) => layer
+                .channels
+                .conversion_footprint::<U>(target_bytes, raw_scratch_peak),
+            LayerKind::SectionDivider(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn convert_bit_depth<U: BitDepth>(&self, source_depth: u16) -> Result<Layer<U>> {
+        let kind = match &self.kind {
+            LayerKind::Image(layer) => LayerKind::Image(ImageLayer {
+                channels: layer.channels.convert_bit_depth::<U>(source_depth)?,
+            }),
+            LayerKind::Text(layer) => LayerKind::Text(TextLayer {
+                channels: layer.channels.convert_bit_depth::<U>(source_depth)?,
+            }),
+            LayerKind::Adjustment(layer) => LayerKind::Adjustment(AdjustmentLayer {
+                channels: layer.channels.convert_bit_depth::<U>(source_depth)?,
+            }),
+            LayerKind::Shape(layer) => LayerKind::Shape(ShapeLayer {
+                channels: layer.channels.convert_bit_depth::<U>(source_depth)?,
+            }),
+            LayerKind::Group(layer) => LayerKind::Group(GroupLayer {
+                children: layer.children.clone(),
+                open: layer.open,
+                channels: layer.channels.convert_bit_depth::<U>(source_depth)?,
+            }),
+            LayerKind::SectionDivider(divider) => LayerKind::SectionDivider(*divider),
+        };
+        Ok(Layer {
+            name: self.name.clone(),
+            bounds: self.bounds,
+            opacity: self.opacity,
+            blend_mode: self.blend_mode,
+            flags: self.flags,
+            clipping: self.clipping,
+            mask: self.mask.clone(),
+            blocks: self.blocks.clone(),
+            blending_ranges: self.blending_ranges.clone(),
+            kind,
+            compression: self.compression,
+            mask_compression: self.mask_compression,
+        })
+    }
+
     /// Build an empty image layer with the given name and bounds.
     pub fn new_image(name: impl Into<String>, bounds: Rect) -> Self {
         Self {
