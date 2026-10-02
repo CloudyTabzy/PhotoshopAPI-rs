@@ -12,6 +12,20 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.15] - 2026-10-02
+
+### Fixed
+
+- A shape layer used as a clipping base now blends as a unit with its clipped layers, like a pixel
+  layer: the base's own colour no longer bleeds through the soft anti-aliased edge of an opaque
+  clipped layer (an orange ellipse with a blue gradient clipped to it used to show an orange
+  fringe).
+- An adjustment layer that is the base of clipped pixel layers no longer transforms the layers
+  below it; it acts on its clip group alone. Clipped adjustment layers do not change this: a
+  base with only clipped adjustments still transforms the backdrop. This follows a Photoshop
+  render of a masked Hue/Saturation base with a clipped gradient layer and is the least certain
+  part of this release.
+
 ## [0.12.14] - 2026-10-02
 
 ### Fixed

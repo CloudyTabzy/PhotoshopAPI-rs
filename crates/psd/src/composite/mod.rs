@@ -628,6 +628,19 @@ impl<T: BitDepth> Compositor<'_, T> {
                 adjustment_coverage,
             );
         }
+        // Approximation: an adjustment that is the base of clipped pixel
+        // layers acts on the clip group alone and leaves the backdrop
+        // untouched (one reference: a Hue/Saturation base with a soft mask
+        // and a clipped gradient layer shows no hue shift in the layers
+        // below). Clipped adjustment layers do not isolate it: stacked
+        // clipped adjustments still transform the backdrop.
+        let skip_adjustment = matches!(layer.kind, LayerKind::Adjustment(_))
+            && !self.is_fill_layer(layer)
+            && clipped.iter().any(|&id| {
+                self.document.layer(id).is_some_and(|member| {
+                    member.is_visible() && !matches!(member.kind, LayerKind::Adjustment(_))
+                })
+            });
         let adjustment_limit = adjustment_coverage.as_deref();
         let is_clip_base = !clipped.is_empty();
         let defer_effects = !clipped.is_empty()
@@ -640,7 +653,9 @@ impl<T: BitDepth> Compositor<'_, T> {
                 .typed_effects(layer)
                 .as_ref()
                 .is_some_and(effects::has_effects);
-        let mut base_coverage = if defer_effects {
+        let mut base_coverage = if skip_adjustment {
+            None
+        } else if defer_effects {
             self.without_effects().composite_layer(
                 base,
                 canvas,
@@ -719,7 +734,10 @@ impl<T: BitDepth> Compositor<'_, T> {
         if clipped.is_empty()
             || !matches!(
                 layer.kind,
-                LayerKind::Image(_) | LayerKind::Text(_) | LayerKind::Group(_)
+                LayerKind::Image(_)
+                    | LayerKind::Text(_)
+                    | LayerKind::Shape(_)
+                    | LayerKind::Group(_)
             )
             || layer.blend_mode == BlendMode::DISSOLVE
             || knockout_setting(layer) != KnockoutSetting::None

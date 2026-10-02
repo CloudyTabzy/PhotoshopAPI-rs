@@ -1019,6 +1019,38 @@ fn invert_layer() -> Layer<u8> {
 }
 
 #[test]
+fn an_adjustment_base_with_clipped_pixels_leaves_the_backdrop_alone() {
+    let mut doc = document(2, 1);
+    doc.add_layer(solid("backdrop", (0, 0, 1, 2), [255, 0, 0]));
+    let base = doc.add_layer(invert_layer());
+    doc.layer_mut(base).unwrap().set_clipping_mask(false);
+    let mut clipped = solid("clipped", (0, 0, 1, 2), [0, 0, 255]);
+    clipped.set_clipping_mask(true);
+    doc.add_layer(clipped);
+    // The inversion would turn red into cyan below the blue layer; the blue
+    // layer covers it fully anyway, so make it half transparent to see it.
+    let id = doc.layers_with_ids().last().unwrap().0;
+    doc.layer_mut(id)
+        .unwrap()
+        .image_mut()
+        .unwrap()
+        .set_channel(ChannelKey::ALPHA, vec![128; 2]);
+    close(flatten(&doc).pixel(0, 0), [127, 0, 128, 255]);
+}
+
+#[test]
+fn an_adjustment_base_with_a_clipped_adjustment_still_transforms_the_backdrop() {
+    let mut doc = document(1, 1);
+    doc.add_layer(solid("backdrop", (0, 0, 1, 1), [255, 0, 0]));
+    doc.add_layer(invert_layer());
+    let mut clipped = invert_layer();
+    clipped.set_clipping_mask(true);
+    doc.add_layer(clipped);
+    // The base inverts the red; the clipped inversion undoes it where the
+    // base lies (an adjustment base covers the whole canvas).
+    close(flatten(&doc).pixel(0, 0), [255, 0, 0, 255]);
+}
+#[test]
 fn adjustments_apply_their_blend_mode_without_changing_alpha() {
     for (mode, expected) in [(BlendMode::MULTIPLY, 64), (BlendMode::SCREEN, 191)] {
         let mut doc = document(1, 1);
