@@ -12,6 +12,23 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.7] - 2026-10-03
+
+### Fixed
+
+- **A Linear gradient fill now runs between whole-pixel end points.** Photoshop truncates the two
+  ends of the fill's axis (the chord through the bounds' centre, `centre ∓ half the chord`) to
+  whole pixels and projects each pixel's *integer* coordinate onto that segment, so a slanted fill
+  is a little steeper than its stored angle and sits at a fractional offset from the exact centre
+  line; along a pixel axis the rule reduces to sampling at the pixel's corner instead of its
+  middle. Measured on Photoshop flattens: `photoshop-shape-gradient` fell from mean 1.22 to
+  **0.39** (dither noise sets the floor), and in the stored-merge set the 90/180° fills of
+  `masks3` (2.06 → 0.20), `knockout-isolated-groups` (1.18 → 0.09) and `vector-mask2`
+  (2.00 → 0.16) and the 150° `rgb-blend-modes` (2.11 → 1.68) improved, with no regression.
+  Radial, Angle, Reflected and Diamond fills and layer-effect gradients keep their geometry. The
+  rule is fitted to one slanted fill and several axis-aligned ones; how a negative coordinate or
+  a scaled axis rounds is not verified.
+
 ## [0.13.6] - 2026-10-03
 
 ### Fixed

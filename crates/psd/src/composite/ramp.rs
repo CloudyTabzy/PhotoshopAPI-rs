@@ -484,10 +484,13 @@ pub(crate) fn position(placement: &Placement, span: Span, basis: SpanBasis, x: i
         center_x = center_x.floor() + 0.5;
         center_y = center_y.floor() + 0.5;
     }
-    let px = x as f32 + 0.5;
-    let py = y as f32 + 0.5;
     let radians = placement.angle.to_radians();
     let (sin, cos) = radians.sin_cos();
+    if basis == SpanBasis::CenterChord && placement.style == GradientStyle::Linear {
+        return linear_fill_position(placement, span, center_x, center_y, (sin, cos), x, y);
+    }
+    let px = x as f32 + 0.5;
+    let py = y as f32 + 0.5;
     let local_x = (px - center_x) * cos - (py - center_y) * sin;
     let local_y = (px - center_x) * sin + (py - center_y) * cos;
 
@@ -533,6 +536,58 @@ pub(crate) fn position(placement: &Placement, span: Span, basis: SpanBasis, x: i
         GradientStyle::Reflected => local_x.abs() / half_ramp,
         GradientStyle::Diamond => (local_x.abs() + local_y.abs()) / half_ramp,
         _ => 0.5 + local_x / (2.0 * half_ramp),
+    };
+    if placement.reverse {
+        position = 1.0 - position;
+    }
+    position.clamp(0.0, 1.0)
+}
+
+/// A Linear gradient fill's position: Photoshop places the axis between two
+/// whole-pixel end points (the chord's ends, truncated to integers) and
+/// projects the pixel's integer coordinate onto it, so a slanted axis is
+/// slightly steeper than the angle says and sits at a fractional offset from
+/// the exact centre line. For axes along a pixel axis this reduces to sampling
+/// at the pixel's corner instead of its centre.
+///
+/// Approximation: fitted to one slanted fill (37 degrees), with axis-aligned
+/// and 150 / 45 degree fills checked; the rounding of negative coordinates and
+/// of a scaled axis is a guess.
+fn linear_fill_position(
+    placement: &Placement,
+    span: Span,
+    center_x: f32,
+    center_y: f32,
+    (sin, cos): (f32, f32),
+    x: i32,
+    y: i32,
+) -> f32 {
+    let (abs_cos, abs_sin) = (cos.abs(), sin.abs());
+    let along_width = if abs_cos > 1e-6 {
+        span.width / abs_cos
+    } else {
+        f32::INFINITY
+    };
+    let along_height = if abs_sin > 1e-6 {
+        span.height / abs_sin
+    } else {
+        f32::INFINITY
+    };
+    let chord = along_width.min(along_height).max(1.0);
+    let half = chord * (placement.scale / 100.0).max(0.01) * 0.5;
+    // The angle runs counter-clockwise; image rows run down.
+    let (ux, uy) = (cos, -sin);
+    // Whole pixels, with a little slack so that a coordinate that is a
+    // whole number up to rounding (63.999996) is not floored a pixel short.
+    let whole = |v: f32| (v + 1e-3).floor();
+    let start = (whole(center_x - ux * half), whole(center_y - uy * half));
+    let end = (whole(center_x + ux * half), whole(center_y + uy * half));
+    let (dx, dy) = (end.0 - start.0, end.1 - start.1);
+    let length_squared = dx * dx + dy * dy;
+    let mut position = if length_squared < 1.0 {
+        0.5
+    } else {
+        ((x as f32 - start.0) * dx + (y as f32 - start.1) * dy) / length_squared
     };
     if placement.reverse {
         position = 1.0 - position;
@@ -676,6 +731,40 @@ mod tests {
             ..linear
         };
         assert_eq!(position(&reversed, span, SpanBasis::Projection, 0, 1), 1.0);
+    }
+
+    #[test]
+    fn a_linear_fill_runs_between_whole_pixel_end_points() {
+        let span = Span {
+            left: 6.0,
+            top: 6.0,
+            width: 52.0,
+            height: 52.0,
+        };
+        let slanted = Placement {
+            angle: 37.0,
+            ..placement(GradientStyle::Linear)
+        };
+        let at = |x, y| position(&slanted, span, SpanBasis::CenterChord, x, y);
+        // The chord's ends (6, 51.59) and (58, 12.41) truncate to (6, 51) and
+        // (58, 12); the pixel at each end point sits exactly on the ramp's end.
+        assert!(at(6, 51).abs() < 1e-5, "{}", at(6, 51));
+        assert!((at(58, 12) - 1.0).abs() < 1e-5, "{}", at(58, 12));
+        // Along a pixel axis the whole-pixel rule reduces to sampling at the
+        // pixel's corner: a 10 px wide fill at 180 degrees runs 1 to 0 from
+        // its right edge (x = 10) to its left (x = 0), so x = 5 is the middle.
+        let flat = Placement {
+            angle: 180.0,
+            ..placement(GradientStyle::Linear)
+        };
+        let across = Span {
+            left: 0.0,
+            top: 0.0,
+            width: 10.0,
+            height: 4.0,
+        };
+        let middle = position(&flat, across, SpanBasis::CenterChord, 5, 1);
+        assert!((middle - 0.5).abs() < 1e-5, "{middle}");
     }
 
     #[test]
