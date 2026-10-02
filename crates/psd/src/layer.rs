@@ -1147,10 +1147,12 @@ impl<T: BitDepth> Layer<T> {
     ///
     /// What moves: the pixel bounds, and a text layer's `TySh` transform so
     /// Photoshop re-renders the text at the new position. **Mask rects are
-    /// never rewritten** — a mask's stored rect is interpreted relative to the
-    /// layer when its link flag is set and as absolute otherwise, so a linked
-    /// mask follows implicitly and an unlinked one stays where it is, which is
-    /// what Photoshop's Move tool does.
+    /// never rewritten** — the mask flag's bit 0 is the specification's
+    /// "position relative to layer", i.e. a statement about the stored rect's
+    /// coordinate space, so a relative mask follows the layer implicitly and an
+    /// absolute one stays where it is. (Photoshop's *UI* link toggle is
+    /// observed to behave the same way, but writers disagree about which state
+    /// sets the bit, so this method never assumes and never rewrites.)
     ///
     /// What this method cannot do, and refuses instead of doing halfway:
     ///
