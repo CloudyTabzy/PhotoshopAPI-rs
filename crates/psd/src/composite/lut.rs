@@ -36,7 +36,10 @@ impl Lut3d {
                 "DOMAIN_MIN" => domain_min = parse_triple(words)?,
                 "DOMAIN_MAX" => domain_max = parse_triple(words)?,
                 _ => {
-                    let red = first.parse::<f32>().ok()?;
+                    let red = first
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|value| value.is_finite())?;
                     let [green, blue] = parse_pair(words)?;
                     table.push([red, green, blue]);
                 }
@@ -60,12 +63,12 @@ impl Lut3d {
         self.table[red + self.size * (green + self.size * blue)]
     }
 
-    /// The table's colour for `color`, by tetrahedral interpolation, clamped
-    /// to the unit range.
+    /// Integer documents use tetrahedral interpolation; float documents use
+    /// trilinear interpolation. Outputs are clamped to the unit range.
     ///
-    /// Approximation: checked only on synthetic tables, with one interpolation
-    /// for every bit depth and no dithering.
-    pub fn eval(&self, color: [f32; 3]) -> [f32; 3] {
+    /// Approximation: table precision and integer rounding are continuous here,
+    /// and dithering is not implemented.
+    pub fn eval(&self, color: [f32; 3], depth: u16) -> [f32; 3] {
         let last = (self.size - 1) as f32;
         let mut base = [0usize; 3];
         let mut fraction = [0.0f32; 3];
@@ -80,6 +83,22 @@ impl Lut3d {
         let [r, g, b] = base;
         let corner = |dr: usize, dg: usize, db: usize| self.at(r + dr, g + dg, b + db);
         let [fr, fg, fb] = fraction;
+        if depth == 32 {
+            let lerp = |a: [f32; 3], b: [f32; 3], t: f32| {
+                std::array::from_fn(|channel| a[channel] + t * (b[channel] - a[channel]))
+            };
+            let near = lerp(
+                lerp(corner(0, 0, 0), corner(1, 0, 0), fr),
+                lerp(corner(0, 1, 0), corner(1, 1, 0), fr),
+                fg,
+            );
+            let far = lerp(
+                lerp(corner(0, 0, 1), corner(1, 0, 1), fr),
+                lerp(corner(0, 1, 1), corner(1, 1, 1), fr),
+                fg,
+            );
+            return lerp(near, far, fb).map(|value| value.clamp(0.0, 1.0));
+        }
         // Walk from the origin corner to the opposite one along the axes in
         // order of decreasing fraction; the path picks the enclosing tetrahedron.
         let mut axes = [(fr, 0usize), (fg, 1), (fb, 2)];
@@ -100,13 +119,15 @@ impl Lut3d {
 }
 
 fn parse_triple<'a>(words: impl Iterator<Item = &'a str>) -> Option<[f32; 3]> {
-    let mut values = words.map(|word| word.parse::<f32>().ok());
-    Some([values.next()??, values.next()??, values.next()??])
+    let mut values = words.map(|word| word.parse::<f32>().ok().filter(|value| value.is_finite()));
+    let triple = [values.next()??, values.next()??, values.next()??];
+    values.next().is_none().then_some(triple)
 }
 
 fn parse_pair<'a>(words: impl Iterator<Item = &'a str>) -> Option<[f32; 2]> {
-    let mut values = words.map(|word| word.parse::<f32>().ok());
-    Some([values.next()??, values.next()??])
+    let mut values = words.map(|word| word.parse::<f32>().ok().filter(|value| value.is_finite()));
+    let pair = [values.next()??, values.next()??];
+    values.next().is_none().then_some(pair)
 }
 
 #[cfg(test)]
@@ -125,7 +146,7 @@ mod tests {
             [1.0, 0.5, 0.0],
             [0.9, 0.9, 0.1],
         ] {
-            let out = lut.eval(color);
+            let out = lut.eval(color, 8);
             for channel in 0..3 {
                 assert!(
                     (out[channel] - color[channel]).abs() < 1e-6,
@@ -140,9 +161,9 @@ mod tests {
         // Swap red and blue in the output.
         let swapped = b"LUT_3D_SIZE 2\n0 0 0\n0 0 1\n0 1 0\n0 1 1\n1 0 0\n1 0 1\n1 1 0\n1 1 1\n";
         let lut = Lut3d::parse_cube(swapped).unwrap();
-        let out = lut.eval([1.0, 0.0, 0.0]);
+        let out = lut.eval([1.0, 0.0, 0.0], 8);
         assert_eq!(out, [0.0, 0.0, 1.0]);
-        let out = lut.eval([0.25, 0.5, 0.75]);
+        let out = lut.eval([0.25, 0.5, 0.75], 8);
         assert!(
             (out[0] - 0.75).abs() < 1e-6 && (out[2] - 0.25).abs() < 1e-6,
             "{out:?}"
@@ -156,7 +177,7 @@ mod tests {
             "LUT_3D_SIZE 2\nDOMAIN_MIN 0 0 0\nDOMAIN_MAX 2 2 2",
         );
         let lut = Lut3d::parse_cube(text.as_bytes()).unwrap();
-        let out = lut.eval([1.0, 1.0, 1.0]);
+        let out = lut.eval([1.0, 1.0, 1.0], 8);
         assert!(
             out.iter().all(|value| (value - 0.5).abs() < 1e-6),
             "{out:?}"
@@ -168,5 +189,38 @@ mod tests {
         assert!(Lut3d::parse_cube(b"LUT_1D_SIZE 4\n0 0 0\n").is_none());
         assert!(Lut3d::parse_cube(b"LUT_3D_SIZE 2\n0 0 0\n").is_none());
         assert!(Lut3d::parse_cube(b"not a table").is_none());
+        for text in [
+            "DOMAIN_MIN NaN 0 0",
+            "DOMAIN_MAX 1 inf 1",
+            "DOMAIN_MIN 0 0 0 1",
+        ] {
+            let cube = format!("{text}\n{}", String::from_utf8_lossy(IDENTITY));
+            assert!(Lut3d::parse_cube(cube.as_bytes()).is_none());
+        }
+        for triple in ["NaN 0 0", "0 inf 0", "0 0 NaN", "0 0 0 1"] {
+            let cube = String::from_utf8_lossy(IDENTITY).replacen("0 0 0", triple, 1);
+            assert!(Lut3d::parse_cube(cube.as_bytes()).is_none());
+        }
+    }
+
+    #[test]
+    fn nonlinear_tables_use_trilinear_interpolation_only_for_float_documents() {
+        // Only the white corner is nonzero: tetrahedral interpolation takes
+        // the smallest fraction, whereas trilinear multiplies all three.
+        let cube = b"LUT_3D_SIZE 2\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n1 1 1\n";
+        let lut = Lut3d::parse_cube(cube).unwrap();
+        for color in [[0.2, 0.5, 0.8], [0.8, 0.2, 0.5], [0.5, 0.8, 0.2], [0.5; 3]] {
+            let minimum = color.into_iter().fold(1.0f32, f32::min);
+            for depth in [8, 16] {
+                assert_eq!(lut.eval(color, depth), [minimum; 3]);
+            }
+            let product = color.into_iter().product::<f32>();
+            assert!(lut
+                .eval(color, 32)
+                .iter()
+                .all(|value| (value - product).abs() < 1e-6));
+        }
+        assert_eq!(lut.eval([1.0; 3], 32), [1.0; 3]);
+        assert_eq!(lut.eval([0.0; 3], 32), [0.0; 3]);
     }
 }

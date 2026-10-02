@@ -4,9 +4,10 @@
 //! and a shadow that composite over the layer with their own blend modes.
 //!
 //! The height field is 0 outside the silhouette and 1 inside. Smooth is the
-//! matte blurred with the tent kernel; Chisel Hard is an exact Euclidean
-//! distance profile and Chisel Soft rounds it with a narrow blur; Soften adds a
-//! further blur. A Contour sub-option reshapes the cross-section, and a
+//! matte blurred with the tent kernel; Chisel Hard is a quantized signed
+//! chamfer profile seeded by fractional alpha. Chisel Soft retains a rounded
+//! Euclidean approximation. Soften precedes the hard chisel transform and
+//! otherwise blurs the generated field. A Contour reshapes the cross-section; a
 //! Texture perturbs the whole face with the pattern's luminance.
 //!
 //! Lighting is the Lambert term `L = N · light` with a normalised normal; the
@@ -91,6 +92,68 @@ fn soften_blur(field: &mut [f32], width: usize, height: usize, soften: f64) {
     }
 }
 
+/// Chisel Hard's signed, quantized 5-by-5 chamfer field. Fractional coverage
+/// seeds the distance itself; thresholding alpha first loses the soft edge.
+/// Both signs propagate independently, with the opposite side treated as
+/// distance zero. A forward and reverse sweep keep corners symmetric.
+fn chisel_hard(matte: &[f32], width: usize, height: usize, size: f64) -> Vec<f32> {
+    const LIMIT: i32 = 32640;
+    let step = f64::from(LIMIT) / (size.max(0.0) + 1.0);
+    let mut field: Vec<i32> = matte
+        .iter()
+        .map(|alpha| ((alpha.clamp(0.0, 1.0) * 255.0).round() as i32 * 256) - LIMIT)
+        .collect();
+    let mut neighbours = Vec::with_capacity(24);
+    for dy in -2i32..=2 {
+        for dx in -2i32..=2 {
+            if dx != 0 || dy != 0 {
+                let distance = f64::from(dx * dx + dy * dy).sqrt();
+                let weight = if dx.abs() + dy.abs() == 2 && (dx == 0 || dy == 0) {
+                    (step as i32) * 2
+                } else {
+                    (step * distance) as i32
+                };
+                neighbours.push((dx, dy, weight.min(LIMIT)));
+            }
+        }
+    }
+    for reverse in [false, true] {
+        if reverse && size <= 2.0 {
+            break;
+        }
+        for ordinal in 0..field.len() {
+            let index = if reverse {
+                field.len() - 1 - ordinal
+            } else {
+                ordinal
+            };
+            let (x, y) = (index % width, index / width);
+            let value = field[index];
+            if value == 0 {
+                continue;
+            }
+            let mut best = value;
+            for &(dx, dy, weight) in &neighbours {
+                let (nx, ny) = (x as i64 + i64::from(dx), y as i64 + i64::from(dy));
+                if nx < 0 || ny < 0 || nx >= width as i64 || ny >= height as i64 {
+                    continue;
+                }
+                let neighbour = field[ny as usize * width + nx as usize];
+                best = if value > 0 {
+                    best.min((neighbour.max(0) + weight).min(LIMIT))
+                } else {
+                    best.max((neighbour.min(0) - weight).max(-LIMIT))
+                };
+            }
+            field[index] = best;
+        }
+    }
+    field
+        .into_iter()
+        .map(|value| (value + LIMIT) as f32 / 65280.0)
+        .collect()
+}
+
 /// How many multiples of the edge mask (per unit of light altitude sine)
 /// texture shading may reach; fitted to a rendered reference.
 const TEXTURE_RELIEF_REACH: f32 = 4.0;
@@ -99,9 +162,10 @@ const TEXTURE_RELIEF_REACH: f32 = 4.0;
 ///
 /// Approximation (the smooth cases match to a fraction of a level; the
 /// contour, texture and large-size cases do not yet match pixel for pixel): a
-/// tent-blurred height field, central-difference lighting scaled empirically,
-/// nine-sample lighting for anti-aliased contours, a fitted cap on texture
-/// shading, and a signed-distance field for the chisel techniques.
+/// tent-blurred height field, calibrated central differences on the plain path,
+/// three-tap gradients and averaged nine-sample lighting on anti-aliased
+/// profiles, a fitted cap on texture shading, and a signed chamfer field for
+/// Hard Chisel (Soft Chisel retains an approximation).
 pub(crate) fn build(
     content: &Content,
     coverage: &[f32],
@@ -196,7 +260,11 @@ pub(crate) fn build(
         let mut field = matte.clone();
         match technique {
             BevelTechnique::Smooth => tent(&mut field, pw, ph, shaping),
-            BevelTechnique::ChiselHard | BevelTechnique::ChiselSoft => {
+            BevelTechnique::ChiselHard => {
+                soften_blur(&mut field, pw, ph, soften);
+                field = chisel_hard(&field, pw, ph, shaping);
+            }
+            BevelTechnique::ChiselSoft => {
                 let shaping = shaping.max(0.01) as f32;
                 // Signed distance, in pixels, to the 50 % coverage contour:
                 // whole-pixel distances to the other side, corrected by how
@@ -220,7 +288,9 @@ pub(crate) fn build(
                 }
             }
         }
-        soften_blur(&mut field, pw, ph, soften);
+        if technique != BevelTechnique::ChiselHard {
+            soften_blur(&mut field, pw, ph, soften);
+        }
         for value in &mut field {
             *value = value.clamp(0.0, 1.0);
         }
@@ -309,7 +379,9 @@ pub(crate) fn build(
     // sub-pixel positions reaching forward from each pixel (0, 0.33 and
     // 0.66 px in both axes). The raw field is interpolated first, then the
     // contour is applied per sample, then each position is lit on its own
-    // and the nine shadings are averaged.
+    // with three-tap gradient sums. Clip the lighting samples, then average
+    // before gloss and splitting into highlight/shadow; they are not nine
+    // overlapping paints.
     let supersampled =
         texture.is_none() && contour_lut.is_some() && bevel.contour_anti_aliased.unwrap_or(false);
     let steps = [0.0f32, 0.33, 0.66];
@@ -354,93 +426,121 @@ pub(crate) fn build(
             if effect_alpha <= 0.0 {
                 continue;
             }
-            for &(ox, oy) in &offsets {
-                let share = 1.0 / offsets.len() as f32;
-                let (left, right, top, bottom) = if supersampled {
-                    (
-                        sub_sample(px as f32 - 1.0 + ox, py as f32 + oy),
-                        sub_sample(px as f32 + 1.0 + ox, py as f32 + oy),
-                        sub_sample(px as f32 + ox, py as f32 - 1.0 + oy),
-                        sub_sample(px as f32 + ox, py as f32 + 1.0 + oy),
-                    )
-                } else {
-                    (
-                        sample(px - 1, py),
-                        sample(px + 1, py),
-                        sample(px, py - 1),
-                        sample(px, py + 1),
-                    )
-                };
-                let base = [(left - right) * normal_scale, (top - bottom) * normal_scale];
-                let flat = left == right && top == bottom;
-
-                let mut shade = |sign: f32, mut weight: f32| {
-                    if weight <= 0.0 {
-                        return;
-                    }
-                    let gradient = [base[0] * sign, base[1] * sign];
+            let mut shade = |sign: f32, mut weight: f32| {
+                if weight <= 0.0 {
+                    return;
+                }
+                let mut surface = 0.0;
+                let mut raw = 0.0;
+                let mut flat = true;
+                for &(ox, oy) in &offsets {
+                    let (left, right, top, bottom) = if supersampled {
+                        let across = [-1.0f32, 0.0, 1.0];
+                        let sx = px as f32 + ox;
+                        let sy = py as f32 + oy;
+                        (
+                            across
+                                .map(|dy| sub_sample(sx - 1.0, sy + dy))
+                                .iter()
+                                .sum::<f32>()
+                                / 3.0,
+                            across
+                                .map(|dy| sub_sample(sx + 1.0, sy + dy))
+                                .iter()
+                                .sum::<f32>()
+                                / 3.0,
+                            across
+                                .map(|dx| sub_sample(sx + dx, sy - 1.0))
+                                .iter()
+                                .sum::<f32>()
+                                / 3.0,
+                            across
+                                .map(|dx| sub_sample(sx + dx, sy + 1.0))
+                                .iter()
+                                .sum::<f32>()
+                                / 3.0,
+                        )
+                    } else {
+                        (
+                            sample(px - 1, py),
+                            sample(px + 1, py),
+                            sample(px, py - 1),
+                            sample(px, py + 1),
+                        )
+                    };
+                    let gradient = [
+                        (left - right) * normal_scale * sign,
+                        (top - bottom) * normal_scale * sign,
+                    ];
+                    flat &= left == right && top == bottom;
                     let length =
                         (gradient[0] * gradient[0] + gradient[1] * gradient[1] + 1.0).sqrt();
-                    let raw = gradient[0] * light[0] + gradient[1] * light[1] + light[2];
-                    let surface = raw / length.max(0.0001);
-                    let split = |value: f32| -> f32 {
-                        if value >= light[2] {
-                            (value - light[2]) / (1.0 - light[2]).max(0.01)
-                        } else {
-                            -((light[2] - value) / light[2].max(0.01))
-                        }
-                    };
-                    let mut lighting = split(surface);
-                    if pillow_family && raw < light[2] {
-                        lighting = -((light[2] - raw) / light[2].max(0.01));
-                    }
-                    if let Some(lut) = &gloss_lut {
-                        // The gloss contour remaps the light value itself; flat
-                        // exterior ground stays clean because a locally flat pixel
-                        // weighs its shading by the matte.
-                        if flat {
-                            weight *= matte_alpha;
-                            if weight <= 0.0 {
-                                return;
-                            }
-                        }
-                        let remapped = lut.sample(surface.clamp(0.0, 1.0), gloss_smooth);
-                        lighting = split(remapped);
-                        if pillow_family && remapped < light[2] {
-                            let remapped_raw = lut.sample(raw.clamp(0.0, 1.0), gloss_smooth);
-                            if remapped_raw < light[2] {
-                                lighting = -((light[2] - remapped_raw) / light[2].max(0.01));
-                            }
-                        }
-                    }
-                    if textured {
-                        // Texture relief reaches no farther than the bevel's own
-                        // footprint: shading is capped by the pixel's edge mask.
-                        let cap = (edge_mask[py as usize * pw + px as usize]
-                            * TEXTURE_RELIEF_REACH
-                            / light[2].max(0.05))
-                        .clamp(0.0, 1.0);
-                        lighting = lighting.clamp(-cap, cap);
-                    }
-                    if lighting > 0.0 {
-                        let strength = lighting.clamp(0.0, 1.0) * weight * highlight_paint.1;
-                        accumulate(&mut highlight, index, highlight_paint.0, strength);
-                    } else if lighting < 0.0 {
-                        let strength = (-lighting).clamp(0.0, 1.0) * weight * shadow_paint.1;
-                        accumulate(&mut shadow, index, shadow_paint.0, strength);
+                    let value = gradient[0] * light[0] + gradient[1] * light[1] + light[2];
+                    raw += value;
+                    surface += (value / length.max(0.0001)).clamp(0.0, 1.0);
+                }
+                raw /= offsets.len() as f32;
+                surface /= offsets.len() as f32;
+                if flat {
+                    raw = light[2];
+                    surface = light[2];
+                }
+                let split = |value: f32| -> f32 {
+                    if value >= light[2] {
+                        (value - light[2]) / (1.0 - light[2]).max(0.01)
+                    } else {
+                        -((light[2] - value) / light[2].max(0.01))
                     }
                 };
-
-                if pillow {
-                    // The valley mirrors the rim, and an anti-aliased edge carries
-                    // both: exterior-signed shading over the backdrop fraction and
-                    // the flipped interior shading over the content fraction.
-                    let base_sign = if direction_up { -1.0 } else { 1.0 };
-                    shade(base_sign, effect_alpha * (1.0 - matte_alpha) * share);
-                    shade(-base_sign, effect_alpha * matte_alpha * share);
-                } else {
-                    shade(direction, effect_alpha * share);
+                let mut lighting = split(surface);
+                if pillow_family && raw < light[2] {
+                    lighting = -((light[2] - raw) / light[2].max(0.01));
                 }
+                if let Some(lut) = &gloss_lut {
+                    // The gloss contour remaps the light value itself; flat
+                    // exterior ground stays clean because a locally flat pixel
+                    // weighs its shading by the matte.
+                    if flat {
+                        weight *= matte_alpha;
+                        if weight <= 0.0 {
+                            return;
+                        }
+                    }
+                    let remapped = lut.sample(surface.clamp(0.0, 1.0), gloss_smooth);
+                    lighting = split(remapped);
+                    if pillow_family && remapped < light[2] {
+                        let remapped_raw = lut.sample(raw.clamp(0.0, 1.0), gloss_smooth);
+                        if remapped_raw < light[2] {
+                            lighting = -((light[2] - remapped_raw) / light[2].max(0.01));
+                        }
+                    }
+                }
+                if textured {
+                    // Texture relief reaches no farther than the bevel's own
+                    // footprint: shading is capped by the pixel's edge mask.
+                    let cap = (edge_mask[py as usize * pw + px as usize] * TEXTURE_RELIEF_REACH
+                        / light[2].max(0.05))
+                    .clamp(0.0, 1.0);
+                    lighting = lighting.clamp(-cap, cap);
+                }
+                if lighting > 0.0 {
+                    let strength = lighting.clamp(0.0, 1.0) * weight * highlight_paint.1;
+                    accumulate(&mut highlight, index, highlight_paint.0, strength);
+                } else if lighting < 0.0 {
+                    let strength = (-lighting).clamp(0.0, 1.0) * weight * shadow_paint.1;
+                    accumulate(&mut shadow, index, shadow_paint.0, strength);
+                }
+            };
+
+            if pillow {
+                // The valley mirrors the rim, and an anti-aliased edge carries
+                // both: exterior-signed shading over the backdrop fraction and
+                // the flipped interior shading over the content fraction.
+                let base_sign = if direction_up { -1.0 } else { 1.0 };
+                shade(base_sign, effect_alpha * (1.0 - matte_alpha));
+                shade(-base_sign, effect_alpha * matte_alpha);
+            } else {
+                shade(direction, effect_alpha);
             }
         }
     }
@@ -458,17 +558,78 @@ pub(crate) fn build(
     ]
 }
 
-/// Add a shading contribution of `color` and `strength` to a plane, combining
-/// with what is already there as a source-over.
+/// Add disjoint sub-pixel shading contributions to a plane. Their weights
+/// represent covered area, so they add rather than occluding one another.
 fn accumulate(plane: &mut Content, index: usize, color: [f32; 3], strength: f32) {
     if strength <= 0.0 {
         return;
     }
-    let existing = plane.alpha[index];
-    let out = strength + existing * (1.0 - strength);
+    let out = (plane.alpha[index] + strength).min(1.0);
     for (channel, value) in color.iter().enumerate() {
-        let old = plane.color[channel][index];
-        plane.color[channel][index] = (old * existing * (1.0 - strength) + value * strength) / out;
+        plane.color[channel][index] = *value;
     }
     plane.alpha[index] = out;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Rect;
+    use super::*;
+
+    #[test]
+    fn disjoint_samples_conserve_covered_area() {
+        let mut plane = Content::new(Rect::new(0, 0, 1, 1));
+        let color = [0.6, 0.2, 0.1];
+        // Nine fully covered sub-pixels cover one pixel. Source-over would
+        // incorrectly attenuate their combined coverage to approximately 65%.
+        for _ in 0..9 {
+            accumulate(&mut plane, 0, color, 1.0 / 9.0);
+        }
+        assert!((plane.alpha[0] - 1.0).abs() < 1e-6);
+        assert_eq!(plane.color.map(|channel| channel[0]), color);
+
+        let mut plane = Content::new(Rect::new(0, 0, 1, 1));
+        accumulate(&mut plane, 0, color, 0.25);
+        accumulate(&mut plane, 0, color, 0.25);
+        assert_eq!(plane.alpha[0], 0.5);
+    }
+
+    #[test]
+    fn hard_chisel_uses_signed_quantized_distances_at_straight_and_diagonal_edges() {
+        let (width, height) = (11, 11);
+        let matte: Vec<f32> = (0..width * height)
+            .map(|index| f32::from(index % width >= 5))
+            .collect();
+        let field = chisel_hard(&matte, width, height, 9.0);
+        let row = &field[5 * width..6 * width];
+        assert_eq!(row[4], 29376.0 / 65280.0);
+        assert_eq!(row[5], 35904.0 / 65280.0);
+        assert_eq!(row[6], 39168.0 / 65280.0);
+
+        let mut matte = vec![1.0; width * height];
+        matte[5 * width + 5] = 0.0;
+        let field = chisel_hard(&matte, width, height, 9.0);
+        assert_eq!(field[6 * width + 6], (32640.0 + 4615.0) / 65280.0);
+        let inverse: Vec<f32> = matte.iter().map(|alpha| 1.0 - alpha).collect();
+        let inverse = chisel_hard(&inverse, width, height, 9.0);
+        assert!(field
+            .iter()
+            .zip(inverse)
+            .all(|(a, b)| (a + b - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn hard_chisel_keeps_fractional_coverage_instead_of_thresholding_it() {
+        for alpha in [127u8, 128] {
+            let matte = vec![f32::from(alpha) / 255.0; 25];
+            let field = chisel_hard(&matte, 5, 5, 9.0);
+            assert!(field.iter().all(|value| *value == f32::from(alpha) / 255.0));
+        }
+        for size in [0.0, 1.0, 2.0, 250.0] {
+            let field = chisel_hard(&[0.0, 1.0, 0.0, 1.0], 2, 2, size);
+            assert!(field
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value)));
+        }
+    }
 }

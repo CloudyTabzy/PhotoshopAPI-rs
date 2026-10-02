@@ -79,7 +79,7 @@ pub fn apply<T: BitDepth>(
         compositor.document.color_mode,
         psd_core::ColorMode::Grayscale | psd_core::ColorMode::Bitmap | psd_core::ColorMode::Duotone
     );
-    let operation = Operation::new(&block.data, generator, gray);
+    let operation = Operation::new(&block.data, generator, gray, T::DEPTH);
     if !operation.supported {
         return Ok(());
     }
@@ -140,6 +140,64 @@ pub fn apply<T: BitDepth>(
     Ok(())
 }
 
+/// RGB Channel Mixer coefficients in native Q10 units.
+struct Mixer {
+    rows: Vec<[i32; 4]>,
+    monochrome: bool,
+    depth: u16,
+}
+
+impl Mixer {
+    fn new(settings: &psd_core::adjustments::ChannelMixer, depth: u16) -> Self {
+        Self {
+            rows: settings
+                .mixes
+                .iter()
+                .map(|mix| {
+                    [mix.sources[0], mix.sources[1], mix.sources[2], mix.constant]
+                        .map(|percent| i32::from(percent) * 1024 / 100)
+                })
+                .collect(),
+            monochrome: settings.monochrome,
+            depth,
+        }
+    }
+
+    fn apply(&self, color: [f32; 3]) -> [f32; 3] {
+        // RGB's integer kernels round half up in the 255 / 32768 domains.
+        // The float kernel uses the same truncated Q10 coefficients, with
+        // the constant scaled by 1/2048, and preserves values outside 0..1.
+        let full_scale = if self.depth == 8 { 255.0 } else { 32768.0 };
+        let samples = color.map(|value| (value.clamp(0.0, 1.0) * full_scale).round() as i64);
+        let mix = |row: &[i32; 4]| {
+            if self.depth == 32 {
+                let sum: f64 = color
+                    .iter()
+                    .zip(row)
+                    .map(|(value, weight)| f64::from(*value) * f64::from(*weight))
+                    .sum();
+                return (sum / 1024.0 + f64::from(row[3]) / 2048.0) as f32;
+            }
+            let sum: i64 = samples
+                .iter()
+                .zip(row)
+                .map(|(value, weight)| *value * i64::from(*weight))
+                .sum::<i64>()
+                + i64::from(row[3]) * full_scale as i64;
+            (((sum + 512) >> 10) as f32 / full_scale).clamp(0.0, 1.0)
+        };
+        if self.monochrome {
+            // The first binary mix is Gray; the remaining records are unused.
+            return [self.rows.first().map_or(0.0, mix); 3];
+        }
+        let mut out = color;
+        for (channel, row) in self.rows.iter().take(3).enumerate() {
+            out[channel] = mix(row);
+        }
+        out
+    }
+}
+
 /// One adjustment, resolved once per layer.
 struct Operation {
     data: AdjustmentData,
@@ -153,8 +211,12 @@ struct Operation {
     /// A single-channel document: its one channel's Levels record and Curves
     /// curve sit where a colour document keeps the red channel's.
     gray: bool,
+    /// Integer adjustments round in their document's sample domain.
+    depth: u16,
     /// Curves are baked once, using the extended channel records when present.
     curves: Vec<(u16, [f32; 256])>,
+    /// Channel Mixer's Q10 coefficients, resolved once from percent values.
+    mixer: Option<Mixer>,
 }
 
 impl Operation {
@@ -162,6 +224,7 @@ impl Operation {
         data: &AdjustmentData,
         generator: Option<&psd_core::adjustments::ContentGenerator>,
         gray: bool,
+        depth: u16,
     ) -> Self {
         let brightness_contrast = match (data, generator) {
             (AdjustmentData::BrightnessContrast(legacy), Some(generator))
@@ -216,6 +279,7 @@ impl Operation {
             lookup,
             brightness_contrast,
             gray,
+            depth,
             curves: match data {
                 AdjustmentData::Curves(curves) => curves
                     .effective_curves()
@@ -223,6 +287,10 @@ impl Operation {
                     .map(|curve| (curve.channel, curve_table(curve)))
                     .collect(),
                 _ => Vec::new(),
+            },
+            mixer: match data {
+                AdjustmentData::ChannelMixer(settings) => Some(Mixer::new(settings, depth)),
+                _ => None,
             },
         }
     }
@@ -262,29 +330,12 @@ impl Operation {
             }
             AdjustmentData::HueSaturation(settings) => hue_saturation(color, settings),
             AdjustmentData::ColorBalance(settings) => color_balance(color, settings),
-            AdjustmentData::BlackAndWhite(settings) => black_and_white(color, settings),
+            AdjustmentData::BlackAndWhite(settings) => black_and_white(color, settings, self.depth),
             AdjustmentData::PhotoFilter(settings) => photo_filter(color, settings),
-            AdjustmentData::ChannelMixer(settings) => {
-                let mix_channel = |mix: &psd_core::adjustments::ChannelMix| -> f32 {
-                    let mut value = f32::from(mix.constant) / 100.0;
-                    for (source, amount) in mix.sources.iter().take(3).enumerate() {
-                        value += color[source] * f32::from(*amount) / 100.0;
-                    }
-                    value.clamp(0.0, 1.0)
-                };
-                if settings.monochrome {
-                    // Monochrome mixes one Gray output, stored in the first
-                    // output record; the other records are unused.
-                    let gray = settings.mixes.first().map_or(0.0, mix_channel);
-                    [gray; 3]
-                } else {
-                    let mut out = color;
-                    for (channel, mix) in settings.mixes.iter().take(3).enumerate() {
-                        out[channel] = mix_channel(mix);
-                    }
-                    out
-                }
-            }
+            AdjustmentData::ChannelMixer(_) => self
+                .mixer
+                .as_ref()
+                .map_or(color, |mixer| mixer.apply(color)),
             AdjustmentData::Posterize(settings) => {
                 let levels = f32::from(settings.levels.max(2));
                 let mut out = [0.0; 3];
@@ -305,7 +356,7 @@ impl Operation {
             AdjustmentData::ColorLookup(_) => self
                 .lookup
                 .as_ref()
-                .map_or(color, |lookup| lookup.eval(color)),
+                .map_or(color, |lookup| lookup.eval(color, self.depth)),
             _ => color,
         }
     }
@@ -848,38 +899,41 @@ fn descriptor_descriptor(value: &DescriptorValue) -> Option<&Descriptor> {
 
 /// Black & White: a hue-interpolated channel mix with an optional tint.
 ///
-/// Approximation: the mix and the tint (the tint colour shifted to the gray's
-/// luma) follow the format and the usual model but have not been compared with
-/// a Photoshop render.
-fn black_and_white(color: [f32; 3], settings: &BlackAndWhite) -> [f32; 3] {
+/// Integer documents use six Q12 weights on the sorted channel differences.
+/// The 8-bit tint shifts the resulting gray by a Q14 luminance of the tint.
+/// Float documents retain the continuous model; their native kernel and the
+/// 16-bit tint conversion have not been independently verified.
+fn black_and_white(color: [f32; 3], settings: &BlackAndWhite, depth: u16) -> [f32; 3] {
     // Percent weights in slider order: reds, yellows, greens, cyans, blues,
     // magentas. Photoshop's defaults fill any the descriptor omits.
-    const DEFAULTS: [f32; 6] = [0.4, 0.6, 0.4, 0.6, 0.2, 0.8];
+    const DEFAULTS: [f64; 6] = [40.0, 60.0, 40.0, 60.0, 20.0, 80.0];
     let stored = settings.weights();
-    let weights: [f32; 6] = std::array::from_fn(|index| {
-        stored[index].map_or(DEFAULTS[index], |value| (value / 100.0) as f32)
-    });
+    let weights: [f64; 6] = std::array::from_fn(|index| stored[index].unwrap_or(DEFAULTS[index]));
+    let full_scale = match depth {
+        8 => Some(255.0),
+        16 => Some(32768.0),
+        _ => None,
+    };
+    let samples = color
+        .map(|value| full_scale.map_or(value, |scale| (value.clamp(0.0, 1.0) * scale).round()));
 
     // The gray part of the pixel (its minimum channel) stays; the saturated
     // part scales by the slider weight at its hue, interpolated linearly
     // between the neighbouring sliders.
-    let max = color[0].max(color[1]).max(color[2]);
-    let min = color[0].min(color[1]).min(color[2]);
-    let chroma = max - min;
-    let gray = if chroma <= 1e-6 {
-        max
+    let mut order = [0, 1, 2];
+    order.sort_by(|&a, &b| samples[a].total_cmp(&samples[b]));
+    let [min, mid, max] = order.map(|channel| samples[channel]);
+    let primary = [0, 2, 4][order[2]];
+    let secondary = [3, 5, 1][order[0]];
+    let gray = if let Some(scale) = full_scale {
+        let fixed = weights.map(|weight| (weight * 4096.0 / 100.0) as i32);
+        let sum = i64::from((max - mid) as i32) * i64::from(fixed[primary])
+            + i64::from((mid - min) as i32) * i64::from(fixed[secondary]);
+        ((min as i64 + ((sum + 2048) >> 12)) as f32 / scale).clamp(0.0, 1.0)
     } else {
-        let sector = if max == color[0] {
-            ((color[1] - color[2]) / chroma).rem_euclid(6.0)
-        } else if max == color[1] {
-            2.0 + (color[2] - color[0]) / chroma
-        } else {
-            4.0 + (color[0] - color[1]) / chroma
-        };
-        let index = (sector.floor() as usize) % 6;
-        let fraction = sector - sector.floor();
-        let weight = weights[index] * (1.0 - fraction) + weights[(index + 1) % 6] * fraction;
-        (min + chroma * weight).clamp(0.0, 1.0)
+        (min + (max - mid) * weights[primary] as f32 / 100.0
+            + (mid - min) * weights[secondary] as f32 / 100.0)
+            .clamp(0.0, 1.0)
     };
 
     if settings.use_tint() != Some(true) {
@@ -891,7 +945,13 @@ fn black_and_white(color: [f32; 3], settings: &BlackAndWhite) -> [f32; 3] {
     else {
         return [gray, gray, gray];
     };
-    // The tint colour shifted so its luma becomes the gray.
+    if depth == 8 {
+        let tint = tint.map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as i32);
+        let luma = (tint[0] * 0x1333 + tint[1] * 0x25c3 + tint[2] * 0x070a + 0x2000) >> 14;
+        let gray = (gray * 255.0).round() as i32;
+        return tint.map(|value| (value - luma + gray).clamp(0, 255) as f32 / 255.0);
+    }
+    // Continuous tint fallback for the other depths.
     let tint_luma = 0.30 * tint[0] + 0.59 * tint[1] + 0.11 * tint[2];
     tint.map(|channel| (channel - tint_luma + gray).clamp(0.0, 1.0))
 }
@@ -1385,12 +1445,12 @@ mod tests {
         };
         // Red and blue swapped.
         let cube = b"LUT_3D_SIZE 2\n0 0 0\n0 0 1\n0 1 0\n0 1 1\n1 0 0\n1 0 1\n1 1 0\n1 1 1\n";
-        let operation = Operation::new(&lookup("LUTFormatCUBE", cube), None, false);
+        let operation = Operation::new(&lookup("LUTFormatCUBE", cube), None, false, 32);
         assert!(operation.supported);
         assert_eq!(operation.apply([1.0, 0.0, 0.0]), [0.0, 0.0, 1.0]);
         // Formats we cannot read leave the layer unrendered.
-        assert!(!Operation::new(&lookup("LUTFormat3DL", cube), None, false).supported);
-        assert!(!Operation::new(&lookup("LUTFormatCUBE", b"junk"), None, false).supported);
+        assert!(!Operation::new(&lookup("LUTFormat3DL", cube), None, false, 32).supported);
+        assert!(!Operation::new(&lookup("LUTFormatCUBE", b"junk"), None, false, 32).supported);
     }
 
     #[test]
@@ -1410,7 +1470,7 @@ mod tests {
             ],
             trailing_bytes: Vec::new(),
         };
-        let operation = Operation::new(&AdjustmentData::ChannelMixer(mixer), None, false);
+        let operation = Operation::new(&AdjustmentData::ChannelMixer(mixer), None, false, 32);
         let out = operation.apply([0.8, 0.4, 0.1]);
         assert!(
             out.iter().all(|value| (value - 0.6).abs() < 1e-5),
@@ -1419,21 +1479,125 @@ mod tests {
     }
 
     #[test]
+    fn channel_mixer_quantizes_coefficients_before_rounding_integer_samples() {
+        let mut settings = psd_core::adjustments::ChannelMixer {
+            version: 1,
+            monochrome: true,
+            mixes: vec![psd_core::adjustments::ChannelMix {
+                sources: [1, 0, 0, 0],
+                constant: 0,
+            }],
+            trailing_bytes: Vec::new(),
+        };
+        // One percent becomes coefficient 10/1024, not a continuous 0.01.
+        assert_eq!(
+            Mixer::new(&settings, 8).apply([1.0, 0.0, 0.0]),
+            [2.0 / 255.0; 3]
+        );
+        assert_eq!(
+            Mixer::new(&settings, 16).apply([1.0, 0.0, 0.0]),
+            [320.0 / 32768.0; 3]
+        );
+        settings.mixes[0].sources = [0; 4];
+        settings.mixes[0].constant = 1;
+        assert_eq!(Mixer::new(&settings, 8).apply([0.0; 3]), [2.0 / 255.0; 3]);
+        assert_eq!(
+            Mixer::new(&settings, 16).apply([0.0; 3]),
+            [320.0 / 32768.0; 3]
+        );
+        settings.mixes[0].sources = [200, -100, 0, 0];
+        settings.mixes[0].constant = 0;
+        assert_eq!(Mixer::new(&settings, 8).apply([1.0, 0.0, 0.0]), [1.0; 3]);
+        assert_eq!(Mixer::new(&settings, 8).apply([0.0, 1.0, 0.0]), [0.0; 3]);
+        settings.mixes[0].sources = [i16::MAX; 4];
+        settings.mixes[0].constant = i16::MAX;
+        assert_eq!(Mixer::new(&settings, 16).apply([1.0; 3]), [1.0; 3]);
+    }
+
+    #[test]
+    fn float_channel_mixer_keeps_hdr_values_and_uses_the_native_constant_scale() {
+        let mut settings = psd_core::adjustments::ChannelMixer {
+            version: 1,
+            monochrome: true,
+            mixes: vec![psd_core::adjustments::ChannelMix {
+                sources: [50, 0, 0, 0],
+                constant: 100,
+            }],
+            trailing_bytes: Vec::new(),
+        };
+        let mixer = Mixer::new(&settings, 32);
+        assert_eq!(mixer.apply([0.0; 3]), [0.5; 3]);
+        assert_eq!(mixer.apply([2.0, 0.0, 0.0]), [1.5; 3]);
+        settings.mixes[0].constant = 0;
+        assert_eq!(Mixer::new(&settings, 32).apply([-1.0, 0.0, 0.0]), [-0.5; 3]);
+    }
+
+    #[test]
     fn black_and_white_reads_the_slider_keys_and_keeps_pale_colours_light() {
         let settings = black_and_white_settings([10, 60, 40, 60, 20, 80]);
         // A pure red takes its slider weight; a pale red keeps its gray floor.
-        let red = black_and_white([1.0, 0.0, 0.0], &settings);
+        let red = black_and_white([1.0, 0.0, 0.0], &settings, 32);
         assert!((red[0] - 0.1).abs() < 1e-5, "{red:?}");
-        let pale = black_and_white([1.0, 0.8, 0.8], &settings);
+        let pale = black_and_white([1.0, 0.8, 0.8], &settings, 32);
         assert!((pale[0] - (0.8 + 0.2 * 0.1)).abs() < 1e-5, "{pale:?}");
         // Halfway between red and yellow the weights interpolate.
-        let orange = black_and_white([1.0, 0.5, 0.0], &settings);
+        let orange = black_and_white([1.0, 0.5, 0.0], &settings, 32);
         assert!(
             (orange[0] - 0.5 * (0.1 + 0.6) / 1.0 * 1.0).abs() < 1e-5,
             "{orange:?}"
         );
         // A gray passes through unchanged.
-        assert_eq!(black_and_white([0.3; 3], &settings), [0.3; 3]);
+        assert_eq!(black_and_white([0.3; 3], &settings, 32), [0.3; 3]);
+    }
+
+    #[test]
+    fn black_and_white_rounds_fixed_point_weights_in_the_integer_sample_domain() {
+        let settings = black_and_white_settings([10, 60, 40, 60, 20, 80]);
+        // 10% red is Q12 weight 409, so a byte-domain full red produces 25,
+        // rather than rounding the continuous 25.5 to 26. In the 16-bit
+        // working domain the corresponding gray is 3272 out of 32768.
+        assert_eq!(
+            black_and_white([1.0, 0.0, 0.0], &settings, 8),
+            [25.0 / 255.0; 3]
+        );
+        assert_eq!(
+            black_and_white([1.0, 0.0, 0.0], &settings, 16),
+            [3272.0 / 32768.0; 3]
+        );
+        for (color, expected) in [
+            ([1.0, 1.0, 0.0], 153),
+            ([0.0, 1.0, 0.0], 102),
+            ([0.0, 1.0, 1.0], 153),
+            ([0.0, 0.0, 1.0], 51),
+            ([1.0, 0.0, 1.0], 204),
+        ] {
+            assert_eq!(
+                black_and_white(color, &settings, 8),
+                [expected as f32 / 255.0; 3]
+            );
+        }
+        let settings = black_and_white_settings([-100, 60, 300, 60, 20, 80]);
+        assert_eq!(black_and_white([1.0, 0.0, 0.0], &settings, 8), [0.0; 3]);
+        assert_eq!(black_and_white([0.0, 1.0, 0.0], &settings, 8), [1.0; 3]);
+    }
+
+    #[test]
+    fn black_and_white_tint_uses_rounded_byte_luminance_and_clips_each_channel() {
+        let mut settings = black_and_white_settings([100; 6]);
+        settings
+            .descriptor
+            .insert("useTint", DescriptorValue::Boolean(true));
+        let mut tint = Descriptor::with_class("RGBC");
+        for (key, value) in [("Rd  ", 255.0), ("Grn ", 128.0), ("Bl  ", 0.0)] {
+            tint.insert(key, DescriptorValue::Double(value));
+        }
+        settings
+            .descriptor
+            .insert("tintColor", DescriptorValue::Descriptor(tint));
+        assert_eq!(
+            black_and_white([128.0 / 255.0; 3], &settings, 8),
+            [231.0 / 255.0, 104.0 / 255.0, 0.0]
+        );
     }
 
     #[test]

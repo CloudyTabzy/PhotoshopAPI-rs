@@ -390,6 +390,21 @@ fn check_document<T: BitDepth>(bytes: &[u8]) -> Vec<(&'static str, String)> {
     if let Err(message) = attempt(|| views(&original)) {
         failures.push(("views", message));
     }
+    if let Err(message) = attempt(|| {
+        let composite = original
+            .composite_rgba8()
+            .map_err(|error| error.to_string())?;
+        if (composite.width, composite.height) != (original.width, original.height) {
+            return Err("composite dimensions differ from the document".to_owned());
+        }
+        let expected = u64::from(original.width) * u64::from(original.height) * 4;
+        if composite.rgba.len() as u64 != expected {
+            return Err("composite pixel count differs from its dimensions".to_owned());
+        }
+        Ok(())
+    }) {
+        failures.push(("composite", message));
+    }
     let written = attempt(|| original.to_bytes().map_err(|e| format!("write: {e}")));
     let reread = written.as_ref().map_err(Clone::clone).and_then(|bytes| {
         attempt(|| LayeredFile::<T>::from_bytes(bytes).map_err(|e| format!("reread: {e}")))
@@ -421,6 +436,26 @@ fn check_document<T: BitDepth>(bytes: &[u8]) -> Vec<(&'static str, String)> {
         failures.push(("stable", message));
     }
     failures
+}
+
+#[test]
+fn corpus_check_reports_errors_that_occur_during_compositing() {
+    use psd::core::{ColorMode, TaggedBlock, TaggedBlockKey};
+    let mut file = LayeredFile::<u8>::new(ColorMode::Rgb, 1, 1).unwrap();
+    let mut layer = psd::Layer::new_adjustment("truncated Levels", psd::Rect::default());
+    layer
+        .blocks
+        .push(TaggedBlock::new(TaggedBlockKey::new(*b"levl"), vec![0]));
+    file.add_layer(layer);
+    let failures = check_document::<u8>(&file.to_bytes().unwrap());
+    assert!(
+        failures.iter().any(|(check, _)| *check == "composite"),
+        "{failures:?}"
+    );
+    assert!(
+        !failures.iter().any(|(check, _)| *check == "read"),
+        "the raw block remains readable"
+    );
 }
 
 /// Every failed `name:check` in `dir`, with its message.

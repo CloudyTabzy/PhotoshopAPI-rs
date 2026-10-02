@@ -99,7 +99,10 @@ impl ColorContext {
         let pixels = first.len();
         let components = match self.mode {
             ColorMode::Cmyk => 4,
-            ColorMode::Grayscale | ColorMode::Bitmap | ColorMode::Duotone => 1,
+            ColorMode::Grayscale
+            | ColorMode::Bitmap
+            | ColorMode::Duotone
+            | ColorMode::Multichannel => 1,
             _ => 3,
         };
         if planes.len() != components || planes.iter().any(|p| p.len() != pixels) {

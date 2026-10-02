@@ -144,7 +144,8 @@ composite, and replacement is transactional.
 - Layer attributes: name, blend mode, opacity, fill, lock, clipping, display color
 - ICC profile and DPI
 - 8-, 16- and 32-bit documents
-- RGB, CMYK and Grayscale color modes
+- RGB, CMYK, Grayscale and Lab document channels
+- Multichannel document channels are preserved; the compositor previews the first channel in grayscale
 - Raw, RLE, ZIP and ZIP-with-prediction compression
 - Optional lazy layer and mask channels with compressed-payload passthrough
 - Unknown tagged blocks and image resources preserved byte-exactly
@@ -152,10 +153,11 @@ composite, and replacement is transactional.
 
 **Not supported**
 
-- Lab and Multichannel color modes
-- A valid merged composite image. Saves write a zeroed RLE composite, matching
-  upstream: it keeps files 20–50% smaller, but third-party readers that require
-  a real flattened image (Lightroom, for example) will not have one.
+- Compositing is best-effort: complex adjustments, effects, special blend modes and version-dependent behavior can differ from Photoshop or be skipped.
+- Photoshop-faithful Multichannel spot-color and overprint preview; the compositor shows the first channel in grayscale
+- Layered saves don't render a true merged composite. They write the zeroed
+  RLE placeholder used by upstream, and Photoshop re-renders layers on open.
+  Unedited layerless documents retain their original merged pixels.
 
 ## Requirements
 

@@ -465,8 +465,9 @@ impl<T: BitDepth> LayeredFile<T> {
             // layerless image, the one extra merged channel is its available
             // transparency plane.
             let merged_transparency = file.layer_and_mask_info.layer_info.has_merged_alpha
-                || file.header.num_channels
-                    == color_channel_count(file.header.color_mode).saturating_add(1);
+                || file.header.color_mode != ColorMode::Multichannel
+                    && file.header.num_channels
+                        == color_channel_count(file.header.color_mode).saturating_add(1);
             MergedImageData::read(
                 bytes.get(start..).unwrap_or_default(),
                 &file.header,
@@ -990,7 +991,11 @@ impl<T: BitDepth> LayeredFile<T> {
         let mut planes = merged.decode::<T>()?;
         let rect = Rect::new(0, 0, self.height as i32, self.width as i32);
         let mut layer = Layer::new_image("Background", rect);
-        let color_channels = usize::from(color_channel_count(self.color_mode));
+        let color_channels = if self.color_mode == ColorMode::Multichannel {
+            channel_count - usize::from(merged.transparency)
+        } else {
+            usize::from(color_channel_count(self.color_mode))
+        };
         if merged.transparency && planes.len() > color_channels {
             if self.color_mode == ColorMode::Indexed {
                 return Err(PsdError::UnsupportedColorMode(ColorMode::Indexed.as_raw()));

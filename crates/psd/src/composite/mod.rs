@@ -258,6 +258,8 @@ impl<T: BitDepth> LayeredFile<T> {
     /// [`decode_layer_pixels`](Self::decode_layer_pixels) for those layers
     /// first; otherwise this returns [`PsdError::InvalidData`]. Decoding stays
     /// explicit so the document's bitmap memory budget is honored.
+    /// Multichannel documents use a grayscale preview of their first channel;
+    /// spot-ink display colours and overprint simulation are not implemented.
     pub fn composite_rgba8(&self) -> Result<CompositeImage> {
         self.composite_rgba8_with(CompositeOptions::default())
     }
@@ -329,16 +331,24 @@ fn merged_canvas<T: BitDepth>(
             offset: 0,
             message: "merged image dimensions overflow",
         })?;
-    let color_channels = usize::from(crate::layered_file::color_channel_count(
-        document.color_mode,
-    ));
+    // Multichannel has no fixed colour-channel count. Its planes are independent
+    // inks, not RGB components or an implicit transparency channel. Until spot
+    // colour display is supported, preview the first plane as grayscale.
+    let multichannel = document.color_mode == ColorMode::Multichannel;
+    let color_channels = if multichannel {
+        1
+    } else {
+        usize::from(crate::layered_file::color_channel_count(
+            document.color_mode,
+        ))
+    };
     if color_channels == 0 || planes.len() < color_channels {
         return Err(PsdError::InvalidData {
             offset: 0,
             message: "merged image has fewer channels than its color mode requires",
         });
     }
-    let alpha_plane = if merged.transparency && planes.len() > color_channels {
+    let alpha_plane = if !multichannel && merged.transparency && planes.len() > color_channels {
         Some(&planes[color_channels])
     } else {
         None
@@ -2274,7 +2284,10 @@ impl<T: BitDepth> Compositor<'_, T> {
 
     fn color_keys(&self) -> Vec<ChannelKey> {
         match self.document.color_mode {
-            ColorMode::Grayscale | ColorMode::Bitmap | ColorMode::Duotone => {
+            ColorMode::Grayscale
+            | ColorMode::Bitmap
+            | ColorMode::Duotone
+            | ColorMode::Multichannel => {
                 vec![ChannelKey::color(0)]
             }
             ColorMode::Cmyk => vec![
@@ -2561,6 +2574,30 @@ mod merged_tests {
         assert_eq!(image.pixel(0, 0), [255, 0, 0, 255]);
         assert_eq!(image.pixel(1, 0), [0, 255, 0, 255]);
         assert!(document.to_bytes().unwrap().ends_with(&section));
+    }
+
+    #[test]
+    fn multichannel_preview_preserves_inks_and_never_infers_alpha_from_one_channel() {
+        for channels in [1, 3, 5] {
+            let mut source = LayeredFile::<u8>::new(ColorMode::Multichannel, 2, 1).unwrap();
+            let mut section = vec![0, 0, 64, 192];
+            section.resize(2 + channels as usize * 2, 0);
+            attach_merged(&mut source, &section, CoreBitDepth::Eight, channels, false);
+            let bytes = source.to_bytes().unwrap();
+            let mut document = LayeredFile::<u8>::from_bytes(&bytes).unwrap();
+            let preview = document.composite_rgba8().unwrap();
+            assert_eq!(preview.rgba, [64, 64, 64, 255, 192, 192, 192, 255]);
+            assert!(document.to_bytes().unwrap().ends_with(&section));
+            let id = document.materialize_merged_image().unwrap().unwrap();
+            let channel_store = document.layer(id).unwrap().channels().unwrap();
+            assert!(!channel_store.contains(ChannelKey::ALPHA));
+            for channel in 0..channels {
+                assert!(channel_store.contains(ChannelKey::color(channel as u8)));
+            }
+            assert_eq!(document.composite_rgba8().unwrap(), preview);
+            let reread = LayeredFile::<u8>::from_bytes(&document.to_bytes().unwrap()).unwrap();
+            assert_eq!(reread.composite_rgba8().unwrap(), preview);
+        }
     }
 
     #[test]

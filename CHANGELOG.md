@@ -12,6 +12,46 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.12.17] - 2026-10-02
+
+### Fixed
+
+- Scaled patterns use rounded mip reductions and byte-quantized bilinear interpolation,
+  reproducing Photoshop's minified and magnified reference pixels exactly. Unrotated tiles
+  with odd dimensions retain footprint averaging to preserve their repeat period; the native mip
+  convention and higher-precision source patterns remain unverified.
+- Anti-aliased bevel profile contours now use three-tap gradient sums and average the nine
+  clipped lighting samples before gloss and highlight/shadow splitting. Disjoint shading
+  contributions preserve their covered area instead of attenuating one another through
+  source-over compositing. Plain smooth bevels retain their existing calibrated path.
+- RGB Channel Mixer adjustments convert slider percentages to truncated Q10 coefficients
+  and round integer output in the document's sample domain. The float kernel retains HDR
+  values and uses its native constant scale of 1/2048. Coefficients are resolved once per
+  layer; wide accumulators prevent overflow on unusual stored percentages.
+- Pattern sampling rejects nonfinite placement parameters and overflowing tile dimensions,
+  and safely wraps extreme pixel positions.
+
+## [0.12.16] - 2026-10-02
+
+### Fixed
+
+- Black & White adjustments now use fixed-point slider weights and round in the document's
+  integer sample domain for 8- and 16-bit images. Eight-bit tinting uses rounded integer
+  luminance, including channel clipping, instead of carrying fractional tint offsets.
+- Color Lookup adjustments use trilinear interpolation for 32-bit documents, retaining
+  tetrahedral interpolation at integer depths. Malformed embedded cubes with nonfinite
+  values or excess colour components are left unrendered.
+- Hard chisel bevels now build a quantized signed chamfer field directly from fractional
+  alpha, with Soften applied before the distance transform. Lighting, soft chisel and
+  some contour and texture combinations remain approximations.
+- Layerless multichannel documents now render a grayscale preview of their first channel.
+  All ink planes remain preserved when saving or materializing the merged image; a single
+  ink plane is no longer mistaken for transparency. Spot-colour display and overprint
+  simulation remain unsupported.
+- The corpus regression suite now actually runs its advertised compositor check and verifies
+  the output dimensions and pixel count. Rendering errors can no longer pass unnoticed
+  merely because reading and round-tripping succeed.
+
 ## [0.12.15] - 2026-10-02
 
 ### Fixed
