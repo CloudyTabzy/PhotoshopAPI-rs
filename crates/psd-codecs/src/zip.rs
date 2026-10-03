@@ -7,29 +7,24 @@
 //! (`ZIP_COMPRESSION_LVL`).
 //!
 //! The deflate engine is chosen by exactly one `zip-backend-*` feature:
-//! `zlib-rs` (default, pure Rust — measured on `examples/zip_bench.rs` as
-//! fast as C libdeflate on this workload), `linflate` (pure-Rust inflate
-//! paired with zlib-rs deflate — the fastest measured decoder, ~15–25% on
-//! real channel planes; adler trailer verified in-engine for parity),
-//! `libdeflater` (C libdeflate, upstream's own engine, opt-in) or `miniz`
-//! (miniz_oxide, portable fallback). Only the engine swaps; stream framing
-//! stays identical, so files written by any backend read on all of them.
+//! `linflate` (default — the znippy decoder, fastest measured inflate at
+//! ~15–25% over zlib-rs on real channel planes, paired with zlib-rs
+//! deflate; the adler trailer is verified in-engine for parity), `zlib-rs`
+//! (pure Rust zlib-ng port), or `miniz` (miniz_oxide, portable fallback).
+//! Only the engine swaps; stream framing stays identical, so files written
+//! by any backend read on all of them.
 
 #[cfg(not(any(
-    feature = "zip-backend-libdeflater",
+    feature = "zip-backend-linflate",
     feature = "zip-backend-zlib-rs",
-    feature = "zip-backend-miniz",
-    feature = "zip-backend-linflate"
+    feature = "zip-backend-miniz"
 )))]
 compile_error!("psd-codecs needs exactly one `zip-backend-*` feature enabled");
 
 #[cfg(any(
-    all(feature = "zip-backend-libdeflater", feature = "zip-backend-zlib-rs"),
-    all(feature = "zip-backend-libdeflater", feature = "zip-backend-miniz"),
-    all(feature = "zip-backend-libdeflater", feature = "zip-backend-linflate"),
-    all(feature = "zip-backend-zlib-rs", feature = "zip-backend-miniz"),
-    all(feature = "zip-backend-zlib-rs", feature = "zip-backend-linflate"),
-    all(feature = "zip-backend-miniz", feature = "zip-backend-linflate")
+    all(feature = "zip-backend-linflate", feature = "zip-backend-zlib-rs"),
+    all(feature = "zip-backend-linflate", feature = "zip-backend-miniz"),
+    all(feature = "zip-backend-zlib-rs", feature = "zip-backend-miniz")
 ))]
 compile_error!("psd-codecs `zip-backend-*` features are mutually exclusive");
 
@@ -78,50 +73,6 @@ pub fn decompress(compressed: &[u8], out_len: usize) -> Result<Vec<u8>> {
         });
     }
     Ok(out)
-}
-
-#[cfg(feature = "zip-backend-libdeflater")]
-mod engine {
-    use super::*;
-    use libdeflater::{
-        adler32 as libdeflate_adler32, CompressionLvl, Compressor, DecompressionError, Decompressor,
-    };
-
-    pub fn adler32(data: &[u8]) -> u32 {
-        libdeflate_adler32(data)
-    }
-
-    /// Raw deflate at the fixed level, allocated once at the bound.
-    pub fn deflate(uncompressed: &[u8]) -> Result<Vec<u8>> {
-        let level = CompressionLvl::new(COMPRESSION_LEVEL).expect("level is a valid constant");
-        let mut compressor = Compressor::new(level);
-        let bound = compressor.deflate_compress_bound(uncompressed.len());
-        let mut out = vec![0u8; bound];
-        let written = compressor
-            .deflate_compress(uncompressed, &mut out)
-            .map_err(|_| CodecError::Deflate)?;
-        out.truncate(written);
-        // The buffer was sized for incompressible input. Keeping that capacity
-        // would hold every compressed channel at its raw size for as long as it
-        // lives, so hand back the memory the stream did not use.
-        out.shrink_to_fit();
-        Ok(out)
-    }
-
-    pub fn zlib_inflate(compressed: &[u8], out_len: usize) -> Result<Vec<u8>> {
-        let mut decompressor = Decompressor::new();
-        let mut out = vec![0u8; out_len];
-        let written = decompressor
-            .zlib_decompress(compressed, &mut out)
-            .map_err(|e| match e {
-                DecompressionError::BadData => CodecError::Inflate("invalid input data"),
-                DecompressionError::InsufficientSpace => {
-                    CodecError::Inflate("insufficient output space")
-                }
-            })?;
-        out.truncate(written);
-        Ok(out)
-    }
 }
 
 #[cfg(feature = "zip-backend-zlib-rs")]

@@ -8,7 +8,6 @@ version.workspace = true
 [dependencies]
 thiserror.workspace = true
 rayon.workspace = true
-libdeflater = { workspace = true, optional = true }
 zlib-rs = { workspace = true, optional = true }
 miniz_oxide = { workspace = true, optional = true }
 linflate = { workspace = true, optional = true }
@@ -22,28 +21,24 @@ fearless_simd = "1.0"
 fearless_simd_macros = "0.1"
 
 [features]
-default = ["zip-backend-zlib-rs"]
+default = ["zip-backend-linflate"]
 # `PSD_CODECS_FORCE_SCALAR=1` switches the prediction kernels to the pre-SIMD
 # scalar chains for the whole process, so one binary can measure and test the
 # two against each other. Off by default: without it the environment has no
 # say in which code runs.
 scalar-override = []
 # The ZIP codec's deflate engine, one at a time (enforced in `zip.rs`).
-# `zlib-rs` (Trifecta's pure-Rust zlib-ng port) is the default: measured
-# within noise of C libdeflate on decode (~4 GiB/s on channel data) and
-# faster on real-plane compress, with no C toolchain requirement. Select
-# `zip-backend-libdeflater` for the C engine, `zip-backend-miniz` for
-# miniz_oxide, or `zip-backend-linflate` for the znippy decoder (fastest
-# measured inflate — pure Rust, zero deps — paired with zlib-rs deflate).
-zip-backend-libdeflater = ["dep:libdeflater"]
+# `linflate` (the znippy decoder — fastest measured inflate, ~15-25% over
+# zlib-rs on real planes — paired with zlib-rs deflate) is the default:
+# pure Rust, zero deps, verified in `examples/zip_bench.rs`. Select
+# `zip-backend-zlib-rs` for the zlib-ng port or `zip-backend-miniz` for
+# the miniz_oxide fallback.
 zip-backend-zlib-rs = ["dep:zlib-rs"]
 zip-backend-miniz = ["dep:miniz_oxide"]
 zip-backend-linflate = ["dep:linflate", "dep:zlib-rs"]
 
 [dev-dependencies]
 # `examples/zip_bench`: every candidate engine in one binary for the A/B.
-libdeflater.workspace = true
 miniz_oxide.workspace = true
 zlib-rs.workspace = true
 linflate.workspace = true
-ldeflate.workspace = true

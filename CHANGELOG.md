@@ -12,6 +12,20 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.28] - 2026-10-05
+
+### Changed
+
+- **`zip-backend-linflate` is now the default ZIP engine, and the C
+  dependency is gone entirely.** `libdeflater` and the `zip-backend-*`
+  features for it are removed, along with the `ldeflate` dev-dependency
+  (measured and rejected: zlib-rs inside). The port's deflate paths are
+  now `linflate` inflate + `zlib-rs` deflate by default, with
+  `zip-backend-zlib-rs` and `zip-backend-miniz` as pure-Rust alternates.
+  Stream framing, public API, and the adler-verification guarantee are
+  unchanged; every encoder's output still decodes byte-exact under every
+  decoder.
+
 ## [0.13.27] - 2026-10-05
 
 ### Added

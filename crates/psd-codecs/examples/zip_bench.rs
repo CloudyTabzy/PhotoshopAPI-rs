@@ -1,9 +1,10 @@
-//! Backend A/B for the ZIP codec's deflate engine: `libdeflater` (C),
-//! `zlib-rs`, `miniz_oxide`, plus the experimental pure-Rust `ldeflate`
-//! (serial and within-stream-split compressors) and `linflate` (decoder
-//! only), measured on real decoded channel planes from the vendored
+//! Backend A/B for the ZIP codec's deflate engine: `zlib-rs`, `miniz_oxide`
+//! and `linflate` (decode-only — the default backend pairs it with zlib-rs
+//! deflate), measured on real decoded channel planes from the vendored
 //! Webtoon corpus (raw RGBA, 9 KB – 1.3 MB — the shape ZIP channel data
-//! actually has).
+//! actually has). C `libdeflater` and the znippy `ldeflate` compressor were
+//! measured here and removed: the former matched zlib-rs, the latter *is*
+//! zlib-rs inside.
 //!
 //! Each engine compresses (zlib framing, level 4 — upstream's fixed level)
 //! and inflates every input; timing is best-of-N with a correctness gate:
@@ -27,22 +28,6 @@ struct Engine {
     /// decompress timings run on the zlib-rs stream.
     compress: Option<CompressFn>,
     decompress: DecompressFn,
-}
-
-fn libdeflate_compress(data: &[u8]) -> Vec<u8> {
-    let mut c = libdeflater::Compressor::new(libdeflater::CompressionLvl::new(4).unwrap());
-    let mut out = vec![0u8; c.zlib_compress_bound(data.len())];
-    let n = c.zlib_compress(data, &mut out).unwrap();
-    out.truncate(n);
-    out
-}
-
-fn libdeflate_decompress(data: &[u8], out_len: usize) -> Vec<u8> {
-    let mut d = libdeflater::Decompressor::new();
-    let mut out = vec![0u8; out_len];
-    let n = d.zlib_decompress(data, &mut out).unwrap();
-    out.truncate(n);
-    out
 }
 
 fn zlib_rs_compress(data: &[u8]) -> Vec<u8> {
@@ -72,17 +57,6 @@ fn miniz_decompress(data: &[u8], out_len: usize) -> Vec<u8> {
     miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(data, out_len).unwrap()
 }
 
-fn ldeflate_compress(data: &[u8]) -> Vec<u8> {
-    ldeflate::zlib_compress(data, 4).unwrap()
-}
-
-fn ldeflate_split_compress(data: &[u8]) -> Vec<u8> {
-    // Default planner at our fixed level: splits within-stream at
-    // full-flush boundaries for inputs >= 4 MiB.
-    let cfg = ldeflate::Config::default().level(4);
-    ldeflate::compress_split(data, &cfg).unwrap()
-}
-
 fn linflate_decompress(data: &[u8], out_len: usize) -> Vec<u8> {
     // linflate is raw DEFLATE only — strip our zlib header + adler trailer.
     linflate::inflate_to_vec(&data[2..data.len() - 4], out_len).unwrap()
@@ -90,11 +64,6 @@ fn linflate_decompress(data: &[u8], out_len: usize) -> Vec<u8> {
 
 fn main() {
     let engines = [
-        Engine {
-            name: "libdeflater (C)",
-            compress: Some(libdeflate_compress),
-            decompress: libdeflate_decompress,
-        },
         Engine {
             name: "zlib-rs",
             compress: Some(zlib_rs_compress),
@@ -104,16 +73,6 @@ fn main() {
             name: "miniz_oxide",
             compress: Some(miniz_compress),
             decompress: miniz_decompress,
-        },
-        Engine {
-            name: "ldeflate",
-            compress: Some(ldeflate_compress),
-            decompress: zlib_rs_decompress,
-        },
-        Engine {
-            name: "ldeflate-split",
-            compress: Some(ldeflate_split_compress),
-            decompress: zlib_rs_decompress,
         },
         Engine {
             name: "linflate",
