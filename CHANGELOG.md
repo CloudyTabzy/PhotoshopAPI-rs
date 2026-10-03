@@ -12,6 +12,15 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.17] - 2026-10-03
+
+### Fixed
+
+- **A layered 32-bit save writes a black merged-image placeholder, not white.** Photoshop's own
+  32-bit no-merge saves fill `0x00` (float `0.0`) where `0xFF` bytes decode as NaN; the corpus's
+  `*MaximizeCompatibilityOff_32bit` documents carry RLE rows of `0x81 0x00` while the 8/16-bit
+  ones carry `0x81 0xFF`. The synthesized fill is now depth-dependent.
+
 ## [0.13.16] - 2026-10-03
 
 ### Fixed

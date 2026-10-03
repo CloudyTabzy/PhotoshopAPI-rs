@@ -8,11 +8,12 @@
 //!
 //! Layout: `u16` compression (`1` = RLE) | for each channel a scanline-size
 //! table (`u16` PSD / `u32` PSB) | for each channel the concatenated
-//! per-scanline PackBits streams. Because every pixel is zero, each scanline
-//! compresses to runs of 128 plus a remainder, and this module can synthesize
-//! the exact bytes without depending on `psd-codecs` (dependency direction).
+//! per-scanline PackBits streams. Because every pixel is the fill constant,
+//! each scanline compresses to runs of 128 plus a remainder, and this module
+//! can synthesize the exact bytes without depending on `psd-codecs`
+//! (dependency direction).
 
-use crate::enums::Version;
+use crate::enums::{BitDepth, Version};
 use crate::error::{PsdError, Result};
 use crate::header::FileHeader;
 use crate::io::BeWriter;
@@ -65,6 +66,12 @@ impl ImageData {
     /// without a merge carries a solid fill of that shape. A three-channel
     /// document has no alpha to hide behind, so white is also what a reader
     /// that only shows the merged image expects to see.
+    ///
+    /// The exception is 32-bit: Photoshop's own 32-bit no-merge saves fill
+    /// `0x00` — a float `0.0`, transparent black — where `0xFF` bytes would
+    /// decode as NaN. (Fixture evidence: the `*MaximizeCompatibilityOff_32bit`
+    /// corpus documents carry RLE rows of `0x81 0x00`; the 8/16-bit ones carry
+    /// `0x81 0xFF`.)
     pub fn write(&self, writer: &mut BeWriter, header: &FileHeader) -> Result<()> {
         if let Some(section) = &self.raw_section {
             if section.len() < 2 {
@@ -97,17 +104,24 @@ impl ImageData {
                 }
             }
         }
-        // One compressed stream per channel.
+        // One compressed stream per channel. The fill is white at integer
+        // depths and float-zero at 32 bits (see `write`'s docs).
+        let fill = if header.depth == BitDepth::ThirtyTwo {
+            0
+        } else {
+            MERGED_FILL
+        };
         for _ in 0..self.num_channels {
             for _ in 0..header.height {
-                write_fill_scanline(writer, scanline_bytes, MERGED_FILL);
+                write_fill_scanline(writer, scanline_bytes, fill);
             }
         }
         Ok(())
     }
 }
 
-/// The byte the merged-image fill uses; see [`ImageData::write`].
+/// The byte the merged-image fill uses at integer depths; see
+/// [`ImageData::write`] for the 32-bit exception.
 pub const MERGED_FILL: u8 = 255;
 
 /// PackBits-encode a scanline of `byte_len` copies of `fill` (the only scanline
@@ -158,6 +172,30 @@ mod tests {
         let mut w = BeWriter::new();
         write_fill_scanline(&mut w, 256, MERGED_FILL);
         assert_eq!(w.as_slice(), &[0x81, 0xFF, 0x81, 0xFF]);
+    }
+
+    #[test]
+    fn placeholder_fill_is_white_at_16_bit_and_black_at_32_bit() {
+        // Photoshop's own no-merge saves: 8/16-bit fill 0xFF, 32-bit fills
+        // 0x00 (float 0.0 — 0xFF bytes would be NaN).
+        for (depth, expected) in [
+            (BitDepth::Eight, 0xFFu8),
+            (BitDepth::Sixteen, 0xFF),
+            (BitDepth::ThirtyTwo, 0x00),
+        ] {
+            let header = header(Version::Psd, depth, 4);
+            let mut w = BeWriter::new();
+            ImageData::new(1).write(&mut w, &header).unwrap();
+            let bytes = w.as_slice();
+            // Marker, then a u16 scanline-size table (one entry per row of the
+            // single channel), then the scanlines as (run header, fill) pairs.
+            assert_eq!(bytes[0..2], [0, 1]);
+            let body = &bytes[2 + 2 * usize::try_from(header.height).unwrap()..];
+            assert!(
+                body.chunks_exact(2).all(|pair| pair[1] == expected),
+                "depth {depth:?}: unexpected bytes {body:02x?}"
+            );
+        }
     }
 
     #[test]
