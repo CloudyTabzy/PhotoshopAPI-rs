@@ -699,6 +699,23 @@ fn fold_pixel(
         content.color[1][index],
         content.color[2][index],
     ];
+    if folds_strength(mode) {
+        // Burn and dodge scale the source toward their neutral colour and
+        // then apply in full, rather than easing the result toward the
+        // layer's colour (the same rule a separate effect plane follows).
+        let mut one = Content::new(Rect::new(0, 0, 1, 1));
+        for (channel, value) in color.into_iter().enumerate() {
+            one.color[channel][0] = value;
+        }
+        one.alpha[0] = strength;
+        fold_strength_into_color(&mut one, mode);
+        let source = [one.color[0][0], one.color[1][0], one.color[2][0]];
+        let blended = blend::blend(mode, current, source, false);
+        for (channel, value) in blended.into_iter().enumerate() {
+            content.color[channel][index] = value;
+        }
+        return;
+    }
     let blended = blend::blend(mode, current, color, false);
     for channel in 0..3 {
         content.color[channel][index] =
@@ -1476,4 +1493,35 @@ pub(crate) fn build_strokes(
         });
     }
     planes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grey(value: f32) -> Content {
+        let mut content = Content::new(Rect::new(0, 0, 1, 1));
+        for channel in 0..3 {
+            content.color[channel][0] = value;
+        }
+        content.alpha[0] = 1.0;
+        content
+    }
+
+    #[test]
+    fn a_folded_color_dodge_scales_its_source_instead_of_easing_the_result() {
+        // Half strength of a white source: a source of 0.5 dodges 0.5 to the
+        // top, where easing the full dodge halfway would stop at 0.75.
+        let mut content = grey(0.5);
+        fold_pixel(&mut content, 0, [1.0; 3], 0.5, BlendMode::COLOR_DODGE);
+        assert!((content.color[0][0] - 1.0).abs() < 1e-5);
+        // A quarter strength dodges 0.5 by 0.25: 0.5 / 0.75.
+        let mut content = grey(0.5);
+        fold_pixel(&mut content, 0, [1.0; 3], 0.25, BlendMode::COLOR_DODGE);
+        assert!((content.color[0][0] - 0.5 / 0.75).abs() < 1e-4);
+        // Other modes still ease the blended result toward the colour.
+        let mut content = grey(0.5);
+        fold_pixel(&mut content, 0, [1.0; 3], 0.5, BlendMode::NORMAL);
+        assert!((content.color[0][0] - 0.75).abs() < 1e-5);
+    }
 }

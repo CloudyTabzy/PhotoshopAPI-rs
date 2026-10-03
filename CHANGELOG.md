@@ -12,6 +12,20 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.11] - 2026-10-03
+
+### Fixed
+
+- **Interior glows, shadows and satin in Color Dodge, Color Burn and the linear dodge/burn modes
+  scale their source by the effect's strength.** An interior effect folded into a layer's colour
+  used to ease the *result* of the blend toward the layer by the strength, which is how Normal
+  and Screen behave; the dodge and burn modes instead move the source toward their neutral colour
+  and apply in full, as a separate effect plane already did. A 77 % Color Dodge inner glow on a
+  grey layer now reads 196, 174, 157, 143... from the edge inward where Photoshop's flatten reads
+  194, 173, 156, 143..., instead of 210, 197, 184, 172.... `photoshop-inner-glow-range` fell from
+  mean 0.76 to **0.04** and `photoshop-gradient-overlay-geometry` from 1.16 to **0.06**; in the
+  stored-merge set only `smart_object_file_no_warp` moved (0.86 → 0.54).
+
 ## [0.13.10] - 2026-10-03
 
 ### Fixed
