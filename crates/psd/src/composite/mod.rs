@@ -55,9 +55,15 @@ mod tile;
 use psd_core::{BlendMode, ColorMode, LayerBlendingRanges, PsdError, Result};
 
 use crate::channels::ChannelKey;
-use crate::layer::{Layer, LayerKind, Rect};
+use crate::layer::{Layer, LayerId, LayerKind, Rect};
 use crate::layered_file::LayeredFile;
 use crate::BitDepth;
+
+/// A sprite's extent in pixels, at most. The render holds ~16 bytes of f32
+/// planes per pixel, so this caps a sprite's working memory near the 2 GiB
+/// budget the reader uses for bitmaps; a synthetic document could otherwise
+/// name an unallocatable rect.
+const MAX_SPRITE_PIXELS: usize = 128 * 1024 * 1024;
 
 /// What to include when flattening.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +93,66 @@ pub struct CompositeImage {
     pub height: u32,
     /// `width * height * 4` bytes: R, G, B, A.
     pub rgba: Vec<u8>,
+}
+
+/// How a [`layer_sprite`](LayeredFile::layer_sprite) frames its pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpriteBounds {
+    /// Tightly frame everything the subtree paints: the content bounds plus
+    /// outer-effect padding, *not* clamped to the canvas — a layer that hangs
+    /// off the document edge keeps its off-canvas pixels and the sprite's
+    /// `rect` reports where they land. This is the sprite format export
+    /// pipelines want (image plus document offset).
+    Content,
+    /// The whole document canvas, origin `(0, 0)`. Every sprite comes out
+    /// the document's size, which suits pipelines that blit by canvas
+    /// position without tracking offsets.
+    Canvas,
+}
+
+/// Toggles for [`LayeredFile::layer_sprite_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpriteOptions {
+    /// The pipeline toggles shared with the document composite. `adjustments`
+    /// matters inside a group: an adjustment layer in the subtree transforms
+    /// the content beneath it, as in the document.
+    pub composite: CompositeOptions,
+    /// Which rect the returned pixels cover.
+    pub bounds: SpriteBounds,
+}
+
+impl Default for SpriteOptions {
+    fn default() -> Self {
+        Self {
+            composite: CompositeOptions::default(),
+            bounds: SpriteBounds::Content,
+        }
+    }
+}
+
+/// One layer or group rendered alone ("sprite"): straight-alpha RGBA over
+/// `rect` in document space.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerSprite {
+    /// The document-space rect `rgba` covers. It may reach past the canvas
+    /// when [`SpriteBounds::Content`] is selected and the subtree paints
+    /// off-canvas pixels.
+    pub rect: Rect,
+    /// `rect.width() * rect.height() * 4` bytes: R, G, B, A, row-major from
+    /// the rect's top-left.
+    pub rgba: Vec<u8>,
+}
+
+impl LayerSprite {
+    /// Pixels wide.
+    pub fn width(&self) -> u32 {
+        self.rect.width().max(0) as u32
+    }
+
+    /// Pixels tall.
+    pub fn height(&self) -> u32 {
+        self.rect.height().max(0) as u32
+    }
 }
 
 impl CompositeImage {
@@ -251,6 +317,10 @@ struct Compositor<'a, T: BitDepth> {
     document_backdrop: Option<Canvas>,
     /// Which of a layer's effects this pass draws.
     effect_scope: EffectScope,
+    /// The rect content clamps to instead of the document canvas — a sprite's
+    /// render extent, which may reach past the canvas edges. `None` keeps the
+    /// document composite's behavior.
+    content_limit: Option<Rect>,
 }
 
 /// A subset of a layer's effects.
@@ -294,6 +364,7 @@ impl<T: BitDepth> LayeredFile<T> {
             },
             document_backdrop: None,
             effect_scope: EffectScope::All,
+            content_limit: None,
         };
         if self
             .layers_with_ids()
@@ -315,6 +386,117 @@ impl<T: BitDepth> LayeredFile<T> {
             false,
         )?;
         Ok(canvas_to_image(&canvas))
+    }
+
+    /// Render one layer or group alone — "export this layer as an image" —
+    /// through the same pipeline the document composite uses, over
+    /// transparency instead of the layer stack. Masks, vector masks, effects,
+    /// opacity and fill all apply, so the sprite is the subtree's appearance,
+    /// not just its channels.
+    ///
+    /// The target renders regardless of its own visibility flag (Photoshop's
+    /// "Layers to Files" export behaves the same way); a group's *children*
+    /// still honor theirs, so the sprite is what the subtree would show.
+    /// `clipping` is document context and is ignored — a clipped member
+    /// exports its own content, unclipped — and blend modes, knockout and
+    /// Blend If resolve over a transparent backdrop.
+    ///
+    /// `None` for ids that paint nothing themselves: section dividers and
+    /// adjustment layers that carry no pixels. Unknown ids are an error.
+    /// Like [`composite_rgba8`](Self::composite_rgba8), decoded channels are
+    /// required for layers that take part.
+    pub fn layer_sprite(&self, id: LayerId) -> Result<Option<LayerSprite>> {
+        self.layer_sprite_with(id, SpriteOptions::default())
+    }
+
+    /// Render one layer or group alone with explicit options.
+    pub fn layer_sprite_with(
+        &self,
+        id: LayerId,
+        options: SpriteOptions,
+    ) -> Result<Option<LayerSprite>> {
+        let Some(layer) = self.layer(id) else {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "layer id does not name a layer in the document",
+            });
+        };
+        if matches!(layer.kind, LayerKind::SectionDivider(_)) {
+            return Ok(None);
+        }
+
+        let mut compositor = Compositor {
+            document: self,
+            options: options.composite,
+            byte_domain: T::DEPTH == 8,
+            patterns: if options.composite.effects || options.composite.adjustments {
+                self.patterns()
+            } else {
+                Vec::new()
+            },
+            colors: color::ColorContext::new(self.color_mode, &self.icc_profile),
+            document_backdrop: None,
+            effect_scope: EffectScope::All,
+            content_limit: None,
+        };
+
+        // A non-fill adjustment transforms what is below it and carries no
+        // pixels of its own; a sprite of it would be empty.
+        if matches!(layer.kind, LayerKind::Adjustment(_)) && !compositor.is_fill_layer(layer) {
+            return Ok(None);
+        }
+
+        // The rect the sprite covers: the document canvas, or the extent the
+        // subtree paints — content plus outer-effect spill, unclamped so
+        // off-canvas pixels are kept.
+        let rect = match options.bounds {
+            SpriteBounds::Canvas => Rect::new(0, 0, self.height as i32, self.width as i32),
+            SpriteBounds::Content => {
+                let extent = if matches!(layer.kind, LayerKind::Group(_)) {
+                    compositor.group_extent(id, layer)
+                } else if layer.bounds.width() <= 0 && compositor.is_fill_layer(layer) {
+                    // A fill layer without a shape silhouette paints the
+                    // whole canvas; its record bounds are empty.
+                    Some(Rect::new(0, 0, self.height as i32, self.width as i32))
+                } else {
+                    Some(compositor.layer_rect_unclamped(layer))
+                };
+                let Some(extent) = extent else {
+                    return Ok(None);
+                };
+                extent
+            }
+        };
+        if rect.width() <= 0 || rect.height() <= 0 {
+            return Ok(None);
+        }
+        if rect.sample_count() > MAX_SPRITE_PIXELS {
+            return Err(PsdError::InvalidData {
+                offset: 0,
+                message: "sprite extent exceeds the pixel budget",
+            });
+        }
+
+        compositor.content_limit = Some(rect);
+        let mut canvas = Canvas::new(rect.width() as u32, rect.height() as u32);
+        canvas.origin = (rect.left, rect.top);
+        let mut backdrop = Canvas::new(rect.width() as u32, rect.height() as u32);
+        backdrop.origin = (rect.left, rect.top);
+
+        compositor.composite_layer(
+            id,
+            &mut canvas,
+            None,
+            Some(&backdrop),
+            Some(&backdrop),
+            false,
+            None,
+        )?;
+
+        Ok(Some(LayerSprite {
+            rect,
+            rgba: canvas_to_image(&canvas).rgba,
+        }))
     }
 }
 
@@ -513,6 +695,7 @@ impl<T: BitDepth> Compositor<'_, T> {
             colors: self.colors.clone(),
             document_backdrop: self.document_backdrop.clone(),
             effect_scope: self.effect_scope,
+            content_limit: self.content_limit,
         }
     }
 
@@ -525,6 +708,16 @@ impl<T: BitDepth> Compositor<'_, T> {
             colors: self.colors.clone(),
             document_backdrop: self.document_backdrop.clone(),
             effect_scope,
+            content_limit: self.content_limit,
+        }
+    }
+
+    /// The rect content clamps to: `content_limit` when a sprite render set
+    /// one, else the document canvas.
+    fn clamp_content(&self, rect: Rect) -> Rect {
+        match self.content_limit {
+            Some(limit) => clamp_to_canvas_rect(rect, limit),
+            None => clamp_to_canvas(rect, self.document.width, self.document.height),
         }
     }
 
@@ -2136,6 +2329,43 @@ impl<T: BitDepth> Compositor<'_, T> {
 
     /// The document-space bounds a subtree touches, clamped to the canvas.
     fn subtree_bounds(&self, id: usize) -> Option<Rect> {
+        self.subtree_extent(id, true)
+    }
+
+    /// `subtree_bounds` without the content clamp: the sprite path needs the
+    /// pixels a subtree paints past the document edges too.
+    fn subtree_bounds_unclamped(&self, id: usize) -> Option<Rect> {
+        self.subtree_extent(id, false)
+    }
+
+    /// A group's unclamped render extent: the children's bounds plus the
+    /// group's own effect padding and artboard, mirroring what
+    /// [`composite_group`](Self::composite_group) covers.
+    fn group_extent(&self, id: usize, layer: &Layer<T>) -> Option<Rect> {
+        let mut rect = self.subtree_bounds_unclamped(id)?;
+        if self.options.effects {
+            if let Some(effects) = self.typed_effects(layer) {
+                rect = effects::padded_rect(&rect, &effects);
+            }
+        }
+        if let Ok(Some(board)) = layer.artboard().map(|board| board.and_then(|b| b.rect())) {
+            rect = union_rect(
+                rect,
+                Rect::new(
+                    board.top.round() as i32,
+                    board.left.round() as i32,
+                    board.bottom.round() as i32,
+                    board.right.round() as i32,
+                ),
+            );
+        }
+        Some(rect)
+    }
+
+    /// The shared subtree-bounds walk. `clamped` selects whether every
+    /// contribution is content-clamped (the document composite) or kept
+    /// whole (a sprite's render extent).
+    fn subtree_extent(&self, id: usize, clamped: bool) -> Option<Rect> {
         let mut bounds: Option<Rect> = None;
         // The group itself has no pixels of its own; its descendants do.
         for &child in self.document.children(Some(id))? {
@@ -2149,7 +2379,7 @@ impl<T: BitDepth> Compositor<'_, T> {
                 // A nested group's effects follow its merged children, not
                 // the often-empty rectangle in its layer record. Carry those
                 // bounds upward so snapshots include every rendered pixel.
-                let mut rect = self.subtree_bounds(child);
+                let mut rect = self.subtree_extent(child, clamped);
                 if let Some(board) = layer
                     .artboard()
                     .ok()
@@ -2184,8 +2414,10 @@ impl<T: BitDepth> Compositor<'_, T> {
                     self.document.height as i32,
                     self.document.width as i32,
                 )
-            } else {
+            } else if clamped {
                 self.layer_rect(layer)
+            } else {
+                self.layer_rect_unclamped(layer)
             };
             if rect.width() <= 0 || rect.height() <= 0 {
                 continue;
@@ -2195,13 +2427,22 @@ impl<T: BitDepth> Compositor<'_, T> {
                 None => rect,
             });
         }
-        bounds.map(|bounds| clamp_to_canvas(bounds, self.document.width, self.document.height))
+        if clamped {
+            bounds.map(|bounds| self.clamp_content(bounds))
+        } else {
+            bounds
+        }
     }
 
     /// The rect a layer's content occupies, including effect padding, clamped
     /// to the canvas: an effect's padding never draws outside it, and
     /// Photoshop's 30,000 px distances would otherwise allocate that padding.
     fn layer_rect(&self, layer: &Layer<T>) -> Rect {
+        self.clamp_content(self.layer_rect_unclamped(layer))
+    }
+
+    /// `layer_rect` without the content clamp.
+    fn layer_rect_unclamped(&self, layer: &Layer<T>) -> Rect {
         let mut rect = layer.bounds;
         if self.options.effects {
             if let Some(effects) = self.typed_effects(layer) {
@@ -2216,7 +2457,7 @@ impl<T: BitDepth> Compositor<'_, T> {
                 );
             }
         }
-        clamp_to_canvas(rect, self.document.width, self.document.height)
+        rect
     }
 
     /// The document's global light as (angle, altitude) in degrees, when it
@@ -2781,6 +3022,205 @@ mod merged_tests {
         assert_eq!(
             reread.composite_rgba8().unwrap().rgba,
             [0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255]
+        );
+    }
+
+    /// A red image layer over `bounds`, alpha 255 everywhere.
+    fn red_layer(name: &str, bounds: Rect) -> Layer<u8> {
+        let mut layer = Layer::new_image(name, bounds);
+        let pixels = bounds.sample_count();
+        let image = layer.image_mut().unwrap();
+        image.set_channel(ChannelKey::color(0), vec![255; pixels]);
+        image.set_channel(ChannelKey::color(1), vec![0; pixels]);
+        image.set_channel(ChannelKey::color(2), vec![0; pixels]);
+        image.set_channel(ChannelKey::ALPHA, vec![255; pixels]);
+        layer
+    }
+
+    /// A sprite renders the layer's own pixels over transparency, framed to
+    /// the content — the same appearance the document composite gives it.
+    #[test]
+    fn a_sprite_is_the_layers_appearance_at_content_bounds() {
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 4, 4).unwrap();
+        let id = document.add_layer(red_layer("Red", Rect::new(1, 1, 3, 3)));
+
+        let sprite = document.layer_sprite(id).unwrap().unwrap();
+        assert_eq!(sprite.rect, Rect::new(1, 1, 3, 3));
+        assert_eq!(sprite.width(), 2);
+        assert!(sprite.rgba.chunks(4).all(|px| px == [255, 0, 0, 255]));
+
+        // The consistency invariant: over the sprite's rect, the document
+        // composite shows the same pixels.
+        let flattened = document.composite_rgba8().unwrap();
+        for y in 1..3u32 {
+            for x in 1..3u32 {
+                let index = ((y - 1) * 2 + (x - 1)) as usize * 4;
+                assert_eq!(
+                    flattened.pixel(x, y),
+                    <[u8; 4]>::try_from(&sprite.rgba[index..index + 4]).unwrap()
+                );
+            }
+        }
+    }
+
+    /// Opacity and pixel alpha multiply into the sprite's alpha.
+    #[test]
+    fn a_sprite_bakes_opacity_into_alpha() {
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 2, 2).unwrap();
+        let mut layer = red_layer("Red", Rect::new(0, 0, 2, 2));
+        layer
+            .image_mut()
+            .unwrap()
+            .set_channel(ChannelKey::ALPHA, vec![128; 4]);
+        layer.opacity = 128;
+        let id = document.add_layer(layer);
+
+        let sprite = document.layer_sprite(id).unwrap().unwrap();
+        // 128/255 pixel alpha × 128/255 opacity.
+        assert!(sprite.rgba.chunks(4).all(|px| px[3] == 64));
+    }
+
+    /// A layer hanging off the canvas edge keeps its off-canvas pixels at
+    /// content bounds and loses them at canvas bounds.
+    #[test]
+    fn a_sprite_keeps_or_crops_off_canvas_pixels_per_its_bounds() {
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 4, 4).unwrap();
+        let id = document.add_layer(red_layer("Red", Rect::new(-1, -1, 1, 1)));
+
+        let sprite = document.layer_sprite(id).unwrap().unwrap();
+        assert_eq!(sprite.rect, Rect::new(-1, -1, 1, 1));
+        assert_eq!(sprite.rgba.len(), (2 * 2 * 4) as usize);
+        assert!(sprite.rgba.chunks(4).all(|px| px == [255, 0, 0, 255]));
+
+        let canvas = document
+            .layer_sprite_with(
+                id,
+                SpriteOptions {
+                    bounds: SpriteBounds::Canvas,
+                    ..SpriteOptions::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(canvas.rect, Rect::new(0, 0, 4, 4));
+        let at = |x: u32, y: u32| -> [u8; 4] {
+            canvas.rgba[((y * 4 + x) * 4) as usize..][..4]
+                .try_into()
+                .unwrap()
+        };
+        assert_eq!(at(0, 0), [255, 0, 0, 255]);
+        assert_eq!(at(3, 3), [0, 0, 0, 0]);
+    }
+
+    /// A group's sprite is its merged subtree: the children unioned, the
+    /// group's own opacity applied, and invisible children left out.
+    #[test]
+    fn a_group_sprite_is_the_merged_subtree() {
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 8, 8).unwrap();
+        let group = document.add_layer(Layer::new_group("Group"));
+        document
+            .add_layer_to_group(group, red_layer("A", Rect::new(1, 1, 3, 3)))
+            .unwrap();
+        let mut hidden = red_layer("Hidden", Rect::new(5, 5, 7, 7));
+        hidden.set_visible(false);
+        document.add_layer_to_group(group, hidden).unwrap();
+        document.layer_mut(group).unwrap().opacity = 128;
+
+        let sprite = document.layer_sprite(group).unwrap().unwrap();
+        // Only the visible child paints; the group record's zeroed bounds
+        // contribute nothing and the hidden child is honored as invisible.
+        assert_eq!(sprite.rect, Rect::new(1, 1, 3, 3));
+        assert!(sprite
+            .rgba
+            .chunks(4)
+            .all(|px| px == [255, 0, 0, 128] || px[3] == 0));
+    }
+
+    /// An invisible layer still exports its content, matching Photoshop's
+    /// Layers-to-Files behavior; an unknown id is an error.
+    #[test]
+    fn sprite_semantics_for_the_edge_cases() {
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 2, 2).unwrap();
+        let mut hidden = red_layer("Hidden", Rect::new(0, 0, 1, 1));
+        hidden.set_visible(false);
+        let id = document.add_layer(hidden);
+        assert!(document.layer_sprite(id).unwrap().is_some());
+        assert!(document.layer_sprite(usize::MAX).is_err());
+    }
+
+    /// A raster mask multiplies the sprite's alpha.
+    #[test]
+    fn a_sprite_applies_the_raster_mask() {
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 2, 2).unwrap();
+        let mut layer = red_layer("Red", Rect::new(0, 0, 2, 2));
+        layer.set_mask(vec![128; 4], Rect::new(0, 0, 2, 2)).unwrap();
+        let id = document.add_layer(layer);
+
+        let sprite = document.layer_sprite(id).unwrap().unwrap();
+        assert!(sprite.rgba.chunks(4).all(|px| px[3] == 128));
+    }
+
+    /// A fill layer's record bounds are empty; it still paints the canvas.
+    #[test]
+    fn a_fill_layers_sprite_covers_the_canvas() {
+        use psd_core::adjustments::FillSettings;
+        use psd_core::{
+            AdjustmentBlock, AdjustmentData, AdjustmentKind, Descriptor, DescriptorValue, Gradient,
+            GradientKind,
+        };
+
+        let mut gradient = Gradient::black_to_white();
+        if let GradientKind::Solid(solid) = &mut gradient.kind {
+            solid.smoothness = 0.0;
+        }
+        let mut descriptor = Descriptor::with_class("gradientLayer");
+        descriptor.set(
+            "Grad",
+            DescriptorValue::Descriptor(gradient.to_descriptor()),
+        );
+        let mut layer = Layer::new_adjustment("Gradient fill", Rect::default());
+        layer
+            .set_adjustment(
+                &AdjustmentBlock::new(
+                    AdjustmentKind::GradientFill,
+                    AdjustmentData::Fill(FillSettings {
+                        descriptor,
+                        trailing_bytes: Vec::new(),
+                    }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 4, 2).unwrap();
+        let id = document.add_layer(layer);
+
+        let sprite = document.layer_sprite(id).unwrap().unwrap();
+        assert_eq!(sprite.rect, Rect::new(0, 0, 2, 4));
+        assert_eq!(sprite.rgba.len(), 4 * 2 * 4);
+        assert!(sprite.rgba.chunks(4).any(|px| px[3] != 0));
+    }
+
+    /// A synthetic document can name a huge rect; the sprite refuses the
+    /// allocation instead of trusting it.
+    #[test]
+    fn a_sprite_refuses_an_unallocatable_extent() {
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 2, 2).unwrap();
+        // No channels: the record only names the rect.
+        let layer = Layer::new_image("Huge", Rect::new(-300_000, -300_000, 300_000, 300_000));
+        let id = document.add_layer(layer);
+        assert!(document.layer_sprite(id).is_err());
+        // Canvas framing still fits the budget.
+        let canvas_only = SpriteOptions {
+            bounds: SpriteBounds::Canvas,
+            ..SpriteOptions::default()
+        };
+        assert_eq!(
+            document
+                .layer_sprite_with(id, canvas_only)
+                .unwrap()
+                .unwrap()
+                .rect,
+            Rect::new(0, 0, 2, 2)
         );
     }
 }

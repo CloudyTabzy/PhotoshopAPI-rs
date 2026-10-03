@@ -12,6 +12,26 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.20] - 2026-10-03
+
+### Added
+
+- **`LayeredFile::layer_sprite` / `layer_sprite_with`, a per-subtree renderer.**
+  Renders one layer or group alone over transparency through the same compositor
+  the document flatten uses — opacity, fill, raster and vector masks, effects,
+  blend modes, Blend If, nested groups and group snapshots included — and returns
+  a `LayerSprite`: straight-alpha RGBA plus the document-space `Rect` it covers.
+  `SpriteOptions` carries the shared `CompositeOptions` toggles and a
+  `SpriteBounds` selector: `Content` tightly frames everything the subtree paints
+  (outer-effect spill and off-canvas pixels included) for sprite-sheet export,
+  while `Canvas` returns a document-sized buffer for position-based blitting.
+  The target renders regardless of its own visibility flag, matching Photoshop's
+  Layers-to-Files export; a group's children still honor theirs. Section dividers
+  and non-fill adjustment layers return `None`, unknown ids are an error, fill
+  layers cover the canvas, and a pixel budget refuses unallocatable extents.
+  Supporting machinery: a `Compositor::content_limit` that swaps the canvas clamp
+  for the sprite rect so off-canvas pixels survive.
+
 ## [0.13.19] - 2026-10-03
 
 ### Added

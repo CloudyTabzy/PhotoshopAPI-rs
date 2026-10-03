@@ -40,7 +40,7 @@ pub use psd_core as core;
 
 pub use bitdepth::BitDepth;
 pub use channels::{ChannelKey, ChannelStore};
-pub use composite::{CompositeImage, CompositeOptions};
+pub use composite::{CompositeImage, CompositeOptions, LayerSprite, SpriteBounds, SpriteOptions};
 pub use geometry::{BezierSurface, BoundingBox, Homography, MeshVertex, Point2, QuadMesh};
 pub use layer::{
     AdjustmentLayer, GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Rect, ShapeLayer, TextLayer,
