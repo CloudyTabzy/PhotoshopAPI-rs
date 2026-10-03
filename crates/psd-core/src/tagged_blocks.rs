@@ -361,7 +361,31 @@ impl AdditionalLayerInfo {
         let mut blocks = Vec::new();
         while end.saturating_sub(reader.position()) >= min_block {
             let before = reader.position();
-            let (block, payload) = TaggedBlock::read_eliding(reader, header, padding, elide)?;
+            let (block, payload) = match TaggedBlock::read_eliding(reader, header, padding, elide) {
+                Ok(pair) => pair,
+                Err(err @ PsdError::InvalidSignature { .. }) => {
+                    // Some writers pad a block wider than the section alignment
+                    // (pikado reads the next `8BIM`/`8B64` signature within four
+                    // bytes rather than trusting the pad width). Resyncing only
+                    // fires where the strict walk already failed, so well-formed
+                    // input is unaffected, and a resynced block still has to fit
+                    // inside the section like any other.
+                    let recovered = (1..=4usize).find_map(|extra| {
+                        if before + extra + min_block > end {
+                            return None;
+                        }
+                        let mut probe = reader.clone();
+                        probe.seek(before + extra).ok()?;
+                        TaggedBlock::read_eliding(&mut probe, header, padding, elide)
+                            .ok()
+                            .map(|pair| (probe, pair))
+                    });
+                    let (probe, pair) = recovered.ok_or(err)?;
+                    *reader = probe;
+                    pair
+                }
+                Err(err) => return Err(err),
+            };
             if payload.is_some() {
                 // Only the first block with the key is taken; a repeat is an
                 // ordinary block.
@@ -589,6 +613,38 @@ mod tests {
         let bytes = writer.into_inner();
         assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()), 3);
         assert_eq!(&bytes[12..], &[1, 2, 3, 0], "global blocks pad outside");
+    }
+
+    #[test]
+    fn resyncs_a_signature_padded_wider_than_the_section_alignment() {
+        // A writer that pads a layer block to 4 inside a 2-aligned section
+        // leaves 1–3 dead bytes before the next signature (pikado's reader
+        // scans forward for `8BIM`/`8B64` in exactly this case). The walk
+        // recovers the block instead of failing the whole layer info.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"8BIMlsct");
+        bytes.extend_from_slice(&4u32.to_be_bytes());
+        bytes.extend_from_slice(&[1, 0, 0, 0]);
+        bytes.extend_from_slice(&[0, 0, 0]); // over-pad: 3 bytes, not the 0 the rule expects
+        bytes.extend_from_slice(b"8BIMlclr");
+        bytes.extend_from_slice(&8u32.to_be_bytes());
+        bytes.extend_from_slice(&[4, 0, 0, 0, 0, 0, 0, 0]);
+        let total = bytes.len();
+
+        let mut r = BeReader::new(&bytes);
+        let back = AdditionalLayerInfo::read(&mut r, &header(Version::Psd), total, 2).unwrap();
+        assert_eq!(back.blocks.len(), 2);
+        assert_eq!(back.blocks[0].key, TaggedBlockKey::LSCT);
+        assert_eq!(back.blocks[1].key, TaggedBlockKey::new(*b"lclr"));
+
+        // Without a signature inside the four-byte reach the same walk fails.
+        let mut bad = bytes.clone();
+        bad[12 + 4 + 3] = b'9';
+        let mut r = BeReader::new(&bad);
+        assert!(matches!(
+            AdditionalLayerInfo::read(&mut r, &header(Version::Psd), total, 2),
+            Err(PsdError::InvalidSignature { .. })
+        ));
     }
 
     #[test]

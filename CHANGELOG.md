@@ -12,6 +12,19 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.25] - 2026-10-04
+
+### Fixed
+
+- **A tagged block padded wider than its section alignment no longer fails
+  the whole layer-info walk.** Some writers pad a mid-list block to four
+  bytes inside a two-aligned section; the strict walk landed on the dead
+  bytes, read them as a signature, and aborted. The walk now resyncs onto
+  the next `8BIM`/`8B64` signature within four bytes — the tolerance the
+  pikado reference reader takes — but only where the strict read already
+  failed, so well-formed input is unchanged and a resynced block still has
+  to fit inside the section.
+
 ## [0.13.24] - 2026-10-03
 
 ### Added
