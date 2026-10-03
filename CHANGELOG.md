@@ -12,6 +12,29 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.22] - 2026-10-03
+
+### Changed
+
+- **Grayscale and bitmap composites now render through the document's embedded
+  ICC profile.** A thumbnail sweep of the corpus — comparing
+  `composite_rgba8` against each file's Photoshop-authored embedded JPEG
+  preview (image resource 1036) — showed clean grayscale files off by ~16
+  mean levels because their `GRAY` profiles were ignored. Photoshop applies
+  the profile; so do we now (`Grayscale_8`/`16`/`32` land within ~4.4 of the
+  authored preview). Documents without a profile keep the previous
+  passthrough. Duotone and multichannel documents still use their own
+  conversion paths.
+
+### Fixed
+
+- **32-bit CMYK, Lab and indexed composites no longer double-encode.** The
+  sRGB output encode added in 0.13.21 is meant for canvases still holding
+  linear-light values, but `ColorContext` already produces display-referred
+  sRGB for ICC-transformed and natively converted modes — applying the curve
+  again would have double-brightened them. The encode is now gated on whether
+  the canvas is still linear.
+
 ## [0.13.21] - 2026-10-03
 
 ### Changed

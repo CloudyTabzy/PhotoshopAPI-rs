@@ -1653,3 +1653,24 @@ fn a_32bit_composite_srgb_encodes_like_photoshops_thumbnail() {
     assert!(px[2] <= 8, "{px:?}");
     assert_eq!(px[3], 255, "{px:?}");
 }
+
+/// Grayscale documents carry an embedded gray ICC profile and Photoshop
+/// renders through it — its thumbnail of `Grayscale_8.psd` shows this pixel
+/// as ~107, matching the profile-transformed 111. A raw passthrough (the
+/// stored value) would show 88.
+#[test]
+fn a_grayscale_composite_applies_the_embedded_icc_profile() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/documents/Grayscale/Grayscale_8.psd");
+    let doc = LayeredFile::<u8>::read(path).unwrap();
+    assert!(!doc.icc_profile.is_empty());
+    let image = doc.composite_rgba8().unwrap();
+    let px = image.pixel(370, 24);
+    assert!(
+        (px[0] as i32 - 111).abs() <= 3,
+        "{px:?}: expected the ICC-transformed ~111, not the stored ~88"
+    );
+    assert_eq!(px[0], px[1], "{px:?}");
+    assert_eq!(px[1], px[2], "{px:?}");
+    assert_eq!(px[3], 255, "{px:?}");
+}

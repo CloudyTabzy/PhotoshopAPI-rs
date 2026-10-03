@@ -1,6 +1,6 @@
-//! Colour conversion at the boundary between native CMYK/Lab planes and RGB
-//! compositing. ICC transforms are resolved once per document and reused for
-//! every layer. RGB and grayscale documents retain their native sample space.
+//! Colour conversion at the boundary between native CMYK/Lab/grayscale planes
+//! and RGB compositing. ICC transforms are resolved once per document and
+//! reused for every layer. RGB documents retain their native sample space.
 
 use std::sync::Arc;
 
@@ -21,6 +21,7 @@ impl ColorContext {
         let expected = match mode {
             ColorMode::Cmyk => DataColorSpace::Cmyk,
             ColorMode::Lab => DataColorSpace::Lab,
+            ColorMode::Grayscale | ColorMode::Bitmap => DataColorSpace::Gray,
             _ => {
                 return Self {
                     mode,
@@ -59,10 +60,10 @@ impl ColorContext {
             })
         });
         let transform = profile.and_then(|source| {
-            let layout = if mode == ColorMode::Cmyk {
-                Layout::Rgba
-            } else {
-                Layout::Rgb
+            let layout = match mode {
+                ColorMode::Cmyk => Layout::Rgba,
+                ColorMode::Grayscale | ColorMode::Bitmap => Layout::Gray,
+                _ => Layout::Rgb,
             };
             let destination = ColorProfile::new_srgb();
             let options = TransformOptions {
@@ -92,6 +93,20 @@ impl ColorContext {
         Self { mode, transform }
     }
 
+    /// Whether converted planes arrive display-referred (`true`) rather than
+    /// linear-light. ICC-transformed output is sRGB, and the CMYK/Lab fallback
+    /// conversions and indexed palette lookups also produce display values;
+    /// RGB and unprofiled grayscale planes pass through untouched. 32-bit
+    /// channels are linear, so a canvas that is not display-encoded still
+    /// needs the sRGB transfer curve applied at byte output.
+    pub fn display_encoded(&self) -> bool {
+        self.transform.is_some()
+            || matches!(
+                self.mode,
+                ColorMode::Cmyk | ColorMode::Lab | ColorMode::Indexed
+            )
+    }
+
     pub fn convert_planar(&self, mut planes: Vec<Vec<f32>>, depth: u16) -> Result<[Vec<f32>; 3]> {
         let Some(first) = planes.first() else {
             return Err(invalid());
@@ -109,6 +124,11 @@ impl ColorContext {
             return Err(invalid());
         }
         if let Some(transform) = &self.transform {
+            // Single-plane documents (grayscale, bitmap) still produce three
+            // output channels from the transform; grow the planar image.
+            if planes.len() < 3 {
+                planes.resize(3, vec![0.0f32; pixels]);
+            }
             // A small reusable interleaved batch keeps the transform workspace
             // bounded instead of copying the whole planar image.
             let mut source = vec![0.0f32; components * 1024];
@@ -274,6 +294,33 @@ mod tests {
             .unwrap();
         for channel in 0..3 {
             assert!((eight[channel][0] - sixteen[channel][0]).abs() < 1e-5);
+        }
+    }
+
+    /// The byte-output sRGB encode for 32-bit documents must only run on
+    /// canvases still holding linear-light values. ICC transforms and the
+    /// CMYK/Lab fallback conversions already produce display-referred sRGB —
+    /// encoding them again would double-encode.
+    #[test]
+    fn display_encoded_tracks_whether_the_canvas_is_already_srgb() {
+        assert!(!ColorContext::new(ColorMode::Rgb, &[]).display_encoded());
+        assert!(!ColorContext::new(ColorMode::Grayscale, &[]).display_encoded());
+        assert!(ColorContext::new(ColorMode::Cmyk, &[]).display_encoded());
+        assert!(ColorContext::new(ColorMode::Lab, &[]).display_encoded());
+        assert!(ColorContext::new(ColorMode::Indexed, &[]).display_encoded());
+    }
+
+    /// A grayscale ICC profile transforms the single stored plane into three
+    /// display-referred RGB planes.
+    #[test]
+    fn a_gray_icc_profile_transforms_the_single_plane() {
+        let profile = ColorProfile::new_gray_with_gamma(1.0).encode().unwrap();
+        let context = ColorContext::new(ColorMode::Grayscale, &profile);
+        let rgb = context.convert_planar(vec![vec![0.5]], 8).unwrap();
+        assert!(context.display_encoded());
+        // A gamma-1.0 (linear) gray profile sRGB-encodes 0.5 to ~0.735.
+        for channel in 0..3 {
+            assert!((rgb[channel][0] - 0.735).abs() < 0.02, "{rgb:?}");
         }
     }
 }

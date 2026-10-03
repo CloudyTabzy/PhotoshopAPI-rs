@@ -385,7 +385,10 @@ impl<T: BitDepth> LayeredFile<T> {
             compositor.document_backdrop.as_ref(),
             false,
         )?;
-        Ok(canvas_to_image::<T>(&canvas))
+        Ok(canvas_to_image::<T>(
+            &canvas,
+            compositor.colors.display_encoded(),
+        ))
     }
 
     /// Render one layer or group alone — "export this layer as an image" —
@@ -495,7 +498,7 @@ impl<T: BitDepth> LayeredFile<T> {
 
         Ok(Some(LayerSprite {
             rect,
-            rgba: canvas_to_image::<T>(&canvas).rgba,
+            rgba: canvas_to_image::<T>(&canvas, compositor.colors.display_encoded()).rgba,
         }))
     }
 }
@@ -638,12 +641,15 @@ fn unmatte_planes(planes: &mut [Vec<f32>], alpha: &[f32], matte: [f32; 3]) {
     }
 }
 
-fn canvas_to_image<T: BitDepth>(canvas: &Canvas) -> CompositeImage {
+fn canvas_to_image<T: BitDepth>(canvas: &Canvas, display_encoded: bool) -> CompositeImage {
     // 32-bit channels store linear-light floats; Photoshop's own 8-bit
     // previews (the embedded JPEG thumbnail, verified against
     // Compression_ZipPrediction_32bit.psd) sRGB-encode them — linear 0.5
-    // shows as 188, not 128. 8/16-bit data is display-encoded already.
-    let srgb_encode = T::DEPTH == 32;
+    // shows as 188, not 128. 8/16-bit data is display-encoded already, as
+    // is any 32-bit canvas whose colour conversion produced sRGB (an ICC
+    // transform, the CMYK/Lab fallbacks, an indexed palette) — encoding
+    // those again would double-encode.
+    let srgb_encode = T::DEPTH == 32 && !display_encoded;
     let mut rgba = vec![0u8; canvas.alpha.len() * 4];
     for index in 0..canvas.alpha.len() {
         let alpha = canvas.alpha[index].clamp(0.0, 1.0);
