@@ -104,6 +104,8 @@ fn eight_bit_round_trips() {
         "Compression/Compression_RLE_8bit.psd",
         "Compression/Compression_Mixed_8bit.psd",
         "Compression/Compression_Zip_8bit.psd",
+        // Photoshop 2026-authored: every BlnM enum in the file is long-form.
+        "BlendModes/ps2026-blend-modes.psd",
         // Upstream "Roundtrip layer read-write multiple smart objects, no
         // warp information" plus the transformed-warp corpus.
         "SmartObjects/smart_object_file_no_warp.psd",
