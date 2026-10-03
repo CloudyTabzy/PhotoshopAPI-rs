@@ -25,6 +25,14 @@ v0.9.1 that this project ports.
   authored preview). Documents without a profile keep the previous
   passthrough. Duotone and multichannel documents still use their own
   conversion paths.
+- **ICC composites now render with Perceptual intent, matching Photoshop's
+  previews.** On a layer-free CMYK file whose embedded thumbnail is a pure
+  conversion of the merged data (`cmyk-gray-ramp.psd`), Perceptual lands
+  within 1.1 mean levels of the authored preview while RelativeColorimetric
+  lands ~9 off — Photoshop's preview pipeline renders Perceptual. The sweep
+  shows the effect on real files: the 69-layer `CMYK_8`/`16` documents dropped
+  from ~16.7 mean difference to ~3.8, at the JPEG noise floor. Matrix/TRC
+  profiles (grayscale, Lab) are intent-invariant and unaffected.
 
 ### Fixed
 

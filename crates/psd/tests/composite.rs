@@ -1674,3 +1674,25 @@ fn a_grayscale_composite_applies_the_embedded_icc_profile() {
     assert_eq!(px[1], px[2], "{px:?}");
     assert_eq!(px[3], 255, "{px:?}");
 }
+
+/// Photoshop renders its embedded previews through the document ICC profile
+/// with Perceptual intent. Verified on `cmyk-gray-ramp.psd` (a layer-free
+/// file: Perceptual conversion of the merged data lands within ~1.1 mean
+/// levels of the authored JPEG preview, RelativeColorimetric ~9) and pinned
+/// here on `CMYK_8.psd`, whose 69-layer composite lands at (102, 92, 90) vs
+/// the preview's (101, 91, 89).
+#[test]
+fn a_cmyk_composite_renders_perceptual_like_photoshops_thumbnail() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/documents/CMYK/CMYK_8.psd");
+    let doc = LayeredFile::<u8>::read(path).unwrap();
+    assert!(!doc.icc_profile.is_empty());
+    let image = doc.composite_rgba8().unwrap();
+    let px = image.pixel(300, 150);
+    for (v, expected) in px.into_iter().zip([102, 92, 90, 255]) {
+        assert!(
+            (v as i32 - expected).abs() <= 4,
+            "{px:?}: expected ~(102, 92, 90) — the preview's Perceptual render"
+        );
+    }
+}

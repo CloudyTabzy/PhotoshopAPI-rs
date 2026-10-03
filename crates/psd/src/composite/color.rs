@@ -66,8 +66,13 @@ impl ColorContext {
                 _ => Layout::Rgb,
             };
             let destination = ColorProfile::new_srgb();
+            // Photoshop's previews render with Perceptual intent: on
+            // cmyk-gray-ramp.psd (a layer-free file whose thumbnail is a pure
+            // conversion of the merged data) the embedded profile under
+            // Perceptual lands within 1.1 levels of the thumbnail, while
+            // RelativeColorimetric lands ~9 off.
             let options = TransformOptions {
-                rendering_intent: RenderingIntent::RelativeColorimetric,
+                rendering_intent: RenderingIntent::Perceptual,
                 interpolation_method: InterpolationMethod::Tetrahedral,
                 prefer_fixed_point: false,
                 ..TransformOptions::default()
@@ -80,7 +85,7 @@ impl ColorContext {
                         &destination,
                         Layout::Rgb,
                         TransformOptions {
-                            rendering_intent: RenderingIntent::Perceptual,
+                            rendering_intent: RenderingIntent::RelativeColorimetric,
                             ..options
                         },
                     )
