@@ -1021,10 +1021,16 @@ pub(crate) fn build_outer(
         shape_by_contour(&mut field, shadow.contour.as_ref(), shadow.anti_aliased);
         add_noise(&mut field, rect, out_width, shadow.noise);
         // "Layer Knocks Out Drop Shadow" (on by default): the layer's own
-        // transparency shape removes its shadow.
+        // transparency shape removes its shadow, but only where the layer is
+        // fully opaque. A partly transparent pixel (a half-opacity child, an
+        // anti-aliased edge) leaves the shadow whole beneath it; scaling the
+        // shadow by `1 - alpha` instead, as this port first did, darkened
+        // those pixels against Photoshop's flatten.
         if shadow.layer_knocks_out.unwrap_or(true) {
             for (value, matte) in field.iter_mut().zip(&own) {
-                *value *= 1.0 - *matte;
+                if *matte >= 0.999 {
+                    *value = 0.0;
+                }
             }
         }
         planes.push(plane_from_field(rect, &field, &shadow_paint(shadow)));
@@ -1662,6 +1668,29 @@ mod tests {
         }
         content.alpha[0] = 1.0;
         content
+    }
+
+    #[test]
+    fn a_knocked_out_shadow_survives_beneath_partly_transparent_pixels() {
+        use psd_core::{Shadow, ShadowKind};
+        let mut shadow = Shadow::new(ShadowKind::Drop);
+        shadow.opacity = Some(100.0);
+        shadow.distance = Some(0.0);
+        shadow.size = Some(0.0);
+        shadow.angle = Some(0.0);
+        let effects = LayerEffects {
+            drop_shadows: vec![shadow],
+            ..Default::default()
+        };
+        // One opaque pixel and one half-transparent pixel, side by side.
+        let mut content = Content::new(Rect::new(0, 0, 1, 2));
+        content.alpha = vec![1.0, 0.5];
+        let coverage = content.alpha.clone();
+        let planes = build_outer(&content, &coverage, &effects, Rect::new(-4, -4, 5, 6));
+        let plane = &planes[0].content;
+        let at = |x: i32, y: i32| plane.alpha[plane.index(i64::from(x), i64::from(y)).unwrap()];
+        assert_eq!(at(0, 0), 0.0, "knocked out under the opaque pixel");
+        assert!((at(1, 0) - 0.5).abs() < 1e-4, "{}", at(1, 0));
     }
 
     #[test]

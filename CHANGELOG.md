@@ -12,6 +12,17 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.14] - 2026-10-03
+
+### Fixed
+
+- **"Layer Knocks Out Drop Shadow" removes the shadow only where the layer is fully opaque.** A
+  partly transparent pixel (a child at half opacity inside a group, an anti-aliased edge) leaves
+  the shadow whole beneath it; the port scaled the shadow by `1 - alpha`, which darkened those
+  pixels against Photoshop's flatten. `photoshop-group-fx-blend-fill` fell from mean 0.67 to
+  **0.00** and `photoshop-interior-exterior-blending` from 0.41 to 0.28; `layer_comps` improved
+  (0.61 → 0.52) with no regression anywhere.
+
 ## [0.13.13] - 2026-10-03
 
 ### Fixed
