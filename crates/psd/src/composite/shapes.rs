@@ -9,12 +9,12 @@
 //! density shows the fill everywhere at `1 − density` outside the path.
 
 use psd_core::vector::{VectorData, VectorStroke};
-use psd_core::{AdjustmentKind, MaskParams};
+use psd_core::{AdjustmentKind, BlendMode, MaskParams};
 
 use super::adjustments::paint_content;
 use super::paths::{feather_blur, rasterize_path};
 use super::stroke::{stroke_coverage, Alignment, Cap, Join, StrokeStyle};
-use super::{Compositor, Content, Rect};
+use super::{blend, Compositor, Content, Rect};
 use crate::layer::Layer;
 use crate::BitDepth;
 
@@ -212,6 +212,13 @@ impl<T: BitDepth> Compositor<'_, T> {
             .and_then(|(stroke, _)| stroke.fill_enabled())
             .unwrap_or(true)
             || stroke.is_none();
+        // `strokeStyleBlendMode` paints the stroke onto the fill with its
+        // own mode; Normal (what every authored file carries) skips the
+        // blend entirely.
+        let stroke_blend_mode = stroke
+            .as_ref()
+            .and_then(|(stroke, _)| stroke.blend_mode_value())
+            .unwrap_or(BlendMode::NORMAL);
 
         // Composite fill and stroke into premultiplied planes over `working`.
         let clamp_index = |x: i32, y: i32| -> Option<usize> {
@@ -251,6 +258,21 @@ impl<T: BitDepth> Compositor<'_, T> {
                         paint.color[1][source],
                         paint.color[2][source],
                     ];
+                }
+                if stroke_blend_mode != BlendMode::NORMAL && stroke_alpha > 0.0 {
+                    let backdrop = [
+                        fill.color[0][source],
+                        fill.color[1][source],
+                        fill.color[2][source],
+                    ];
+                    let blended =
+                        blend::blend(stroke_blend_mode, backdrop, stroke_color, self.byte_domain);
+                    // The same translucent-backdrop rule the layer compositor
+                    // applies: under a partly transparent fill the stroke
+                    // keeps its own colour in proportion.
+                    for (channel, value) in stroke_color.iter_mut().enumerate() {
+                        *value = *value * (1.0 - fill_alpha) + blended[channel] * fill_alpha;
+                    }
                 }
                 let out_alpha = stroke_alpha + fill_alpha * (1.0 - stroke_alpha);
                 alpha[index] = out_alpha;

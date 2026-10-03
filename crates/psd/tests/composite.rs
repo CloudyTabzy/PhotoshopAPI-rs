@@ -715,6 +715,86 @@ fn shape_paint_in_a_content_block_renders_live() {
     }
 }
 
+/// A vector stroke's own blend mode (`strokeStyleBlendMode`) blends the
+/// stroke onto the shape's fill channel-wise rather than replacing it:
+/// Multiply keeps the stroke dark but tints it with the fill's colour.
+#[test]
+fn a_vector_strokes_blend_mode_blends_onto_the_fill() {
+    use psd::core::{DescriptorKey, DescriptorValue, VectorBlock, VectorData};
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/generated/Vectors/vector_shapes_8bit.psd");
+    let mut doc = LayeredFile::<u8>::read(path).unwrap();
+    let id = doc
+        .layers_with_ids()
+        .find(|(_, layer)| layer.name == "Ellipse")
+        .map(|(id, _)| id)
+        .unwrap();
+    // Blank the stored pixels so the live stroke has to draw (stored pixels
+    // that already hold the stroke otherwise win, `fill_source`).
+    doc.layer_mut(id)
+        .unwrap()
+        .channels_mut()
+        .unwrap()
+        .iter_mut()
+        .for_each(|(_, samples)| samples.fill(0));
+    // The fixture's stroke is dashed; a solid ring keeps the arithmetic
+    // clean, and the same undashed ring first renders Normal: every diff
+    // between the two renders is then the blend mode alone.
+    let patch_stroke = |doc: &mut LayeredFile<u8>, mode: [u8; 4]| {
+        let layer = doc.layer_mut(id).unwrap();
+        let block = layer
+            .blocks
+            .blocks
+            .iter_mut()
+            .find(|block| block.key == TaggedBlockKey::new(*b"vstk"))
+            .unwrap();
+        let mut vector = VectorBlock::read(block).unwrap().unwrap();
+        let VectorData::Stroke(ref mut stroke) = vector.data else {
+            panic!("vstk must decode to a stroke");
+        };
+        let DescriptorValue::Enumerated { value, .. } =
+            stroke.descriptor.get_mut("strokeStyleBlendMode").unwrap()
+        else {
+            panic!("strokeStyleBlendMode must be an enumerator");
+        };
+        *value = DescriptorKey::char_id(mode);
+        *stroke.descriptor.get_mut("strokeStyleLineDashSet").unwrap() =
+            DescriptorValue::List(Vec::new());
+        *block = vector.to_tagged_block().unwrap();
+    };
+    patch_stroke(&mut doc, *b"Nrml");
+    let normal = flatten(&doc);
+    patch_stroke(&mut doc, *b"Mltp");
+    let multiplied = flatten(&doc);
+
+    // The fill's interior is untouched by the stroke's blend.
+    assert_eq!(multiplied.pixel(46, 12), normal.pixel(46, 12));
+    // Where the grey (20,20,20) stroke covers the fill, Multiply can only
+    // darken — and at full coverage it reaches (20/255)·(40,120,220) ≈
+    // (3,9,17). Ring pixels hanging off the fill keep the plain grey.
+    let (mut blended, mut darkest) = (0, 255u8);
+    for y in 0..64 {
+        for x in 0..64 {
+            let before = normal.pixel(x, y);
+            let after = multiplied.pixel(x, y);
+            if after == before {
+                continue;
+            }
+            blended += 1;
+            assert!(
+                after[0] < before[0] && after[1] <= before[1] && after[2] <= before[2],
+                "({x}, {y}): {before:?} -> {after:?}"
+            );
+            darkest = darkest.min(after[0]);
+        }
+    }
+    assert!(blended > 10, "only {blended} ring pixels changed");
+    assert!(
+        darkest <= 6,
+        "no pixel reached the multiply result: {darkest}"
+    );
+}
+
 /// The stored pixels of a stroked shape already hold its stroke, including
 /// the half that lies outside the path: the path must not clip them.
 #[test]

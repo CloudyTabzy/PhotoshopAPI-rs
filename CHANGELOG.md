@@ -12,6 +12,21 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.24] - 2026-10-03
+
+### Added
+
+- **A vector stroke's own blend mode (`strokeStyleBlendMode`) is honoured
+  when the live stroke is drawn over the shape's fill.** The stroke was
+  always composited source-over; a `vstk` carrying Multiply, Subtract or
+  any other mode now blends against the fill beneath it with the same
+  translucent-backdrop rule the layer compositor applies, matching how
+  `psd-tools` composites the same field. Every authored file in the corpus
+  carries Normal, which keeps the previous (verified) arithmetic, so the
+  change is provably inert for all existing oracles; non-Normal modes are
+  implemented on the shared blend machinery and remain unverified until a
+  Photoshop-authored file exercises one.
+
 ## [0.13.23] - 2026-10-03
 
 ### Fixed
