@@ -12,6 +12,21 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.9] - 2026-10-03
+
+### Fixed
+
+- **Two-stop gradient overlays, glows and strokes now ease like fill layers do.** A gradient with
+  smoothness 4096 eases every segment, including a lone one, and the transparency ramp eases the
+  same way; only fill layers did, so an overlay of two colours came out linear while Photoshop's
+  flatten starts slowly and flattens out toward both ends (green channel 0, 5, 11, 18, 25... where
+  a linear ramp gave 0, 9, 18, 27...). `Ramp` no longer carries an end-point-smoothing switch; a
+  smoothness of zero is still linear. `photoshop-overlay-zorder` fell from mean 0.67 to **0.01**,
+  `photoshop-stroke-shapeburst` 0.58 to **0.06** and `photoshop-stroke-aa-matte` 0.95 to 0.84 in
+  the Photoshop-export set, and the stored-merge set improved on a dozen documents
+  (`clipping-mask2` 1.77 → 1.51, `fill_adjustments` 2.58 → 2.44, `layer_effects` 0.97 → 0.87)
+  with no regression.
+
 ## [0.13.8] - 2026-10-03
 
 ### Fixed

@@ -72,7 +72,7 @@ impl EffectPaint {
 
 /// Sample a gradient at `t` in `0..=1` as straight colour (no transparency).
 pub(crate) fn gradient_sample(gradient: &Gradient, t: f32) -> [f32; 3] {
-    Ramp::new(gradient, None, false).map_or([0.0; 3], |ramp| ramp.sample(t).0)
+    Ramp::new(gradient, None).map_or([0.0; 3], |ramp| ramp.sample(t).0)
 }
 
 /// Whether any effect of the set draws.
@@ -633,7 +633,7 @@ fn fold_interior_overlays_into(
         let Some(gradient) = overlay.gradient.as_ref() else {
             continue;
         };
-        let Some(ramp) = Ramp::new(gradient, overlay.interpolation, false) else {
+        let Some(ramp) = Ramp::new(gradient, overlay.interpolation) else {
             continue;
         };
         let span = if overlay.align.unwrap_or(true) {
@@ -866,7 +866,7 @@ fn glow_paint(glow: &psd_core::Glow, default_mode: BlendMode) -> EffectPaint {
     let ramp = glow
         .gradient
         .as_ref()
-        .and_then(|gradient| Ramp::new(gradient, None, false));
+        .and_then(|gradient| Ramp::new(gradient, None));
     EffectPaint {
         color: glow.color.as_ref().map(color_rgb).unwrap_or([1.0; 3]),
         alpha: opacity_scale(glow.opacity),
@@ -1350,7 +1350,7 @@ pub(crate) fn build_strokes(
                 let ramp = stroke
                     .gradient
                     .as_ref()
-                    .and_then(|gradient| Ramp::new(gradient, stroke.interpolation, false));
+                    .and_then(|gradient| Ramp::new(gradient, stroke.interpolation));
                 let Some(ramp) = ramp else {
                     continue;
                 };

@@ -5,8 +5,9 @@
 //! stop at its right (the destination) and remaps the segment so the midpoint
 //! lands on 50%, and Classic interpolation eases each segment with a
 //! Catmull-Rom spline (duplicated virtual end points) scaled by the stored
-//! smoothness. Two-stop colour ramps stay linear unless the caller asks for
-//! end-point smoothing, which fill layers do.
+//! smoothness. Two-stop ramps ease too (the end segments hold their end
+//! point at both ends), for fills, overlays, glows and strokes alike; a
+//! smoothness of zero is linear. Transparency segments ease the same way.
 //!
 //! The geometry functions map a pixel to a ramp position for the five
 //! point-mapped styles, following Photoshop's measured behaviour: the axis
@@ -43,18 +44,12 @@ pub(crate) struct Ramp {
     /// `Intr / 4096`, 1.0 for a fully smooth gradient.
     smoothness: f32,
     interpolation: GradientInterpolation,
-    /// Fill layers ease even two-stop ramps.
-    endpoint_smoothing: bool,
 }
 
 impl Ramp {
     /// Build a ramp. Returns `None` for gradients this renderer cannot
     /// evaluate (noise gradients).
-    pub fn new(
-        gradient: &Gradient,
-        interpolation: Option<GradientInterpolation>,
-        endpoint_smoothing: bool,
-    ) -> Option<Self> {
+    pub fn new(gradient: &Gradient, interpolation: Option<GradientInterpolation>) -> Option<Self> {
         let solid = match &gradient.kind {
             GradientKind::Solid(solid) => solid.clone(),
             GradientKind::Noise(noise) => synthesize_noise_gradient(noise),
@@ -84,7 +79,6 @@ impl Ramp {
             alphas,
             smoothness: (solid.smoothness as f32 / 4096.0).clamp(0.0, 1.0),
             interpolation: interpolation.unwrap_or(GradientInterpolation::Classic),
-            endpoint_smoothing,
         })
     }
 
@@ -138,11 +132,7 @@ impl Ramp {
                             left.color
                         };
                         let next = stops.get(index + 1).map_or(right.color, |s| s.color);
-                        let smoothness = if stops.len() > 2 || self.endpoint_smoothing {
-                            self.smoothness
-                        } else {
-                            0.0
-                        };
+                        let smoothness = self.smoothness;
                         let mut out = [0.0; 3];
                         for channel in 0..3 {
                             let linear = left.color[channel]
@@ -181,7 +171,7 @@ impl Ramp {
             if position <= right.location {
                 let span = (right.location - left.location).max(0.0001);
                 let t = remap((position - left.location) / span, right.midpoint);
-                if self.endpoint_smoothing && self.smoothness > 0.0 {
+                if self.smoothness > 0.0 {
                     let previous = if index > 1 {
                         stops[index - 2].opacity
                     } else {
@@ -618,9 +608,9 @@ mod tests {
 
     #[test]
     fn a_noise_gradient_draws_a_deterministic_ramp_from_its_seed() {
-        let first = Ramp::new(&noise(7, 2048), None, false).expect("noise gradients render");
-        let again = Ramp::new(&noise(7, 2048), None, false).unwrap();
-        let other = Ramp::new(&noise(8, 2048), None, false).unwrap();
+        let first = Ramp::new(&noise(7, 2048), None).expect("noise gradients render");
+        let again = Ramp::new(&noise(7, 2048), None).unwrap();
+        let other = Ramp::new(&noise(8, 2048), None).unwrap();
         let samples = |ramp: &Ramp| -> Vec<[f32; 3]> {
             (0..=10).map(|i| ramp.sample(i as f32 / 10.0).0).collect()
         };
@@ -667,25 +657,29 @@ mod tests {
     }
 
     #[test]
-    fn a_two_stop_ramp_is_linear_and_the_midpoint_moves_the_halfway_colour() {
-        let plain = gradient(&[(0, 50, [0.0; 3]), (4096, 50, [255.0; 3])], &[], 4096.0);
-        let ramp = Ramp::new(&plain, None, false).unwrap();
+    fn a_two_stop_ramp_without_smoothness_is_linear_and_the_midpoint_moves_the_halfway_colour() {
+        let plain = gradient(&[(0, 50, [0.0; 3]), (4096, 50, [255.0; 3])], &[], 0.0);
+        let ramp = Ramp::new(&plain, None).unwrap();
         assert!((ramp.sample(0.25).0[0] - 0.25).abs() < 1e-4);
 
         // The destination stop's midpoint at 25%: half the colour change has
         // happened a quarter of the way along.
-        let skewed = gradient(&[(0, 50, [0.0; 3]), (4096, 25, [255.0; 3])], &[], 4096.0);
-        let ramp = Ramp::new(&skewed, None, false).unwrap();
+        let skewed = gradient(&[(0, 50, [0.0; 3]), (4096, 25, [255.0; 3])], &[], 0.0);
+        let ramp = Ramp::new(&skewed, None).unwrap();
         assert!((ramp.sample(0.25).0[0] - 0.5).abs() < 1e-4);
     }
 
     #[test]
-    fn end_point_smoothing_eases_a_two_stop_ramp() {
+    fn smoothness_eases_a_two_stop_ramp() {
         let plain = gradient(&[(0, 50, [0.0; 3]), (4096, 50, [255.0; 3])], &[], 4096.0);
-        let eased = Ramp::new(&plain, None, true).unwrap();
+        let eased = Ramp::new(&plain, None).unwrap();
         // 0.5t + 1.5t^2 - t^3 at t = 0.25.
         let expected = 0.5 * 0.25 + 1.5 * 0.0625 - 0.015625;
         assert!((eased.sample(0.25).0[0] - expected).abs() < 1e-4);
+        // Half the smoothness is halfway between linear and eased.
+        let half = gradient(&[(0, 50, [0.0; 3]), (4096, 50, [255.0; 3])], &[], 2048.0);
+        let halfway = Ramp::new(&half, None).unwrap().sample(0.25).0[0];
+        assert!((halfway - (0.25 + expected) / 2.0).abs() < 1e-4);
     }
 
     #[test]
@@ -695,7 +689,7 @@ mod tests {
             &[(0, 100.0), (4096, 0.0)],
             4096.0,
         );
-        let ramp = Ramp::new(&g, None, false).unwrap();
+        let ramp = Ramp::new(&g, None).unwrap();
         let (color, alpha) = ramp.sample(0.5);
         assert_eq!(color, [1.0, 0.0, 0.0]);
         assert!((alpha - 0.5).abs() < 1e-4);

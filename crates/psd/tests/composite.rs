@@ -1434,9 +1434,12 @@ fn independent_gradient_overlays_keep_their_alpha_at_each_pixel() {
     doc.add_layer(layer);
     let image = flatten(&doc);
     assert_eq!(image.pixel(0, 0), [0; 4]);
-    close(image.pixel(1, 0), [0, 0, 255, 16]);
+    // The transparency ramp eases (smoothness 4096): 0.2031, 0.5 and 0.7969 a
+    // quarter, half and three quarters of the way across, times the 50%
+    // overlay opacity and the mask (half at the second pixel).
+    close(image.pixel(1, 0), [0, 0, 255, 13]);
     close(image.pixel(2, 0), [0, 0, 255, 64]);
-    close(image.pixel(3, 0), [0, 0, 255, 96]);
+    close(image.pixel(3, 0), [0, 0, 255, 102]);
 }
 
 #[test]

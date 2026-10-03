@@ -1297,7 +1297,7 @@ pub(super) fn paint_content<T: BitDepth>(
             // A gradient fill eases even a two-stop ramp.
             let ramp = gradient
                 .as_ref()
-                .and_then(|gradient| Ramp::new(gradient, interpolation, true));
+                .and_then(|gradient| Ramp::new(gradient, interpolation));
             let placement = Placement {
                 style: enumerated("Type")
                     .and_then(|id| GradientStyle::from_id(&id))
