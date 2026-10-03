@@ -12,6 +12,13 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.16] - 2026-10-03
+
+### Fixed
+
+- The README said a layered save writes a zeroed merged-image placeholder; since 0.13.2 it is a
+  white fill. The text now says so.
+
 ## [0.13.15] - 2026-10-03
 
 ### Fixed

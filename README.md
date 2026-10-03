@@ -155,8 +155,8 @@ composite, and replacement is transactional.
 
 - Compositing is best-effort: complex adjustments, effects, special blend modes and version-dependent behavior can differ from Photoshop or be skipped.
 - Photoshop-faithful Multichannel spot-color and overprint preview; the compositor shows the first channel in grayscale
-- Layered saves don't render a true merged composite. They write the zeroed
-  RLE placeholder used by upstream, and Photoshop re-renders layers on open.
+- Layered saves don't render a true merged composite. They write a white-filled
+  RLE placeholder (upstream writes zeros), and Photoshop re-renders layers on open.
   Unedited layerless documents retain their original merged pixels.
 
 ## Requirements
