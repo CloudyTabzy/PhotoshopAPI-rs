@@ -97,9 +97,9 @@ pub use image_resources::{
 };
 pub use io::{BeReader, BeWriter};
 pub use layer_and_mask_info::{
-    BlendingRange, ChannelData, ChannelImageData, ChannelInfo, GlobalLayerMaskInfo,
-    LayerAndMaskInformation, LayerBlendingRanges, LayerFlags, LayerInfo, LayerMask, LayerMaskData,
-    LayerMaskFlags, LayerRecord, MaskParams, MAX_LAYER_CHANNELS,
+    BlendingRange, ChannelData, ChannelImageData, ChannelInfo, GlobalLayerMaskInfo, GlobalMaskKind,
+    GlobalMaskSettings, LayerAndMaskInformation, LayerBlendingRanges, LayerFlags, LayerInfo,
+    LayerMask, LayerMaskData, LayerMaskFlags, LayerRecord, MaskParams, MAX_LAYER_CHANNELS,
 };
 pub use layer_effects::{
     EffectDescriptor, EffectKind, LayerEffectsBlock, LayerEffectsData, LegacyEffectColor,

@@ -6,7 +6,7 @@
 //! the section itself).
 //!
 //! Section order: `length` (u32 PSD / u64 PSB) | `LayerInfo` (its own marker)
-//! | `GlobalLayerMaskInfo` (u32 marker + opaque bytes) | tagged blocks
+//! | `GlobalLayerMaskInfo` (u32 marker + bytes, [`GlobalMaskSettings`] typed) | tagged blocks
 //! (4-byte aligned). 16- and 32-bit documents keep their layer data inside an
 //! `Lr16`/`Lr32` tagged block instead of the main `LayerInfo` (which is then a
 //! zero-length section); this port moves it into [`LayerInfo`] on read and
@@ -1400,11 +1400,100 @@ impl LayerBlendingRanges {
     }
 }
 
-/// Opaque GlobalLayerMaskInfo payload. Photoshop writes an empty section; the
-/// contents are undocumented, so the port preserves whatever is there.
+/// Which mask display setting a [`GlobalMaskSettings`] payload describes (its
+/// trailing kind byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalMaskKind {
+    /// The overlay color shows the selected color, inverted. Written only by
+    /// beta-era Photoshop; kept for old files.
+    ColorSelected,
+    /// The overlay color shows the protected color (beta-era Photoshop).
+    ColorProtected,
+    /// Each layer's mask data carries its own value — what modern Photoshop
+    /// writes.
+    PerLayer,
+    /// Any other byte, meaning undocumented. Preserved verbatim.
+    Unknown(u8),
+}
+
+impl GlobalMaskKind {
+    const fn from_byte(byte: u8) -> Self {
+        match byte {
+            0 => Self::ColorSelected,
+            1 => Self::ColorProtected,
+            128 => Self::PerLayer,
+            other => Self::Unknown(other),
+        }
+    }
+
+    const fn as_byte(self) -> u8 {
+        match self {
+            Self::ColorSelected => 0,
+            Self::ColorProtected => 1,
+            Self::PerLayer => 128,
+            Self::Unknown(byte) => byte,
+        }
+    }
+}
+
+/// The typed contents of a non-empty [`GlobalLayerMaskInfo`]: five big-endian
+/// `u16` overlay color values, a `u16` opacity, and a kind byte — a 13-byte
+/// record Photoshop pads with zeros to a 4-byte boundary (usually 16 bytes
+/// total). The overlay is mask-display state, not compositing input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalMaskSettings {
+    /// Undocumented overlay color space id followed by its four components,
+    /// as stored (component values use the full `u16` range).
+    pub overlay_color: [u16; 5],
+    /// Overlay opacity as a percent, 0 (transparent) to 100 (opaque).
+    pub opacity: u16,
+    /// Which mask setting the overlay describes.
+    pub kind: GlobalMaskKind,
+}
+
+/// GlobalLayerMaskInfo payload: empty when the document never set mask
+/// display options, otherwise the 13-byte [`GlobalMaskSettings`] record
+/// zero-padded to a 4-byte boundary. The bytes are authoritative for writing
+/// so unusual lengths round-trip; [`parse`](Self::parse) and
+/// [`set`](Self::set) cover the typed view.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GlobalLayerMaskInfo {
     pub data: Vec<u8>,
+}
+
+impl GlobalLayerMaskInfo {
+    /// The typed settings when the payload carries the 13-byte record
+    /// (padded or not); `None` for an empty or truncated payload.
+    pub fn parse(&self) -> Option<GlobalMaskSettings> {
+        if self.data.len() < 13 {
+            return None;
+        }
+        let read_u16 = |at: usize| u16::from_be_bytes([self.data[at], self.data[at + 1]]);
+        Some(GlobalMaskSettings {
+            overlay_color: [
+                read_u16(0),
+                read_u16(2),
+                read_u16(4),
+                read_u16(6),
+                read_u16(8),
+            ],
+            opacity: read_u16(10),
+            kind: GlobalMaskKind::from_byte(self.data[12]),
+        })
+    }
+
+    /// Replace the payload with the 13-byte settings record padded to four
+    /// bytes, the shape Photoshop writes.
+    pub fn set(&mut self, settings: GlobalMaskSettings) {
+        let mut data = Vec::with_capacity(16);
+        for component in settings.overlay_color {
+            data.extend_from_slice(&component.to_be_bytes());
+        }
+        data.extend_from_slice(&settings.opacity.to_be_bytes());
+        data.push(settings.kind.as_byte());
+        data.resize(16, 0);
+        self.data = data;
+    }
 }
 
 /// The compressed channel data of one layer, index aligned with the layer's
@@ -2018,5 +2107,61 @@ mod tests {
             SectionDivider::from_raw(u32::from_be_bytes(block.data[..4].try_into().unwrap())),
             SectionDivider::OpenFolder
         );
+    }
+
+    #[test]
+    fn global_layer_mask_info_parses_the_settings_record() {
+        // The 16-byte payload Photoshop actually writes (space 0, red overlay
+        // at 50%, per-layer kind) — the shape the corpus carries.
+        let info = GlobalLayerMaskInfo {
+            data: vec![
+                0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x80, 0x00,
+                0x00, 0x00,
+            ],
+        };
+        assert_eq!(
+            info.parse(),
+            Some(GlobalMaskSettings {
+                overlay_color: [0, 0xffff, 0, 0, 0],
+                opacity: 50,
+                kind: GlobalMaskKind::PerLayer,
+            })
+        );
+
+        // A 13-byte body padded to only 14 bytes is in the corpus too; the
+        // first 13 bytes still decode and the payload stays authoritative.
+        let short = GlobalLayerMaskInfo {
+            data: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0],
+        };
+        assert_eq!(
+            short.parse(),
+            Some(GlobalMaskSettings {
+                overlay_color: [0; 5],
+                opacity: 0,
+                kind: GlobalMaskKind::PerLayer,
+            })
+        );
+        assert_eq!(GlobalLayerMaskInfo::default().parse(), None);
+        assert_eq!(GlobalLayerMaskInfo { data: vec![0; 12] }.parse(), None);
+    }
+
+    #[test]
+    fn global_layer_mask_info_set_writes_the_photoshop_shape() {
+        let mut info = GlobalLayerMaskInfo::default();
+        info.set(GlobalMaskSettings {
+            overlay_color: [1, 2, 3, 4, 5],
+            opacity: 75,
+            kind: GlobalMaskKind::Unknown(7),
+        });
+        assert_eq!(info.data.len(), 16);
+        assert_eq!(
+            info.parse(),
+            Some(GlobalMaskSettings {
+                overlay_color: [1, 2, 3, 4, 5],
+                opacity: 75,
+                kind: GlobalMaskKind::Unknown(7),
+            })
+        );
+        assert!(info.data[13..].iter().all(|&byte| byte == 0));
     }
 }

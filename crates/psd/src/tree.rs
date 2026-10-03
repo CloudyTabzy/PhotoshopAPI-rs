@@ -8,7 +8,7 @@
 //! passed to these methods count only real layers (dividers are skipped).
 //! Groups without a divider get one synthesized on write.
 
-use psd_core::{PsdError, Result};
+use psd_core::{LayerColor, PsdError, Result};
 
 use crate::bitdepth::BitDepth;
 use crate::layer::{Layer, LayerId, LayerKind};
@@ -167,6 +167,56 @@ impl<T: BitDepth> LayeredFile<T> {
             current = self.parent(id);
         }
         false
+    }
+
+    /// Effective `lspf` lock flags for `id`: its own word OR'd with every
+    /// ancestor group's. Photoshop applies a group's locks to its descendants
+    /// without recording the inherited bits on the children, so
+    /// [`Layer::protection_flags`] alone reports only the file value. Unknown
+    /// ids report 0.
+    pub fn effective_protection_flags(&self, id: LayerId) -> u32 {
+        let mut flags = 0;
+        let mut current = Some(id);
+        while let Some(layer_id) = current {
+            let Some(layer) = self.layer(layer_id) else {
+                break;
+            };
+            flags |= layer.protection_flags();
+            current = self.parent(layer_id);
+        }
+        flags
+    }
+
+    /// Whether the layer is locked, its own `lspf` "lock all" or an ancestor
+    /// group's. [`Layer::is_locked`] alone reads only the file value.
+    pub fn is_effectively_locked(&self, id: LayerId) -> bool {
+        let mut current = Some(id);
+        while let Some(layer_id) = current {
+            if self.layer(layer_id).is_some_and(Layer::is_locked) {
+                return true;
+            }
+            current = self.parent(layer_id);
+        }
+        false
+    }
+
+    /// Effective panel color for `id`: its own `lclr`, else the nearest
+    /// ancestor group's. Photoshop lets a group's label color its
+    /// descendants; [`Layer::display_color`] alone reads only the file value.
+    /// Unknown ids report [`LayerColor::None`].
+    pub fn effective_display_color(&self, id: LayerId) -> LayerColor {
+        let mut current = Some(id);
+        while let Some(layer_id) = current {
+            let Some(layer) = self.layer(layer_id) else {
+                break;
+            };
+            let color = layer.display_color();
+            if color != LayerColor::None {
+                return color;
+            }
+            current = self.parent(layer_id);
+        }
+        LayerColor::None
     }
 
     pub(crate) fn parent_is_within_artboard(&self, parent: Option<LayerId>) -> bool {
@@ -532,6 +582,44 @@ mod tests {
             .iter()
             .map(|&id| document.layer(id).unwrap().name.clone())
             .collect()
+    }
+
+    /// Photoshop locks a group's descendants without recording the inherited
+    /// state on them: the file value stays per layer, so the effective
+    /// accessors walk the ancestors.
+    #[test]
+    fn locks_and_labels_inherit_from_ancestors() {
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 1, 1).unwrap();
+        let outer = document.add_layer(Layer::new_group("Outer"));
+        let inner = document
+            .add_layer_to_group(outer, Layer::new_group("Inner"))
+            .unwrap();
+        let leaf = document.add_layer_to_group(inner, image("Leaf")).unwrap();
+
+        document.layer_mut(inner).unwrap().set_locked(true);
+        document
+            .layer_mut(outer)
+            .unwrap()
+            .set_display_color(LayerColor::Orange);
+
+        let leaf_layer = document.layer(leaf).unwrap();
+        assert!(!leaf_layer.is_locked());
+        assert_eq!(leaf_layer.protection_flags(), 0);
+        assert_eq!(leaf_layer.display_color(), LayerColor::None);
+
+        assert!(document.is_effectively_locked(leaf));
+        assert!(document.is_effectively_locked(inner));
+        assert_ne!(document.effective_protection_flags(leaf), 0);
+        assert_eq!(document.effective_display_color(leaf), LayerColor::Orange);
+
+        // The leaf's own values win over anything inherited.
+        document
+            .layer_mut(leaf)
+            .unwrap()
+            .set_display_color(LayerColor::Blue);
+        assert_eq!(document.effective_display_color(leaf), LayerColor::Blue);
+        let free = document.add_layer(image("Free"));
+        assert!(!document.is_effectively_locked(free));
     }
 
     #[test]

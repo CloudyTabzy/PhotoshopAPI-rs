@@ -12,6 +12,23 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.18] - 2026-10-03
+
+### Added
+
+- **`GlobalLayerMaskInfo::parse`/`set`, a typed view of the document's global mask
+  settings.** The section is empty or a 13-byte record — an undocumented overlay color
+  space id plus four `u16` components, a `u16` opacity percent, and a kind byte
+  (`GlobalMaskKind`: color selected / protected / per-layer) — zero-padded to a 4-byte
+  boundary. The raw payload stays authoritative for writing, so unusual lengths still
+  round-trip; `set` writes the padded shape Photoshop produces.
+- **`LayeredFile::effective_protection_flags`, `is_effectively_locked`, and
+  `effective_display_color`.** Photoshop applies a group's `lspf` locks and `lclr` panel
+  color to its descendants without recording the inherited values on the children, so the
+  per-layer `Layer::is_locked`/`display_color` readers see only what the file stores. The
+  new accessors walk the ancestors — the reading the per-layer docs already described but
+  the API could not express.
+
 ## [0.13.17] - 2026-10-03
 
 ### Fixed
