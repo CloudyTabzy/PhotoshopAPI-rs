@@ -300,6 +300,32 @@ pub(crate) fn dilate(matte: &[f32], width: usize, height: usize, radius: usize) 
     if radius == 0 {
         return matte.to_vec();
     }
+    {
+        let contour: Vec<f32> = matte
+            .iter()
+            .map(|&v| if v >= 0.5 { 1.0 } else { 0.0 })
+            .collect();
+        if contour.iter().any(|&v| v > 0.0) {
+            let mut distance = distance_transform(&contour, width, height);
+            refine_edge_distance(
+                &mut distance,
+                &contour,
+                matte,
+                width,
+                height,
+                radius as f32 + 2.0,
+                true,
+            );
+            return matte
+                .iter()
+                .zip(distance.iter())
+                .map(|(value, distance)| {
+                    let reach = (radius as f32 + 1.0 - *distance).clamp(0.0, 1.0);
+                    value.max(reach)
+                })
+                .collect();
+        }
+    }
     let distance = distance_transform(matte, width, height);
     matte
         .iter()
@@ -326,7 +352,11 @@ fn exterior_mask(
     let spread_radius = ((spread_percent / 100.0) * size as f64).round() as usize;
     let mut field = dilate(matte, width, height, spread_radius);
     let blur = size.saturating_sub(spread_radius);
-    let radius = if size == 0 { 0 } else { blur.max(2) };
+    let radius = if size == 0 || blur == 0 {
+        0
+    } else {
+        blur.max(2)
+    };
     blur_tent(&mut field, width, height, radius);
     field
 }
@@ -1168,7 +1198,14 @@ fn refine_edge_distance(
             } else {
                 0.5 - alpha
             };
-            offset[index] = (signed * spread).clamp(-0.75, 0.75);
+            // A fully covered (or fully empty) boundary pixel is half a pixel
+            // from the outline along every axis; only a partly covered one
+            // needs the edge's slope.
+            offset[index] = if alpha >= 0.999 || alpha <= 0.001 {
+                0.5
+            } else {
+                (signed * spread).clamp(-0.75, 0.75)
+            };
         }
     }
     let radius_limit = reach.ceil() as i64 + 1;
@@ -1625,6 +1662,31 @@ mod tests {
         }
         content.alpha[0] = 1.0;
         content
+    }
+
+    #[test]
+    fn a_full_spread_glow_has_a_crisp_edge_at_its_size() {
+        // A 4 x 4 block, a hard glow of 5 px (spread 100 %): painted out to
+        // exactly 5 px from the block's edge on its axes and not a pixel
+        // further, with no soft ramp between.
+        let (width, height) = (24usize, 24usize);
+        let matte: Vec<f32> = (0..width * height)
+            .map(|index| {
+                let (x, y) = (index % width, index / width);
+                if (10..14).contains(&x) && (10..14).contains(&y) {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let field = exterior_mask(&matte, width, height, 5.0, 100.0);
+        let at = |x: usize, y: usize| field[y * width + x];
+        assert_eq!(at(11, 4), 0.0, "six pixels above the block");
+        assert_eq!(at(11, 5), 1.0, "five pixels above the block");
+        assert_eq!(at(11, 6), 1.0);
+        assert_eq!(at(18, 11), 1.0, "five pixels right of the block");
+        assert_eq!(at(19, 11), 0.0);
     }
 
     #[test]

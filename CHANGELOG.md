@@ -12,6 +12,23 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.13] - 2026-10-03
+
+### Fixed
+
+- **A full-spread glow or shadow has a crisp edge.** With Spread at 100 % the whole of Size is
+  hard dilation and nothing is left to blur, but a minimum two-pixel tent was still applied,
+  smearing the edge into a 64/191 ramp where Photoshop's flatten is `255, 1, 0`. The tent now runs
+  only when some of Size is left over.
+- **Spread and choke measure from the anti-aliased outline.** The hard dilation reached out from
+  the centres of the matte's pixels with a hard disc, so a spread edge was a staircase of whole
+  pixels. It now uses the same sub-pixel distance as stroke bands (see 0.13.12) and ramps over
+  one pixel, so a shallow curve is smooth. `photoshop-inner-glow` fell from mean 0.48 to
+  **0.14**, `photoshop-outer-glow` 0.69 → 0.39, `photoshop-clip-base-effects` 0.41 → 0.11, and in
+  the stored-merge set `layer_comps` 0.97 → 0.61, `layer_params` 0.49 → 0.42 and
+  `photoshop-stroke-shapeburst` stayed at 0.06. The corner of a hard-dilated rectangle is still
+  slightly rounder than Photoshop's.
+
 ## [0.13.12] - 2026-10-03
 
 ### Fixed
