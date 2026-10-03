@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "psd"
-version = "0.13.25"
+version = "0.13.26"
 dependencies = [
  "image",
  "memmap2",
@@ -614,18 +614,20 @@ dependencies = [
 
 [[package]]
 name = "psd-codecs"
-version = "0.13.25"
+version = "0.13.26"
 dependencies = [
  "fearless_simd",
  "fearless_simd_macros",
  "libdeflater",
+ "miniz_oxide 0.9.1",
  "rayon",
  "thiserror",
+ "zlib-rs",
 ]
 
 [[package]]
 name = "psd-companion"
-version = "0.13.25"
+version = "0.13.26"
 dependencies = [
  "psd-codecs",
  "psd-core",
@@ -634,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "psd-core"
-version = "0.13.25"
+version = "0.13.26"
 dependencies = [
  "serde",
  "serde_json",
@@ -653,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "psd-py"
-version = "0.13.25"
+version = "0.13.26"
 dependencies = [
  "numpy",
  "psd",

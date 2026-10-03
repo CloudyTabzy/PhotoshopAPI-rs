@@ -10,13 +10,13 @@ exclude = ["crates/psd-png/bench", "crates/psd-png/fuzz"]
 edition = "2021"
 license = "BSD-3-Clause"
 # The single project version; bump it with every CHANGELOG.md entry.
-version = "0.13.25"
+version = "0.13.26"
 
 # Dependency versions are centralized here; crates pull them in with
 # `workspace = true`.
 [workspace.dependencies]
 psd-core = { path = "crates/psd-core" }
-psd-codecs = { path = "crates/psd-codecs" }
+psd-codecs = { path = "crates/psd-codecs", default-features = false }
 psd-png = { path = "crates/psd-png" }
 psd = { path = "crates/psd" }
 psd-companion = { path = "crates/psd-companion" }
@@ -27,6 +27,11 @@ rayon = "1"
 memmap2 = "0.9"
 moxcms = { version = "0.8.1", default-features = false, features = ["lut", "options"] }
 libdeflater = "1"
+# Optional ZIP backends for psd-codecs, selectable one at a time via its
+# `zip-backend-*` features (zlib-rs is the default, measured in
+# `psd-codecs/examples/zip_bench.rs`).
+miniz_oxide = "0.9"
+zlib-rs = "0.6"
 nalgebra = { version = "0.34", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 uuid = { version = "1", features = ["v4"] }

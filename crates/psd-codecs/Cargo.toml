@@ -8,7 +8,9 @@ version.workspace = true
 [dependencies]
 thiserror.workspace = true
 rayon.workspace = true
-libdeflater.workspace = true
+libdeflater = { workspace = true, optional = true }
+zlib-rs = { workspace = true, optional = true }
+miniz_oxide = { workspace = true, optional = true }
 # The prediction kernels are written with `fearless_simd`'s portable vectors
 # (port TODO §F2b): measured 1.98x on the byte prefix sum and 1.47x on the
 # transpose over the serial chains, with a scalar backend for platforms
@@ -19,8 +21,24 @@ fearless_simd = "1.0"
 fearless_simd_macros = "0.1"
 
 [features]
+default = ["zip-backend-zlib-rs"]
 # `PSD_CODECS_FORCE_SCALAR=1` switches the prediction kernels to the pre-SIMD
 # scalar chains for the whole process, so one binary can measure and test the
 # two against each other. Off by default: without it the environment has no
 # say in which code runs.
 scalar-override = []
+# The ZIP codec's deflate engine, one at a time (enforced in `zip.rs`).
+# `zlib-rs` (Trifecta's pure-Rust zlib-ng port) is the default: measured
+# within noise of C libdeflate on decode (~4 GiB/s on channel data) and
+# faster on real-plane compress, with no C toolchain requirement. Select
+# `zip-backend-libdeflater` for the C engine or `zip-backend-miniz` for
+# miniz_oxide, both measured slower (see `examples/zip_bench.rs`).
+zip-backend-libdeflater = ["dep:libdeflater"]
+zip-backend-zlib-rs = ["dep:zlib-rs"]
+zip-backend-miniz = ["dep:miniz_oxide"]
+
+[dev-dependencies]
+# `examples/zip_bench`: all three engines in one binary for the backend A/B.
+libdeflater.workspace = true
+miniz_oxide.workspace = true
+zlib-rs.workspace = true

@@ -12,6 +12,30 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.26] - 2026-10-05
+
+### Changed
+
+- **The ZIP codec's deflate engine is now selectable and defaults to
+  `zlib-rs` — the port no longer requires a C toolchain by default.**
+  `psd-codecs` gains three mutually exclusive `zip-backend-*` features
+  (`zip-backend-zlib-rs`, `zip-backend-libdeflater`, `zip-backend-miniz`),
+  forwarded through `psd` and `psd-companion`; exactly one must be
+  enabled or the crate fails to compile. Previously `libdeflater` — a
+  C binding, matching upstream's own libdeflate dependency — was the
+  only engine. A benchmark over real Photoshop channel planes plus
+  synthetic noise/gradient inputs (`psd-codecs/examples/zip_bench.rs`)
+  measured libdeflater and zlib-rs within noise of each other on
+  decompress (~4 GiB/s) with zlib-rs markedly faster on compress for
+  real channel data (1.5 GiB/s vs 0.78 GiB/s on a merged 400x800 RGBA
+  plane); miniz_oxide trails at roughly half the throughput. The C
+  engine does not beat zlib-rs by a considerable measure, so the pure
+  Rust backend is the default; `zip-backend-libdeflater` remains for
+  anyone chasing its edge on incompressible data or its ~2% smaller
+  gradient output. Public API (`zip::compress`/`zip::decompress`) and
+  the Photoshop zlib framing are unchanged, and the bench verifies
+  every encoder's output decodes byte-exact under every decoder.
+
 ## [0.13.25] - 2026-10-04
 
 ### Fixed
