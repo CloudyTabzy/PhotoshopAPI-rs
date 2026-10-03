@@ -365,11 +365,11 @@ impl AdditionalLayerInfo {
                 Ok(pair) => pair,
                 Err(err @ PsdError::InvalidSignature { .. }) => {
                     // Some writers pad a block wider than the section alignment
-                    // (pikado reads the next `8BIM`/`8B64` signature within four
-                    // bytes rather than trusting the pad width). Resyncing only
-                    // fires where the strict walk already failed, so well-formed
-                    // input is unaffected, and a resynced block still has to fit
-                    // inside the section like any other.
+                    // (a shipped reference reader scans the next `8BIM`/`8B64`
+                    // signature within four bytes rather than trusting the pad
+                    // width). Resyncing only fires where the strict walk already
+                    // failed, so well-formed input is unaffected, and a resynced
+                    // block still has to fit inside the section like any other.
                     let recovered = (1..=4usize).find_map(|extra| {
                         if before + extra + min_block > end {
                             return None;
@@ -618,8 +618,8 @@ mod tests {
     #[test]
     fn resyncs_a_signature_padded_wider_than_the_section_alignment() {
         // A writer that pads a layer block to 4 inside a 2-aligned section
-        // leaves 1–3 dead bytes before the next signature (pikado's reader
-        // scans forward for `8BIM`/`8B64` in exactly this case). The walk
+        // leaves 1–3 dead bytes before the next signature (shipped readers
+        // scan forward for `8BIM`/`8B64` in exactly this case). The walk
         // recovers the block instead of failing the whole layer info.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"8BIMlsct");

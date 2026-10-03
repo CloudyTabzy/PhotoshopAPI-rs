@@ -8,9 +8,9 @@
 //! big-endian `f32` components in the file's own scale (0–1), and a two-byte
 //! colour type.
 //!
-//! There is no official Adobe specification; the layout here follows the
-//! workspace's ag-psd port, whose reading matches independent community
-//! documentation of real Photoshop output.
+//! There is no official Adobe specification; the layout here follows
+//! established third-party implementations, whose reading matches independent
+//! community documentation of real Photoshop output.
 
 use psd_core::io::BeReader;
 

@@ -112,7 +112,7 @@ fn eight_bit_round_trips() {
         "Compression/Compression_Zip_8bit.psd",
         // Photoshop 2026-authored: every BlnM enum in the file is long-form.
         "BlendModes/ps2026-blend-modes.psd",
-        // psd-webtoon integration corpus (MIT, (c) NAVER WEBTOON): authored
+        // Vendored integration corpus (MIT, (c) NAVER WEBTOON): authored
         // CJK/emoji documents, group framing, and a PSB twin.
         "Webtoon/example.psd",
         "Webtoon/example.psb",

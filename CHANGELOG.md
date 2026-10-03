@@ -76,8 +76,8 @@ v0.9.1 that this project ports.
   the whole layer-info walk.** Some writers pad a mid-list block to four
   bytes inside a two-aligned section; the strict walk landed on the dead
   bytes, read them as a signature, and aborted. The walk now resyncs onto
-  the next `8BIM`/`8B64` signature within four bytes — the tolerance the
-  pikado reference reader takes — but only where the strict read already
+  the next `8BIM`/`8B64` signature within four bytes — a tolerance shipped
+  reference readers take — but only where the strict read already
   failed, so well-formed input is unchanged and a resynced block still has
   to fit inside the section.
 
@@ -90,7 +90,7 @@ v0.9.1 that this project ports.
   always composited source-over; a `vstk` carrying Multiply, Subtract or
   any other mode now blends against the fill beneath it with the same
   translucent-backdrop rule the layer compositor applies, matching how
-  `psd-tools` composites the same field. Every authored file in the corpus
+  third-party compositors treat the same field. Every authored file in the corpus
   carries Normal, which keeps the previous (verified) arithmetic, so the
   change is provably inert for all existing oracles; non-Normal modes are
   implemented on the shared blend machinery and remain unverified until a
@@ -112,9 +112,9 @@ v0.9.1 that this project ports.
   path, but the fill plane spans the document rect — and `layer_rect` unions
   the mask record's rect — so the floor could wash the fill colour across
   pixels the layer never claimed. The floor is content, not coverage: it now
-  applies only inside the authored layer bounds (psd-tools draws fills at
-  `layer.bbox` extent likewise). Pixel-layer vector masks already bounded
-  the floor this way through their alpha channel.
+  applies only inside the authored layer bounds (third-party compositors
+  draw fills at `layer.bbox` extent likewise). Pixel-layer vector masks
+  already bounded the floor this way through their alpha channel.
 
 ## [0.13.22] - 2026-10-03
 
@@ -1888,9 +1888,9 @@ document changes.
 
 - The `psd-companion` crate: readers for the small Adobe formats that travel
   beside PSD files — `.abr` brush presets, `.csh` custom shapes and `.ase`
-  swatch palettes. All three are read-only over a byte slice, following the
-  workspace's ag-psd port as the format reference (none of the three has an
-  official Adobe specification). The crate reuses `psd-core`'s machinery
+  swatch palettes. All three are read-only over a byte slice, following
+  established third-party implementations as the format reference (none of
+  the three has an official Adobe specification). The crate reuses `psd-core`'s machinery
   instead of carrying its own: `.csh` paths parse through the same
   `VectorPath` records a layer's vector mask does, and `.abr` presets are PSD
   action descriptors read through the shared descriptor parser, with a typed
@@ -1991,7 +1991,7 @@ document changes.
 
 ### Changed
 
-- The workspace's third-party code is now recorded in `LICENSE`, and the dependency ladder in
+- Third-party code is now recorded in `LICENSE`, and the dependency ladder in
   `README.md` lists the vendored crate. `crates/psd-png` is MIT OR Apache-2.0 with its original
   copyright retained, so it is not covered by this project's BSD 3-Clause terms.
 

@@ -10,8 +10,8 @@
 //!
 //! Every mode runs on the synthetic set from `tools/gen_bench_images.py`. The encode-side
 //! modes this harness once carried went with the encoder; the decode comparisons against
-//! real files that produced the numbers in `docs/benchmarks.md` ran through the workspace's
-//! own measurement scripts.
+//! real files that produced the numbers in `docs/benchmarks.md` ran through ad-hoc
+//! measurement scripts.
 
 use std::time::{Duration, Instant};
 

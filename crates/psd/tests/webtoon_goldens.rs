@@ -1,5 +1,5 @@
-//! Pixel goldens vendored from the psd-webtoon integration corpus
-//! (`packages/psd/tests/integration/fixtures/example/`): an authored 400x800
+//! Pixel goldens vendored from the Webtoon integration corpus
+//! (`example/`): an authored 400x800
 //! RGB document with 14 layer records — groups, CJK and emoji names, and
 //! layers extending past the canvas. `example.layerN` is the raw decoded RGBA
 //! of layer record N in bottom-to-top order (their `composite(false, false)`:

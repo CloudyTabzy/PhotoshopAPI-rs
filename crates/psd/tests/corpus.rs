@@ -616,24 +616,24 @@ const EXTRA_CORPUS_KNOWN: &[(&str, &str, &str)] = &[
         "layer-offsets-read/src.psd",
         "roundtrip",
         concat!(
-            "ag-psd writer output: a mid-tree pixel record with no transparency ",
-            "channel gets an all-opaque one (the 0.6.14 rule)"
+            "third-party writer output: a mid-tree pixel record with no ",
+            "transparency channel gets an all-opaque one (the 0.6.14 rule)"
         ),
     ),
     (
         "float-size/expected.psd",
         "roundtrip",
         concat!(
-            "ag-psd writer output: a mid-tree pixel record with no transparency ",
-            "channel gets an all-opaque one (the 0.6.14 rule)"
+            "third-party writer output: a mid-tree pixel record with no ",
+            "transparency channel gets an all-opaque one (the 0.6.14 rule)"
         ),
     ),
     (
         "layer-offsets/expected.psd",
         "roundtrip",
         concat!(
-            "ag-psd writer output: a mid-tree pixel record with no transparency ",
-            "channel gets an all-opaque one (the 0.6.14 rule)"
+            "third-party writer output: a mid-tree pixel record with no ",
+            "transparency channel gets an all-opaque one (the 0.6.14 rule)"
         ),
     ),
     (

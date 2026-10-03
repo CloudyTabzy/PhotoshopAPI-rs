@@ -17,7 +17,7 @@
 //!
 //! Deliberately unsupported, each with a named error rather than a guess:
 //! `.abr` major versions 1 and 2 (the pre-CS entry-stream layout, for which no
-//! fixture or reference exists in this workspace), 16-bit run-length-encoded
+//! fixture or reference is at hand), 16-bit run-length-encoded
 //! brush samples, and run-length-encoded indexed patterns.
 //!
 //! [`psd`]: ../psd/index.html

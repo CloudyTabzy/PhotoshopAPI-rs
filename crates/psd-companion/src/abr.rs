@@ -15,11 +15,11 @@
 //! - `phry` carries a descriptor this reader parses and ignores.
 //!
 //! Major versions 1 and 2 are the pre-CS entry-stream layout. No fixture or
-//! reference for them exists in this workspace, so they are rejected with a
-//! named error rather than decoded from guesswork.
+//! reference for them is at hand, so they are rejected with a named error
+//! rather than decoded from guesswork.
 //!
-//! The typed brush model and the descriptor key spellings follow the
-//! workspace's ag-psd port, which reads real Photoshop output.
+//! The typed brush model and the descriptor key spellings follow established
+//! third-party implementations that read real Photoshop output.
 
 use psd_core::descriptor::{Descriptor, DescriptorValue};
 use psd_core::io::BeReader;

@@ -1,6 +1,5 @@
-Vendored from the psd-webtoon integration corpus
-(`packages/psd/tests/integration/fixtures/`, MIT License,
-(c) 2021-present NAVER WEBTOON).
+Vendored from a third-party integration corpus
+(MIT License, (c) 2021-present NAVER WEBTOON).
 
 - `example.psd` / `example.psb` — an authored 400x800 RGB document with 14
   content records: nested group, CJK and emoji layer names, text layers, and

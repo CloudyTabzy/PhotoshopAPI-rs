@@ -1,9 +1,10 @@
 import json
 import struct
+import sys
 from collections import Counter
 from pathlib import Path
 
-ROOT = Path(r"C:\Dev\PhotoshopAPI-rs-port\PhotoshopAPI-rs\fixtures\documents")
+ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("fixtures/documents")
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 NAMES = {0: "Gray", 2: "RGB", 3: "Palette", 4: "GrayAlpha", 6: "RGBA"}
 
@@ -58,9 +59,8 @@ for row in rows:
         summary[f"{NAMES[ctype]} {depth}-bit {'interlaced' if interlace else 'non-interlaced'}"] += 1
 
 out = {"summary": dict(summary), "rows": rows}
-Path(r"C:\Users\User\AppData\Local\Temp\opencode\png-mix\scan.json").write_text(
-    json.dumps(out, indent=1), encoding="utf-8"
-)
+out_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("scan.json")
+out_path.write_text(json.dumps(out, indent=1), encoding="utf-8")
 
 print(f"scanned {len(rows)} entries ({sum(1 for r in rows if r['ihdr'])} valid PNGs)")
 for key, count in summary.most_common():

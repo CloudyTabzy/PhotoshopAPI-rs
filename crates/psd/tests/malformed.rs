@@ -1,4 +1,4 @@
-//! Malformed-input corpus vendored from psd-webtoon's `errors/` fixtures
+//! Malformed-input corpus vendored from a third-party `errors/` fixture set
 //! (MIT, (c) NAVER WEBTOON — see `malformed/README.md`). Each file is a
 //! deliberately damaged variant of `original.psd`/`original.psb` with one
 //! field patched to an invalid value.
@@ -9,7 +9,7 @@
 //! - `OK` files are tolerated **and preserved**: the malformed scalar is a
 //!   raw field we store verbatim (blend key, clipping byte, divider type,
 //!   reserved bytes), or the damage sits in the lazily-decoded merged image
-//!   which a layered document does not need. psd-webtoon's own suite rejects
+//!   which a layered document does not need. The donor suite rejects
 //!   several of these; our policy is strict-where-unsafe, verbatim elsewhere.
 //!
 //! `image-depth-16/32` are not malformed at all — they are valid 16/32-bit
@@ -52,8 +52,8 @@ fn malformed_header_and_record_fields() {
         ("image-compression-invalid.psd", true),
         // Unknown blend-mode 4cc keys are stored raw and written back.
         ("layer-blend-mode-key-invalid.psd", true),
-        // Channel id 3 is a valid fourth color channel; psd-webtoon's "kind"
-        // check rejects ids it does not model, ours keeps them.
+        // Channel id 3 is a valid fourth color channel; the donor suite's
+        // "kind" check rejects ids it does not model, ours keeps them.
         ("layer-channel-kind-invalid.psd", true),
         // The clipping byte is stored raw; Photoshop interprets nonzero as
         // clipped.
