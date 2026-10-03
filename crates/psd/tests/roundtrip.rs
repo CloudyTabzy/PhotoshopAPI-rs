@@ -49,6 +49,12 @@ fn assert_documents_match<T: psd::BitDepth + std::fmt::Debug>(
                 assert_eq!(ga.open, gb.open, "{name}: group state of {}", a.name);
                 assert_eq!(ga.children, gb.children, "{name}: children of {}", a.name);
             }
+            (LayerKind::Adjustment(aa), LayerKind::Adjustment(ab)) => {
+                assert_channel_stores_match(name, &a.name, &aa.channels, &ab.channels);
+            }
+            (LayerKind::Shape(sa), LayerKind::Shape(sb)) => {
+                assert_channel_stores_match(name, &a.name, &sa.channels, &sb.channels);
+            }
             (LayerKind::SectionDivider(da), LayerKind::SectionDivider(db)) => {
                 assert_eq!(da, db, "{name}: divider kind");
             }
@@ -106,6 +112,17 @@ fn eight_bit_round_trips() {
         "Compression/Compression_Zip_8bit.psd",
         // Photoshop 2026-authored: every BlnM enum in the file is long-form.
         "BlendModes/ps2026-blend-modes.psd",
+        // psd-webtoon integration corpus (MIT, (c) NAVER WEBTOON): authored
+        // CJK/emoji documents, group framing, and a PSB twin.
+        "Webtoon/example.psd",
+        "Webtoon/example.psb",
+        "Webtoon/CJK.psd",
+        "Webtoon/engineData.psd",
+        "Webtoon/pattern.psd",
+        "Webtoon/original.psd",
+        "Webtoon/original.psb",
+        "Webtoon/original-uncompressed.psd",
+        "Webtoon/original-with-group.psd",
         // Upstream "Roundtrip layer read-write multiple smart objects, no
         // warp information" plus the transformed-warp corpus.
         "SmartObjects/smart_object_file_no_warp.psd",
