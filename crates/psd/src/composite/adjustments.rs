@@ -1302,7 +1302,7 @@ pub(super) fn paint_content<T: BitDepth>(
                 style: enumerated("Type")
                     .and_then(|id| GradientStyle::from_id(&id))
                     .unwrap_or(GradientStyle::Linear),
-                angle: descriptor_number(descriptor, "Angl").unwrap_or(90.0) as f32,
+                angle: descriptor_number(descriptor, "Angl").unwrap_or(0.0) as f32,
                 scale: descriptor_number(descriptor, "Scl ").unwrap_or(100.0) as f32,
                 reverse: descriptor
                     .get("Rvrs")

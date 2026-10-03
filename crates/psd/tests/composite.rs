@@ -1395,6 +1395,71 @@ fn disabling_effects_keeps_pattern_fill_layers() {
     assert_eq!(off, flatten(&doc));
 }
 
+/// A document filled by a black-to-white gradient fill layer whose descriptor
+/// carries `angle` (or none) and no other placement keys.
+fn gradient_fill_document(angle: Option<f64>) -> psd::CompositeImage {
+    use psd::core::adjustments::FillSettings;
+    use psd::core::{
+        AdjustmentBlock, AdjustmentData, AdjustmentKind, Descriptor, DescriptorValue, Gradient,
+        GradientKind,
+    };
+    let mut gradient = Gradient::black_to_white();
+    if let GradientKind::Solid(solid) = &mut gradient.kind {
+        solid.smoothness = 0.0;
+    }
+    let mut descriptor = Descriptor::with_class("gradientLayer");
+    descriptor.set(
+        "Grad",
+        DescriptorValue::Descriptor(gradient.to_descriptor()),
+    );
+    descriptor.set(
+        "Type",
+        DescriptorValue::Enumerated {
+            type_id: psd::core::DescriptorKey::new("GrdT"),
+            value: psd::core::DescriptorKey::new("Lnr "),
+        },
+    );
+    if let Some(angle) = angle {
+        descriptor.set(
+            "Angl",
+            DescriptorValue::UnitFloat {
+                unit: *b"#Ang",
+                value: angle,
+            },
+        );
+    }
+    let mut layer = Layer::new_adjustment("Gradient fill", Rect::default());
+    layer
+        .set_adjustment(
+            &AdjustmentBlock::new(
+                AdjustmentKind::GradientFill,
+                AdjustmentData::Fill(FillSettings {
+                    descriptor,
+                    trailing_bytes: Vec::new(),
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut doc = document(16, 8);
+    doc.add_layer(layer);
+    flatten(&doc)
+}
+
+#[test]
+fn a_gradient_fill_without_an_angle_runs_left_to_right() {
+    let image = gradient_fill_document(None);
+    for y in 0..8 {
+        assert_eq!(image.pixel(8, y), image.pixel(8, 0), "rows agree");
+    }
+    assert!(image.pixel(0, 3)[0] < 20, "{:?}", image.pixel(0, 3));
+    assert!(image.pixel(15, 3)[0] > 235, "{:?}", image.pixel(15, 3));
+    // The same fill at an explicit 90 degrees runs bottom to top instead.
+    let upright = gradient_fill_document(Some(90.0));
+    assert!(upright.pixel(8, 0)[0] > 235 && upright.pixel(8, 7)[0] < 40);
+    assert_eq!(upright.pixel(0, 4), upright.pixel(15, 4));
+}
+
 #[test]
 fn clipping_a_pass_through_group_also_clips_nested_group_shadows() {
     let mut doc = document(10, 3);

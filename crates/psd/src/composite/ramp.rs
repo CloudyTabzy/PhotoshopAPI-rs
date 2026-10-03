@@ -479,8 +479,15 @@ pub(crate) fn position(placement: &Placement, span: Span, basis: SpanBasis, x: i
     if basis == SpanBasis::CenterChord && placement.style == GradientStyle::Linear {
         return linear_fill_position(placement, span, center_x, center_y, (sin, cos), x, y);
     }
-    let px = x as f32 + 0.5;
-    let py = y as f32 + 0.5;
+    // A fill layer samples the integer pixel coordinate (see
+    // `linear_fill_position`); a layer effect samples the pixel's middle.
+    let sample = if basis == SpanBasis::CenterChord {
+        0.0
+    } else {
+        0.5
+    };
+    let px = x as f32 + sample;
+    let py = y as f32 + sample;
     let local_x = (px - center_x) * cos - (py - center_y) * sin;
     let local_y = (px - center_x) * sin + (py - center_y) * cos;
 

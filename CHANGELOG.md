@@ -12,6 +12,18 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.15] - 2026-10-03
+
+### Fixed
+
+- **A gradient fill with no stored angle runs left to right.** Photoshop omits `Angl` for an angle
+  of zero; the port assumed 90°, so a fill such as a noise gradient came out as horizontal bands
+  where Photoshop draws vertical ones.
+- **Radial, Angle, Reflected and Diamond fills sample the integer pixel coordinate**, like the
+  Linear fill of 0.13.7 (the pixel's corner, not its middle). `gradient-styles` improved from
+  13.42 to 12.66; most of what remains in that document is its noise-gradient row, whose random
+  stops this port cannot reproduce.
+
 ## [0.13.14] - 2026-10-03
 
 ### Fixed
