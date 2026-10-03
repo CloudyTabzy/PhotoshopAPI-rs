@@ -294,9 +294,22 @@ impl<T: BitDepth> Compositor<'_, T> {
                     [fill.color[0][to], fill.color[1][to], fill.color[2][to]]
                 };
                 let mut a = a;
+                // Outside the path the fill still shows at `1 − density`,
+                // inside the layer's own bounds: a layer's mask can claim
+                // a larger rect than its content, but the fill's floor is
+                // part of the content and stays in the authored bounds.
+                let dx = rect.left + x as i32;
+                let dy = rect.top + y as i32;
+                let in_bounds = dx >= layer.bounds.left
+                    && dx < layer.bounds.right
+                    && dy >= layer.bounds.top
+                    && dy < layer.bounds.bottom;
                 if let Some(density) = density {
-                    // Outside the path the fill still shows at `1 − density`.
-                    let raised = 1.0 - density + density * a;
+                    let raised = if in_bounds {
+                        1.0 - density + density * a
+                    } else {
+                        a
+                    };
                     if raised > 1e-6 {
                         for (channel, value) in color.iter_mut().enumerate() {
                             let base = fill.color[channel][to];
@@ -311,8 +324,8 @@ impl<T: BitDepth> Compositor<'_, T> {
                 out.alpha[to] = a.clamp(0.0, 1.0);
                 let cover = silhouette[from];
                 out_silhouette[to] = match density {
-                    Some(density) => 1.0 - density + density * cover,
-                    None => cover,
+                    Some(density) if in_bounds => 1.0 - density + density * cover,
+                    _ => cover,
                 }
                 .clamp(0.0, 1.0);
             }

@@ -290,8 +290,12 @@ pub(crate) fn rasterize_path(path: &VectorPath, width: u32, height: u32, rect: R
         }
     }
 
-    let starts_full = path.initial_fill_rule() == Some(1)
-        || groups.first().is_some_and(|group| group.operation == 2);
+    // The initial fill rule only counts when the path record has no subpaths
+    // at all (the reveal-all case, already handled by the early return above):
+    // Photoshop's own renders show subpath coverage winning over it (a `vmsk`
+    // of `InitialFillRule=1` plus one Combine subpath still clips to that
+    // subpath). A leading Subtract starts from full instead.
+    let starts_full = groups.first().is_some_and(|group| group.operation == 2);
     let mut accumulated = vec![if starts_full { 1.0 } else { 0.0 }; pixels];
     for (index, group) in groups.iter().enumerate() {
         let coverage = fill_even_odd(&group.polygons, rect);
@@ -512,5 +516,71 @@ mod snap_tests {
         let mut triangle: Polygon = vec![(0.5, 0.5), (4.5, 0.5), (0.5, 4.5)];
         snap_axis_aligned_rectangle(&mut triangle);
         assert_eq!(triangle[0], (0.5, 0.5));
+    }
+
+    fn point(x: f64, y: f64) -> psd_core::vector::PathPoint {
+        let fix = |v: f64| (v * 16_777_216.0).round() as i32;
+        psd_core::vector::PathPoint {
+            vertical: fix(y),
+            horizontal: fix(x),
+        }
+    }
+
+    fn knot(x: f64, y: f64) -> psd_core::vector::PathRecord {
+        psd_core::vector::PathRecord::Knot(psd_core::vector::BezierKnot {
+            closed: true,
+            linked: true,
+            preceding: point(x, y),
+            anchor: point(x, y),
+            leaving: point(x, y),
+        })
+    }
+
+    /// Photoshop-authored evidence: a `vmsk` with `InitialFillRule = 1` and
+    /// one Combine subpath still clips to the subpath — the rule seeds full
+    /// coverage only when no subpaths exist at all.
+    #[test]
+    fn the_initial_fill_rule_yields_to_subpaths() {
+        use psd_core::vector::{PathRecord, SubpathRecord, VectorPath};
+        let subpath = |operation| {
+            vec![
+                PathRecord::Subpath(SubpathRecord {
+                    closed: true,
+                    knot_count: 4,
+                    operation,
+                    flags: 0,
+                    reserved: [0; 18],
+                }),
+                knot(0.25, 0.25),
+                knot(0.75, 0.25),
+                knot(0.75, 0.75),
+                knot(0.25, 0.75),
+            ]
+        };
+        let ifr = PathRecord::InitialFillRule {
+            value: 1,
+            reserved: [0; 22],
+        };
+        let rect = Rect::new(0, 0, 8, 8);
+
+        // Combine over an initial fill is the subpath, not the whole canvas.
+        let path = VectorPath {
+            records: [ifr.clone()].into_iter().chain(subpath(1)).collect(),
+            trailing_bytes: Vec::new(),
+        };
+        let plane = rasterize_path(&path, 8, 8, rect);
+        for y in 0..8 {
+            for x in 0..8 {
+                let inside = (2..6).contains(&x) && (2..6).contains(&y);
+                assert_eq!(plane[y * 8 + x], if inside { 1.0 } else { 0.0 }, "{x},{y}");
+            }
+        }
+
+        // No subpaths at all: the fill rule reveals everything.
+        let path = VectorPath {
+            records: vec![ifr],
+            trailing_bytes: Vec::new(),
+        };
+        assert!(rasterize_path(&path, 8, 8, rect).iter().all(|&v| v == 1.0));
     }
 }

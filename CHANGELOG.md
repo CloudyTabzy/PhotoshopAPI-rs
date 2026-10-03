@@ -12,6 +12,26 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.23] - 2026-10-03
+
+### Fixed
+
+- **A vector mask's `InitialFillRule` no longer overrides its own subpaths.**
+  Path coverage started from "all covered" whenever the record carried the
+  rule, so a `vmsk` of `InitialFillRule = 1` plus a Combine subpath covered
+  the whole canvas instead of the subpath — a shape layer's fill could paint
+  canvas-wide. Photoshop's own renders clip to the subpath (a pixel layer
+  with uniform alpha shows the subpath's silhouette in the merged data); the
+  rule now seeds full coverage only in the no-subpaths case it exists for.
+- **A shape layer's vector-mask-density floor stays inside the layer's own
+  bounds.** Density correctly raised coverage to `1 − density` outside the
+  path, but the fill plane spans the document rect — and `layer_rect` unions
+  the mask record's rect — so the floor could wash the fill colour across
+  pixels the layer never claimed. The floor is content, not coverage: it now
+  applies only inside the authored layer bounds (psd-tools draws fills at
+  `layer.bbox` extent likewise). Pixel-layer vector masks already bounded
+  the floor this way through their alpha channel.
+
 ## [0.13.22] - 2026-10-03
 
 ### Changed
