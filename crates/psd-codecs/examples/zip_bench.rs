@@ -1,7 +1,9 @@
 //! Backend A/B for the ZIP codec's deflate engine: `libdeflater` (C),
-//! `zlib-rs` and `miniz_oxide`, measured on real decoded channel planes from
-//! the vendored Webtoon corpus (raw RGBA, 9 KB – 1.3 MB — the shape ZIP
-//! channel data actually has).
+//! `zlib-rs`, `miniz_oxide`, plus the experimental pure-Rust `ldeflate`
+//! (serial and within-stream-split compressors) and `linflate` (decoder
+//! only), measured on real decoded channel planes from the vendored
+//! Webtoon corpus (raw RGBA, 9 KB – 1.3 MB — the shape ZIP channel data
+//! actually has).
 //!
 //! Each engine compresses (zlib framing, level 4 — upstream's fixed level)
 //! and inflates every input; timing is best-of-N with a correctness gate:
@@ -16,10 +18,15 @@ fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/documents/Webtoon")
 }
 
+type CompressFn = fn(&[u8]) -> Vec<u8>;
+type DecompressFn = fn(&[u8], usize) -> Vec<u8>;
+
 struct Engine {
     name: &'static str,
-    compress: fn(&[u8]) -> Vec<u8>,
-    decompress: fn(&[u8], usize) -> Vec<u8>,
+    /// `None` for decode-only engines (linflate writes nothing); their
+    /// decompress timings run on the zlib-rs stream.
+    compress: Option<CompressFn>,
+    decompress: DecompressFn,
 }
 
 fn libdeflate_compress(data: &[u8]) -> Vec<u8> {
@@ -65,22 +72,53 @@ fn miniz_decompress(data: &[u8], out_len: usize) -> Vec<u8> {
     miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(data, out_len).unwrap()
 }
 
+fn ldeflate_compress(data: &[u8]) -> Vec<u8> {
+    ldeflate::zlib_compress(data, 4).unwrap()
+}
+
+fn ldeflate_split_compress(data: &[u8]) -> Vec<u8> {
+    // Default planner at our fixed level: splits within-stream at
+    // full-flush boundaries for inputs >= 4 MiB.
+    let cfg = ldeflate::Config::default().level(4);
+    ldeflate::compress_split(data, &cfg).unwrap()
+}
+
+fn linflate_decompress(data: &[u8], out_len: usize) -> Vec<u8> {
+    // linflate is raw DEFLATE only — strip our zlib header + adler trailer.
+    linflate::inflate_to_vec(&data[2..data.len() - 4], out_len).unwrap()
+}
+
 fn main() {
     let engines = [
         Engine {
             name: "libdeflater (C)",
-            compress: libdeflate_compress,
+            compress: Some(libdeflate_compress),
             decompress: libdeflate_decompress,
         },
         Engine {
             name: "zlib-rs",
-            compress: zlib_rs_compress,
+            compress: Some(zlib_rs_compress),
             decompress: zlib_rs_decompress,
         },
         Engine {
             name: "miniz_oxide",
-            compress: miniz_compress,
+            compress: Some(miniz_compress),
             decompress: miniz_decompress,
+        },
+        Engine {
+            name: "ldeflate",
+            compress: Some(ldeflate_compress),
+            decompress: zlib_rs_decompress,
+        },
+        Engine {
+            name: "ldeflate-split",
+            compress: Some(ldeflate_split_compress),
+            decompress: zlib_rs_decompress,
+        },
+        Engine {
+            name: "linflate",
+            compress: None,
+            decompress: linflate_decompress,
         },
     ];
 
@@ -117,10 +155,13 @@ fn main() {
         total_in as f64 / 1048576.0
     );
 
-    // Correctness gate: every engine inflates every other engine's stream.
+    // Correctness gate: every engine inflates every encoder's stream.
     for (name, data) in &inputs {
         for enc in &engines {
-            let compressed = (enc.compress)(data);
+            let Some(compress) = enc.compress else {
+                continue;
+            };
+            let compressed = compress(data);
             for dec in &engines {
                 let back = (dec.decompress)(&compressed, data.len());
                 assert_eq!(&back, data, "{name}: {} -> {}", enc.name, dec.name);
@@ -136,16 +177,24 @@ fn main() {
         for (_, data) in &inputs {
             // Best-of up to 50 iterations per file (fewer for large inputs).
             let iters = ((200usize << 20) / data.len()).clamp(5, 50);
-            let compressed = (engine.compress)(data);
-            total_comp_len += compressed.len();
-            let mut best_c = u128::MAX;
-            for _ in 0..iters {
-                let t = Instant::now();
-                std::hint::black_box((engine.compress)(std::hint::black_box(data)));
-                best_c = best_c.min(t.elapsed().as_nanos());
-            }
-            comp_ns += best_c;
-            comp_bytes += data.len();
+            // Decode-only engines time their decompress against the zlib-rs
+            // stream (any conforming encoder would do).
+            let compressed = match engine.compress {
+                Some(compress) => {
+                    let out = compress(data);
+                    total_comp_len += out.len();
+                    let mut best_c = u128::MAX;
+                    for _ in 0..iters {
+                        let t = Instant::now();
+                        std::hint::black_box(compress(std::hint::black_box(data)));
+                        best_c = best_c.min(t.elapsed().as_nanos());
+                    }
+                    comp_ns += best_c;
+                    comp_bytes += data.len();
+                    out
+                }
+                None => zlib_rs_compress(data),
+            };
             let mut best_d = u128::MAX;
             for _ in 0..iters {
                 let t = Instant::now();
@@ -158,8 +207,15 @@ fn main() {
             decomp_ns += best_d;
             decomp_bytes += data.len();
         }
-        let c_mbs = comp_bytes as f64 / (comp_ns as f64 / 1e9) / 1048576.0;
         let d_mbs = decomp_bytes as f64 / (decomp_ns as f64 / 1e9) / 1048576.0;
+        if comp_bytes == 0 {
+            println!(
+                "{:16}  compress      -- MiB/s   decompress {:7.1} MiB/s   ratio     --",
+                engine.name, d_mbs
+            );
+            continue;
+        }
+        let c_mbs = comp_bytes as f64 / (comp_ns as f64 / 1e9) / 1048576.0;
         let ratio = total_comp_len as f64 / comp_bytes as f64;
         println!(
             "{:16}  compress {:7.1} MiB/s   decompress {:7.1} MiB/s   ratio {:.4}",
@@ -176,13 +232,18 @@ fn main() {
     {
         println!("{name} ({:.1} MiB):", data.len() as f64 / 1048576.0);
         for engine in &engines {
-            let compressed = (engine.compress)(data);
-            let mut best_c = u128::MAX;
-            for _ in 0..30 {
-                let t = Instant::now();
-                std::hint::black_box((engine.compress)(std::hint::black_box(data)));
-                best_c = best_c.min(t.elapsed().as_nanos());
-            }
+            let (compressed, best_c) = match engine.compress {
+                Some(compress) => {
+                    let mut best = u128::MAX;
+                    for _ in 0..30 {
+                        let t = Instant::now();
+                        std::hint::black_box(compress(std::hint::black_box(data)));
+                        best = best.min(t.elapsed().as_nanos());
+                    }
+                    (compress(data), best)
+                }
+                None => (zlib_rs_compress(data), u128::MAX),
+            };
             let mut best_d = u128::MAX;
             for _ in 0..30 {
                 let t = Instant::now();
@@ -194,9 +255,13 @@ fn main() {
             }
             let mbs = |ns| data.len() as f64 / (ns as f64 / 1e9) / 1048576.0;
             println!(
-                "  {:16}  compress {:7.1} MiB/s   decompress {:7.1} MiB/s   size {:.4}",
+                "  {:16}  compress {:>7} MiB/s   decompress {:7.1} MiB/s   size {:.4}",
                 engine.name,
-                mbs(best_c),
+                if best_c == u128::MAX {
+                    "--".to_owned()
+                } else {
+                    format!("{:.1}", mbs(best_c))
+                },
                 mbs(best_d),
                 compressed.len() as f64 / data.len() as f64
             );

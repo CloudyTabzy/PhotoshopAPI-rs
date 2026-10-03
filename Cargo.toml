@@ -10,7 +10,7 @@ exclude = ["crates/psd-png/bench", "crates/psd-png/fuzz"]
 edition = "2021"
 license = "BSD-3-Clause"
 # The single project version; bump it with every CHANGELOG.md entry.
-version = "0.13.26"
+version = "0.13.27"
 
 # Dependency versions are centralized here; crates pull them in with
 # `workspace = true`.
@@ -32,6 +32,12 @@ libdeflater = "1"
 # `psd-codecs/examples/zip_bench.rs`).
 miniz_oxide = "0.9"
 zlib-rs = "0.6"
+# The znippy decompressor — `psd-codecs`'s optional `zip-backend-linflate`
+# engine (fastest measured inflate, ~15-25% over zlib-rs on real planes).
+linflate = "0.1"
+# The znippy compressor — measured in `zip_bench` and rejected (it is
+# zlib-rs inside); dev-dep only, kept so the bench documents the A/B.
+ldeflate = "0.1"
 nalgebra = { version = "0.34", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 uuid = { version = "1", features = ["v4"] }

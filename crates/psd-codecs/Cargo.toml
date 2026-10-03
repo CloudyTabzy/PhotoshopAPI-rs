@@ -11,6 +11,7 @@ rayon.workspace = true
 libdeflater = { workspace = true, optional = true }
 zlib-rs = { workspace = true, optional = true }
 miniz_oxide = { workspace = true, optional = true }
+linflate = { workspace = true, optional = true }
 # The prediction kernels are written with `fearless_simd`'s portable vectors
 # (port TODO §F2b): measured 1.98x on the byte prefix sum and 1.47x on the
 # transpose over the serial chains, with a scalar backend for platforms
@@ -31,14 +32,18 @@ scalar-override = []
 # `zlib-rs` (Trifecta's pure-Rust zlib-ng port) is the default: measured
 # within noise of C libdeflate on decode (~4 GiB/s on channel data) and
 # faster on real-plane compress, with no C toolchain requirement. Select
-# `zip-backend-libdeflater` for the C engine or `zip-backend-miniz` for
-# miniz_oxide, both measured slower (see `examples/zip_bench.rs`).
+# `zip-backend-libdeflater` for the C engine, `zip-backend-miniz` for
+# miniz_oxide, or `zip-backend-linflate` for the znippy decoder (fastest
+# measured inflate — pure Rust, zero deps — paired with zlib-rs deflate).
 zip-backend-libdeflater = ["dep:libdeflater"]
 zip-backend-zlib-rs = ["dep:zlib-rs"]
 zip-backend-miniz = ["dep:miniz_oxide"]
+zip-backend-linflate = ["dep:linflate", "dep:zlib-rs"]
 
 [dev-dependencies]
-# `examples/zip_bench`: all three engines in one binary for the backend A/B.
+# `examples/zip_bench`: every candidate engine in one binary for the A/B.
 libdeflater.workspace = true
 miniz_oxide.workspace = true
 zlib-rs.workspace = true
+linflate.workspace = true
+ldeflate.workspace = true

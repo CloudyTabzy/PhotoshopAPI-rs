@@ -12,6 +12,24 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.27] - 2026-10-05
+
+### Added
+
+- **A fourth ZIP backend: `zip-backend-linflate` — the fastest measured
+  decoder.** The znippy project's pure-Rust, zero-dependency `linflate`
+  handles inflate (raw DEFLATE inside our own zlib framing, adler trailer
+  verified in-engine so the checksum guarantee is unchanged) while
+  `zlib-rs` keeps the deflate side. On real channel planes it inflates
+  ~15–25% faster than zlib-rs (~3.5 vs ~2.8 GiB/s on a merged RGBA
+  plane, ~4.5 vs ~4.1 GiB/s aggregate) — decode is the ZIP codec's hot
+  path. `zlib-rs` remains the default; `linflate` 0.1 is young and
+  opt-in. The companion `ldeflate` compressor was measured and rejected:
+  it wraps zlib-rs for its entropy coding, so it produces identical
+  output while pulling in anyhow + rotaryengine + futures, and its
+  within-stream parallel split is slower at our channel sizes. It stays
+  a dev-dependency so `examples/zip_bench.rs` documents the A/B.
+
 ## [0.13.26] - 2026-10-05
 
 ### Changed

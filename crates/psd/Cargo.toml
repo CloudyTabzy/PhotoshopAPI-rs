@@ -17,6 +17,7 @@ serde = ["psd-core/serde"]
 zip-backend-libdeflater = ["psd-codecs/zip-backend-libdeflater"]
 zip-backend-zlib-rs = ["psd-codecs/zip-backend-zlib-rs"]
 zip-backend-miniz = ["psd-codecs/zip-backend-miniz"]
+zip-backend-linflate = ["psd-codecs/zip-backend-linflate"]
 
 [dependencies]
 psd-core.workspace = true
