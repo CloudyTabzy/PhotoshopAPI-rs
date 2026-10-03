@@ -12,6 +12,18 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.21] - 2026-10-03
+
+### Changed
+
+- **32-bit composites now sRGB-encode the u8 output.** 32-bit channels store
+  linear-light floats; Photoshop's own 8-bit previews encode them with the sRGB
+  curve — a stored 0.5 shows as 188, not the linear-scale 128 we produced. The
+  oracle is the file's embedded JPEG thumbnail (`Compression_ZipPrediction_32bit.psd`,
+  Photoshop-authored at 64×64): we now match it within JPEG noise. Alpha stays a
+  linear coverage value; 8/16-bit output is unchanged. Applies to both
+  `composite_rgba8` and `layer_sprite`.
+
 ## [0.13.20] - 2026-10-03
 
 ### Added

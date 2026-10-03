@@ -1593,7 +1593,7 @@ fn independent_inner_shadows_keep_only_their_own_paint() {
 fn grayscale_curves_apply_the_channel_table_before_the_composite_at_all_depths() {
     use psd::core::adjustments::{Curve, CurveData, Curves};
     use psd::core::{AdjustmentBlock, AdjustmentData, AdjustmentKind};
-    fn check<T: psd::BitDepth>() {
+    fn check<T: psd::BitDepth>(expected: [u8; 4]) {
         let mut doc = LayeredFile::<T>::new(ColorMode::Grayscale, 1, 1).unwrap();
         let mut base = Layer::new_image("gray", Rect::new(0, 0, 1, 1));
         base.image_mut()
@@ -1628,12 +1628,28 @@ fn grayscale_curves_apply_the_channel_table_before_the_composite_at_all_depths()
             )
             .unwrap();
         doc.add_layer(adjustment);
-        close(
-            doc.composite_rgba8().unwrap().pixel(0, 0),
-            [95, 95, 95, 255],
-        );
+        close(doc.composite_rgba8().unwrap().pixel(0, 0), expected);
     }
-    check::<u8>();
-    check::<u16>();
-    check::<f32>();
+    check::<u8>([95, 95, 95, 255]);
+    check::<u16>([95, 95, 95, 255]);
+    // The same stored 0.3725 shows as 164 at 32-bit: the channel is linear
+    // light and the u8 conversion sRGB-encodes it.
+    check::<f32>([164, 164, 164, 255]);
+}
+
+/// 32-bit channels store linear-light floats; Photoshop's own 8-bit previews
+/// sRGB-encode them. The oracle is the file's embedded JPEG thumbnail
+/// (Photoshop-authored): a flat (255, 188, ~3) field. Linear scaling would
+/// give (255, 128, 0); the sRGB encode must land within JPEG noise of it.
+#[test]
+fn a_32bit_composite_srgb_encodes_like_photoshops_thumbnail() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/documents/Compression/Compression_ZipPrediction_32bit.psd");
+    let doc = LayeredFile::<f32>::read(path).unwrap();
+    let image = doc.composite_rgba8().unwrap();
+    let px = image.pixel(32, 32);
+    assert_eq!(px[0], 255, "{px:?}");
+    assert!((px[1] as i32 - 188).abs() <= 4, "{px:?}");
+    assert!(px[2] <= 8, "{px:?}");
+    assert_eq!(px[3], 255, "{px:?}");
 }
