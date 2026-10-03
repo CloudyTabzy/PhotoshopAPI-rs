@@ -21,7 +21,3 @@ __pycache__/
 /TODO.md
 /docs/evaluations/
 /evidence/
-
-# Local agent-tooling state (J-Space controller, ledgers, repository maps).
-.jspace*
-jspace*
