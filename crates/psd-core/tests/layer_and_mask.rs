@@ -62,6 +62,7 @@ const ROUND_TRIP_FIXTURES: &[&str] = &[
     "Groups/Groups_16bit.psd",
     "Compression/Compression_RAW_8bit.psd",
     "Compression/Compression_RAW_8bit.psb",
+    "Compression/Compression_Zip_8bit.psd",
     "Compression/Compression_ZipPrediction_16bit.psd",
     "Compression/Compression_ZipPrediction_32bit.psb",
     "CMYK/CMYK_8.psd",
