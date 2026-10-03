@@ -12,6 +12,19 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.12] - 2026-10-03
+
+### Fixed
+
+- **Stroke bands follow the shape's sub-pixel outline.** The band was measured from the centres
+  of the contour's pixels, so the edge of a stroke around a shallow curve (the top of a circle)
+  climbed in whole-pixel steps while Photoshop's coverage ramps smoothly along it. Each boundary
+  pixel now credits how far its anti-aliased edge lies past its centre (`coverage - 0.5` along the
+  edge normal, from the alpha gradient) and the band's distance is taken to that refined outline;
+  a flat, fully covered edge reads exactly as before. `photoshop-stroke-aa-matte` fell from mean
+  0.84 (max 168) to **0.35**; in the stored-merge set `stroke-effects` improved 4.20 → 2.91 and
+  `shape-fx2` 7.47 → 6.51, while `photoshop-stroke-shapeburst` moved from 0.06 to 0.11.
+
 ## [0.13.11] - 2026-10-03
 
 ### Fixed

@@ -1093,6 +1093,115 @@ pub(crate) fn fold_strength_into_color(content: &mut Content, mode: BlendMode) {
     }
 }
 
+/// Refine a distance to the contour pixels into a distance to the contour's
+/// true, sub-pixel edge. `coarse` holds, for every pixel, the distance to the
+/// nearest source pixel (contour pixels when `from_contour`, otherwise the
+/// pixels outside it); each boundary source is credited with how far the
+/// anti-aliased edge lies past its centre, `(coverage - 0.5)` along the edge
+/// normal, so a shallow curve is no longer a staircase. Only pixels within
+/// `reach` of a source are refined; the result keeps `coarse`'s convention
+/// (a flat, fully covered edge reads the same as before).
+fn refine_edge_distance(
+    coarse: &mut [f32],
+    contour: &[f32],
+    matte: &[f32],
+    width: usize,
+    height: usize,
+    reach: f32,
+    from_contour: bool,
+) {
+    // Boundary sources with their sub-pixel offsets.
+    let at = |x: i64, y: i64| -> f32 {
+        let x = x.clamp(0, width as i64 - 1) as usize;
+        let y = y.clamp(0, height as i64 - 1) as usize;
+        matte[y * width + x]
+    };
+    let mut offset = vec![f32::NAN; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            let source = (contour[index] > 0.0) == from_contour;
+            if !source {
+                continue;
+            }
+            let mut boundary = false;
+            for (dx, dy) in [
+                (-1i64, -1i64),
+                (0, -1),
+                (1, -1),
+                (-1, 0),
+                (1, 0),
+                (-1, 1),
+                (0, 1),
+                (1, 1),
+            ] {
+                let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+                if nx < 0 || ny < 0 || nx >= width as i64 || ny >= height as i64 {
+                    continue;
+                }
+                if (contour[ny as usize * width + nx as usize] > 0.0) != from_contour {
+                    boundary = true;
+                    break;
+                }
+            }
+            if !boundary {
+                continue;
+            }
+            let (x, y) = (x as i64, y as i64);
+            let gx = at(x + 1, y - 1) + 2.0 * at(x + 1, y) + at(x + 1, y + 1)
+                - at(x - 1, y - 1)
+                - 2.0 * at(x - 1, y)
+                - at(x - 1, y + 1);
+            let gy = at(x - 1, y + 1) + 2.0 * at(x, y + 1) + at(x + 1, y + 1)
+                - at(x - 1, y - 1)
+                - 2.0 * at(x, y - 1)
+                - at(x + 1, y - 1);
+            let length = (gx * gx + gy * gy).sqrt();
+            let spread = if length > 1e-4 {
+                (gx.abs() + gy.abs()) / length
+            } else {
+                1.0
+            };
+            let alpha = matte[index];
+            let signed = if from_contour {
+                alpha - 0.5
+            } else {
+                0.5 - alpha
+            };
+            offset[index] = (signed * spread).clamp(-0.75, 0.75);
+        }
+    }
+    let radius_limit = reach.ceil() as i64 + 1;
+    let source_distance = coarse.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            let d0 = source_distance[index];
+            if d0 > reach {
+                continue;
+            }
+            let window = (d0.ceil() as i64 + 1).min(radius_limit);
+            let mut best = f32::INFINITY;
+            for qy in (y as i64 - window).max(0)..=(y as i64 + window).min(height as i64 - 1) {
+                for qx in (x as i64 - window).max(0)..=(x as i64 + window).min(width as i64 - 1) {
+                    let off = offset[qy as usize * width + qx as usize];
+                    if off.is_nan() {
+                        continue;
+                    }
+                    let (dx, dy) = ((qx - x as i64) as f32, (qy - y as i64) as f32);
+                    let value = (dx * dx + dy * dy).sqrt() - off + 0.5;
+                    if value < best {
+                        best = value;
+                    }
+                }
+            }
+            if best.is_finite() {
+                coarse[index] = best.max(0.0);
+            }
+        }
+    }
+}
+
 /// The alpha below which a pixel is too faint to count as part of the shape
 /// a stroke follows (one 8-bit step of alpha is rounding noise).
 const FAINT_FLOOR: f32 = 1.5 / 255.0;
@@ -1187,6 +1296,16 @@ fn stroke_band(
         } else {
             Vec::new()
         };
+        // The band's edge, and Shape Burst's position along it, follow the
+        // true sub-pixel outline instead of the pixel centres.
+        let mut outside = outside;
+        let mut inside = inside;
+        if band_out > 0.0 {
+            refine_edge_distance(&mut outside, &contour, matte, w, h, band_out + 2.0, true);
+        }
+        if band_in > 0.0 {
+            refine_edge_distance(&mut inside, &contour, matte, w, h, band_in + 2.0, false);
+        }
         let mut coverage = vec![0.0f32; w * h];
         let mut burst = vec![0.0f32; w * h];
         let mut inner = vec![0.0f32; w * h];
@@ -1506,6 +1625,47 @@ mod tests {
         }
         content.alpha[0] = 1.0;
         content
+    }
+
+    #[test]
+    fn the_refined_edge_distance_sees_the_sub_pixel_outline() {
+        // Rows 0..=9 are solid, row 10 is three quarters covered and the rest
+        // is empty: the outline sits a quarter pixel past row 10's centre.
+        let (width, height) = (12usize, 16usize);
+        let matte: Vec<f32> = (0..width * height)
+            .map(|index| match index / width {
+                0..=9 => 1.0,
+                10 => 0.75,
+                _ => 0.0,
+            })
+            .collect();
+        let contour: Vec<f32> = matte
+            .iter()
+            .map(|&v| if v >= 0.5 { 1.0 } else { 0.0 })
+            .collect();
+        let mut distance = distance_transform(&contour, width, height);
+        let at = |d: &[f32], y: usize| d[y * width + 6];
+        assert_eq!(at(&distance, 12), 2.0);
+        refine_edge_distance(&mut distance, &contour, &matte, width, height, 8.0, true);
+        // Distance to the outline is 1.75 at row 12; the value keeps the
+        // convention of a half pixel more.
+        assert!(
+            (at(&distance, 12) - 2.25).abs() < 1e-4,
+            "{}",
+            at(&distance, 12)
+        );
+        assert!((at(&distance, 14) - 4.25).abs() < 1e-4);
+        // A fully covered flat edge reads exactly as the unrefined distance.
+        let solid: Vec<f32> = (0..width * height)
+            .map(|index| if index / width <= 10 { 1.0 } else { 0.0 })
+            .collect();
+        let solid_contour = solid.clone();
+        let mut flat = distance_transform(&solid_contour, width, height);
+        let before = flat.clone();
+        refine_edge_distance(&mut flat, &solid_contour, &solid, width, height, 8.0, true);
+        for y in 11..16 {
+            assert!((at(&flat, y) - at(&before, y)).abs() < 1e-4, "row {y}");
+        }
     }
 
     #[test]
