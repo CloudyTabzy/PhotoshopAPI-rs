@@ -17,8 +17,7 @@ exclude = ["bench/", "fuzz/", ".github/"]
 # (SSE2/SSE4.2/AVX2/AVX-512, NEON, wasm SIMD, or a scalar fallback). It is what makes the
 # kernels work off x86-64.
 fearless_simd = "1.0"
-# The `#[simd]` attribute, without which the generic kernels measure *slower* than scalar
-# (the trap the F2b evaluation recorded).
+# The `#[simd]` attribute, without which the generic kernels measure *slower* than scalar.
 fearless_simd_macros = "0.1"
 # CRC-32 of the chunks, over every compressed byte of a default decode. Carry-less
 # multiplication (PCLMULQDQ, PMULL) is out of reach of safe code and of `fearless_simd`, and

@@ -11,9 +11,8 @@ the encoder, the compressor under it and the ancillary-chunk retention, none of 
 decode path ever touched. Measurements for every claim below are in
 [`benchmarks.md`](benchmarks.md).
 
-**Status.** Implemented and measured. The crate is unpublished and vendored into the
-PhotoshopAPI-rs workspace as `crates/psd-png` when smart-object PNG decode lands there; that
-integration has not happened yet.
+**Status.** Implemented and measured. The crate is vendored into PhotoshopAPI-rs as
+`crates/psd-png` and drives its smart-object PNG decode path.
 
 ## The shape of a decode
 
@@ -169,7 +168,7 @@ for SSE2, SSE4.2, AVX2, AVX-512, NEON or wasm SIMD and the acceleration is no lo
 x86-64-only. The backend is chosen once per call from the level `fearless_simd` detects, and
 two backends deliberately stay scalar: the scalar fallback, where the generic code runs a lane
 at a time, and — for the shuffle-built conversion kernels — the bare SSE2 level, where a
-dynamic byte shuffle is emulated per lane. Two rules from the F2b evaluation carry over: every
+dynamic byte shuffle is emulated per lane. Two rules from measurement carry over: every
 kernel carries `#[simd]` (without it the identical source measured 2.4× *slower* than scalar),
 and any shape that would lean on a slow path for its backend declines instead, leaving the
 scalar path to run.
@@ -307,8 +306,8 @@ table.
 ## Appendix: the proposal this was built from
 
 The design began as a proposal written against png-spark 0.2.0 at `6d256fc`. Phases 1–3 were
-implemented as proposed; Phase 4, an upstream pull request, was cancelled on 2026-09-24 in
-favour of a hard fork. This record is kept because the reasoning is worth more than the
+implemented as proposed; Phase 4, an upstream pull request, was cancelled in
+favour of continuing as a fork. This record is kept because the reasoning is worth more than the
 outcome, and because two of the estimates did not survive contact with measurement.
 
 **Original estimates, and what was measured:**

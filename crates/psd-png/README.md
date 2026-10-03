@@ -51,10 +51,9 @@ the same per-row code, so the two paths cannot drift.
 
 ## Status and provenance
 
-This crate is **not published to a registry**. It is developed in its own checkout and vendored
-into the PhotoshopAPI-rs workspace as `crates/psd-png` when smart-object raster decoding lands
-there. Nothing in this repository is a GitHub fork, and the package carries no `repository` URL
-until it has a home of its own.
+This crate is **not published to a registry**. It is vendored into PhotoshopAPI-rs as
+`crates/psd-png`, where it drives the smart-object PNG raster path. It carries no
+`repository` URL of its own while its home is this repository.
 
 It began as **[png-spark](https://github.com/stephenberry/png-spark) 0.2.0 by Stephen Berry**,
 which contributed:

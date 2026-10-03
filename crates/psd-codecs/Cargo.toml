@@ -11,10 +11,9 @@ rayon.workspace = true
 zlib-rs = { workspace = true, optional = true }
 miniz_oxide = { workspace = true, optional = true }
 linflate = { workspace = true, optional = true }
-# The prediction kernels are written with `fearless_simd`'s portable vectors
-# (port TODO §F2b): measured 1.98x on the byte prefix sum and 1.47x on the
-# transpose over the serial chains, with a scalar backend for platforms
-# without SIMD.
+# The prediction kernels are written with `fearless_simd`'s portable vectors:
+# measured 1.98x on the byte prefix sum and 1.47x on the transpose over the
+# serial chains, with a scalar backend for platforms without SIMD.
 fearless_simd = "1.0"
 # The `#[simd]` attribute: without it the same kernels measured 2.4x *slower*
 # than scalar, so it is required, not an optimization.

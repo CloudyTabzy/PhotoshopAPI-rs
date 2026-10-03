@@ -338,7 +338,7 @@ fn indexed(
 //
 // One source, compiled per backend: `fearless_simd` picks SSE2, SSE4.2, AVX2, AVX-512,
 // NEON or wasm SIMD at run time, with a scalar fallback for everything else. Two rules
-// from the crate's F2b evaluation carry over. Every kernel carries `#[simd]`: without it
+// from the crate's SIMD measurements carry over. Every kernel carries `#[simd]`: without it
 // the same source measured 2.4x *slower* than scalar. And a kernel that would lean on a
 // slow path for its backend declines instead, leaving the caller's scalar code to run.
 //
