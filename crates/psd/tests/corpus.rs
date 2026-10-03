@@ -612,6 +612,39 @@ const EXTRA_CORPUS_KNOWN: &[(&str, &str, &str)] = &[
             "its Background layer; the writer synthesizes one (the 0.6.14 rule)"
         ),
     ),
+    (
+        "layer-offsets-read/src.psd",
+        "roundtrip",
+        concat!(
+            "ag-psd writer output: a mid-tree pixel record with no transparency ",
+            "channel gets an all-opaque one (the 0.6.14 rule)"
+        ),
+    ),
+    (
+        "float-size/expected.psd",
+        "roundtrip",
+        concat!(
+            "ag-psd writer output: a mid-tree pixel record with no transparency ",
+            "channel gets an all-opaque one (the 0.6.14 rule)"
+        ),
+    ),
+    (
+        "layer-offsets/expected.psd",
+        "roundtrip",
+        concat!(
+            "ag-psd writer output: a mid-tree pixel record with no transparency ",
+            "channel gets an all-opaque one (the 0.6.14 rule)"
+        ),
+    ),
+    (
+        "nested/src.psd",
+        "roundtrip",
+        concat!(
+            "the outermost group lacks its closing bounding-divider record ",
+            "(a Photoshop-authored degenerate); the writer balances group framing, ",
+            "same normalization as divider_only/"
+        ),
+    ),
 ];
 
 #[test]
