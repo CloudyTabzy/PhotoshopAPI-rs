@@ -12,6 +12,22 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.10] - 2026-10-03
+
+### Fixed
+
+- **A clipping base's overlays can sit under its members.** With "Blend Clipped Layers as Group"
+  off and "Blend Interior Effects as Group" on, a colour, gradient or pattern overlay on the base
+  is part of the base the clipped layers sit on, so an opaque member stays its own colour; the
+  base's other effects (shadows, glows, strokes, bevel) still paint over the members. Every other
+  flag combination keeps the overlay over the finished group.
+- **A partly opaque Normal base composites as a unit even with the group option off.** A
+  half-opaque base with a Multiply member rendered darker than Photoshop's flatten, which is the
+  same as with the option on; a soft-edged base keeps the layer-by-layer path (unverified).
+  `photoshop-clip-base-effects` fell from mean 1.59 (max 128) to **0.41**, with no change
+  elsewhere in the Photoshop-export or stored-merge sets; what remains there is the inner-shadow
+  edge of the `A` cells.
+
 ## [0.13.9] - 2026-10-03
 
 ### Fixed

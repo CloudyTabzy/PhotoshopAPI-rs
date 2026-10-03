@@ -204,6 +204,65 @@ fn clipped_layers_blend_individually_when_the_group_option_is_off() {
     assert!(pixel[0] > 50, "{pixel:?}");
 }
 
+/// A red base with a clipped red-on-top member, one 50% blue colour overlay
+/// on the base and the two clip/interior group flags set as given.
+fn overlay_clip_document(clipped_as_group: bool, interior_as_group: bool) -> LayeredFile<u8> {
+    let mut doc = document(1, 1);
+    white_background(&mut doc);
+    let mut base = solid("base", (0, 0, 1, 1), [0, 255, 0]);
+    base.set_layer_effects(&LayerEffects {
+        color_overlays: vec![overlay([0, 0, 255], 50.0, BlendMode::NORMAL)],
+        ..Default::default()
+    })
+    .unwrap();
+    for (key, on) in [(*b"clbl", clipped_as_group), (*b"infx", interior_as_group)] {
+        base.blocks.push(TaggedBlock::new(
+            TaggedBlockKey::new(key),
+            vec![u8::from(on), 0, 0, 0],
+        ));
+    }
+    doc.add_layer(base);
+    let id = doc.add_layer(solid("member", (0, 0, 1, 1), [255, 0, 0]));
+    doc.layer_mut(id).unwrap().set_clipping_mask(true);
+    doc
+}
+
+#[test]
+fn a_base_overlay_sits_under_its_members_only_with_clipping_off_and_interior_on() {
+    // The overlay normally tints the finished group, members included.
+    for (clipped, interior) in [(false, false), (true, false), (true, true)] {
+        let pixel = flatten(&overlay_clip_document(clipped, interior)).pixel(0, 0);
+        assert!(pixel[2] > 100, "{clipped} {interior}: {pixel:?}");
+    }
+    // With "blend clipped layers as group" off and "blend interior effects as
+    // group" on, it is part of the base the opaque member covers.
+    close(
+        flatten(&overlay_clip_document(false, true)).pixel(0, 0),
+        [255, 0, 0, 255],
+    );
+}
+
+#[test]
+fn a_half_opaque_normal_base_composites_as_a_unit_whatever_the_group_option() {
+    let render = |as_group: bool| {
+        let mut doc = document(1, 1);
+        white_background(&mut doc);
+        let mut base = solid("base", (0, 0, 1, 1), [255, 0, 0]);
+        base.opacity = 128;
+        base.blocks.push(TaggedBlock::new(
+            TaggedBlockKey::new(*b"clbl"),
+            vec![u8::from(as_group), 0, 0, 0],
+        ));
+        doc.add_layer(base);
+        let mut member = solid("member", (0, 0, 1, 1), [0, 128, 255]);
+        member.blend_mode = BlendMode::MULTIPLY;
+        member.set_clipping_mask(true);
+        doc.add_layer(member);
+        flatten(&doc).pixel(0, 0)
+    };
+    assert_eq!(render(false), render(true));
+}
+
 #[test]
 fn blend_if_hides_a_layer_over_dark_backdrop_pixels() {
     let mut doc = document(2, 1);

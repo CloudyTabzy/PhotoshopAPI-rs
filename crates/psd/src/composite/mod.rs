@@ -249,6 +249,18 @@ struct Compositor<'a, T: BitDepth> {
     patterns: Vec<psd_core::pattern::Pattern>,
     colors: color::ColorContext,
     document_backdrop: Option<Canvas>,
+    /// Which of a layer's effects this pass draws.
+    effect_scope: EffectScope,
+}
+
+/// A subset of a layer's effects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EffectScope {
+    All,
+    /// Only the colour, gradient and pattern overlays.
+    OverlaysOnly,
+    /// Everything except those overlays.
+    WithoutOverlays,
 }
 
 impl<T: BitDepth> LayeredFile<T> {
@@ -281,6 +293,7 @@ impl<T: BitDepth> LayeredFile<T> {
                 Vec::new()
             },
             document_backdrop: None,
+            effect_scope: EffectScope::All,
         };
         if self
             .layers_with_ids()
@@ -499,6 +512,19 @@ impl<T: BitDepth> Compositor<'_, T> {
             patterns: self.patterns.clone(),
             colors: self.colors.clone(),
             document_backdrop: self.document_backdrop.clone(),
+            effect_scope: self.effect_scope,
+        }
+    }
+
+    fn with_scope(&self, effect_scope: EffectScope) -> Self {
+        Self {
+            document: self.document,
+            options: self.options,
+            byte_domain: self.byte_domain,
+            patterns: self.patterns.clone(),
+            colors: self.colors.clone(),
+            document_backdrop: self.document_backdrop.clone(),
+            effect_scope,
         }
     }
 
@@ -663,8 +689,30 @@ impl<T: BitDepth> Compositor<'_, T> {
                 .typed_effects(layer)
                 .as_ref()
                 .is_some_and(effects::has_effects);
+        // Approximation: with "Blend Clipped Layers as Group" off and "Blend
+        // Interior Effects as Group" on, the base's colour, gradient and
+        // pattern overlays are part of the base the members sit on, while
+        // its other effects still paint over the members (one reference: a
+        // red member over a blue 50% overlay stays red).
+        let overlays_first = defer_effects
+            && self.interior_flags(layer) == (false, true)
+            && self.typed_effects(layer).is_some_and(|effects| {
+                !effects.color_overlays.is_empty()
+                    || !effects.gradient_overlays.is_empty()
+                    || effects.pattern_overlay.is_some()
+            });
         let mut base_coverage = if skip_adjustment {
             None
+        } else if overlays_first {
+            self.with_scope(EffectScope::OverlaysOnly).composite_layer(
+                base,
+                canvas,
+                None,
+                shallow_backdrop,
+                deep_backdrop,
+                is_clip_base,
+                adjustment_limit,
+            )?
         } else if defer_effects {
             self.without_effects().composite_layer(
                 base,
@@ -722,7 +770,10 @@ impl<T: BitDepth> Compositor<'_, T> {
                 union_coverage(accumulated, coverage);
             }
         }
-        if defer_effects {
+        if overlays_first {
+            self.with_scope(EffectScope::WithoutOverlays)
+                .composite_layer_effects(base, canvas, None)?;
+        } else if defer_effects {
             self.composite_layer_effects(base, canvas, None)?;
         }
         Ok(())
@@ -762,7 +813,14 @@ impl<T: BitDepth> Compositor<'_, T> {
             .get(key)
             .and_then(|block| block.data.first().copied())
             .is_none_or(|flag| flag != 0);
-        if !as_group {
+        // Approximation: with the option off, a Normal base at partial
+        // opacity still composites as a unit (a Photoshop render of a
+        // half-opaque base with a Multiply member is the same either way).
+        // A soft-edged base keeps the layer-by-layer path, which is not
+        // verified against a render.
+        let partial_normal =
+            layer.blend_mode == BlendMode::NORMAL && (layer.opacity != 255 || layer.fill() != 255);
+        if !as_group && !partial_normal {
             return None;
         }
         if self.options.effects
@@ -1469,6 +1527,18 @@ impl<T: BitDepth> Compositor<'_, T> {
         // The clip base coverage a clipped layer above sees is the layer's own
         // coverage including its mask.
         Ok(Some(clip_plane))
+    }
+
+    /// `(blend clipped layers as group, blend interior effects as group)`.
+    fn interior_flags(&self, layer: &Layer<T>) -> (bool, bool) {
+        let flag = |key: &[u8; 4], default: bool| {
+            layer
+                .blocks
+                .get(psd_core::TaggedBlockKey::new(*key))
+                .and_then(|block| block.data.first().copied())
+                .map_or(default, |value| value != 0)
+        };
+        (flag(b"clbl", true), flag(b"infx", false))
     }
 
     /// Whether the layer's interior effects blend together with its content:
@@ -2204,6 +2274,23 @@ impl<T: BitDepth> Compositor<'_, T> {
                 let mut effects = psd_core::LayerEffects::from_descriptor(&modern.descriptor);
                 if effects.master_switch.unwrap_or(true) {
                     self.apply_global_light(&mut effects);
+                    match self.effect_scope {
+                        EffectScope::All => {}
+                        EffectScope::OverlaysOnly => {
+                            effects.drop_shadows.clear();
+                            effects.inner_shadows.clear();
+                            effects.outer_glow = None;
+                            effects.inner_glow = None;
+                            effects.bevel = None;
+                            effects.satin = None;
+                            effects.strokes.clear();
+                        }
+                        EffectScope::WithoutOverlays => {
+                            effects.color_overlays.clear();
+                            effects.gradient_overlays.clear();
+                            effects.pattern_overlay = None;
+                        }
+                    }
                     return Some(effects);
                 }
             }
