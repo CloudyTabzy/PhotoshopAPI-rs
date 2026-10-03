@@ -11,7 +11,7 @@
 use psd_core::{LayerColor, PsdError, Result};
 
 use crate::bitdepth::BitDepth;
-use crate::layer::{Layer, LayerId, LayerKind};
+use crate::layer::{Layer, LayerId, LayerKind, Rect};
 use crate::layered_file::LayeredFile;
 
 /// A layer detached from a document, together with its descendants.
@@ -217,6 +217,35 @@ impl<T: BitDepth> LayeredFile<T> {
             current = self.parent(layer_id);
         }
         LayerColor::None
+    }
+
+    /// The union of every descendant layer's bounds, `None` when `id` is not
+    /// a group or holds no content. A group record's own `bounds` cannot
+    /// answer this — Photoshop writes them zeroed — so the extent is computed
+    /// from the children: section dividers and zero-area records contribute
+    /// nothing, nested groups are descended, and invisible layers count.
+    pub fn group_bounds(&self, id: LayerId) -> Option<Rect> {
+        let mut bounds: Option<Rect> = None;
+        let mut stack: Vec<LayerId> = self.children(Some(id))?.to_vec();
+        while let Some(child) = stack.pop() {
+            if self.is_divider(child) {
+                continue;
+            }
+            if let Some(children) = self.children(Some(child)) {
+                stack.extend_from_slice(children);
+            }
+            let Some(rect) = self.layer(child).map(|layer| layer.bounds) else {
+                continue;
+            };
+            if rect.sample_count() == 0 {
+                continue;
+            }
+            bounds = Some(match bounds {
+                Some(union) => union.union(rect),
+                None => rect,
+            });
+        }
+        bounds
     }
 
     pub(crate) fn parent_is_within_artboard(&self, parent: Option<LayerId>) -> bool {
@@ -620,6 +649,43 @@ mod tests {
         assert_eq!(document.effective_display_color(leaf), LayerColor::Blue);
         let free = document.add_layer(image("Free"));
         assert!(!document.is_effectively_locked(free));
+    }
+
+    /// Photoshop writes a group's record with zeroed bounds, so the real
+    /// extent is the union of its descendants — nested groups descended,
+    /// divider and empty records contributing nothing.
+    #[test]
+    fn group_bounds_unions_descendants() {
+        let mut document = LayeredFile::<u8>::new(ColorMode::Rgb, 100, 100).unwrap();
+        let group = document.add_layer(Layer::new_group("Group"));
+        let mut near = image("Near");
+        near.bounds = Rect::new(10, 10, 20, 30);
+        let mut far = image("Far");
+        far.bounds = Rect::new(40, 50, 60, 70);
+        let nested = document.add_layer_to_group(group, near).unwrap();
+        let inner = document
+            .add_layer_to_group(group, Layer::new_group("Inner"))
+            .unwrap();
+        document.add_layer_to_group(inner, far).unwrap();
+        let mut empty = image("Empty");
+        empty.bounds = Rect::new(0, 0, 0, 0);
+        document.add_layer_to_group(inner, empty).unwrap();
+
+        assert_eq!(document.layer(group).unwrap().bounds, Rect::new(0, 0, 0, 0));
+        assert_eq!(
+            document.group_bounds(group),
+            Some(Rect::new(10, 10, 60, 70))
+        );
+        assert_eq!(
+            document.group_bounds(inner),
+            Some(Rect::new(40, 50, 60, 70))
+        );
+        // Not a group, and a group with no content.
+        assert_eq!(document.group_bounds(nested), None);
+        let vacant = document.add_layer(Layer::new_group("Vacant"));
+        assert_eq!(document.group_bounds(vacant), None);
+        // Unknown id.
+        assert_eq!(document.group_bounds(usize::MAX), None);
     }
 
     #[test]

@@ -78,6 +78,16 @@ impl Rect {
         self.bottom - self.top
     }
 
+    /// The smallest rect containing both.
+    pub fn union(self, other: Rect) -> Rect {
+        Rect {
+            top: self.top.min(other.top),
+            left: self.left.min(other.left),
+            bottom: self.bottom.max(other.bottom),
+            right: self.right.max(other.right),
+        }
+    }
+
     /// Center point in canvas coordinates.
     pub fn center(self) -> (f64, f64) {
         (

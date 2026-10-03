@@ -12,6 +12,18 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.19] - 2026-10-03
+
+### Added
+
+- **`LayeredFile::group_bounds`.** Group records carry zeroed bounds on disk, so a
+  group's own `bounds` cannot answer how large it is; this accessor unions the bounds
+  of every descendant layer (section dividers and zero-area records excluded, nested
+  groups descended, invisible layers counted) and returns `None` for non-groups and
+  content-free groups. Distinct from the compositor's private render-extent helper,
+  which additionally filters invisible layers, unions artboard rects, and clamps to
+  the canvas. `Rect::union` is the supporting primitive.
+
 ## [0.13.18] - 2026-10-03
 
 ### Added
