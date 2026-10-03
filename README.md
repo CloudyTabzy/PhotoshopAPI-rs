@@ -350,6 +350,47 @@ The one license expression mentioning LGPL is `r-efi` (a UEFI-target crate,
 not part of a normal desktop build), and it is `MIT OR Apache-2.0 OR
 LGPL-2.1-or-later` — an either/or choice, so the LGPL terms never apply.
 
+## Performance
+
+Read → decode all layer channels → write, measured against the C++ upstream
+(v0.9.1, MSVC Release) on the same machine, warm file cache, same documents.
+*Decode* is upstream's per-layer `get_image_data()` against this port's
+explicit `decode_layer_pixels`; the port's default `LayeredFile::read`
+combines read + decode eagerly.
+
+Real documents (milliseconds, lower is better; **bold** = faster):
+
+| Document | Read C++ / Rust | Decode C++ / Rust | Write C++ / Rust |
+|---|---|---|---|
+| `example.psd` (0.9 MB, 8-bit) | 32.5 / **0.31** | **1.07** / 2.02 | 16.7 / **2.8** |
+| `smart_object_no_warp.psd` (5.3 MB) | 34.3 / **2.6** | **2.8** / 6.7 | 245.7 / **5.2** |
+| `SmartObject.psd` (5.8 MB) | 115.5 / **7.1** | —¹ / 3.5 | 1953.6² / **4.7** |
+| `qual_rca_pinout.psd` (6 MB) | 35.7 / **3.2** | **3.1** / 4.7 | 19.9 / **8.7** |
+
+Synthetic large documents:
+
+| Document | Read C++ / Rust | Decode C++ / Rust | Write C++ / Rust |
+|---|---|---|---|
+| `big8.psd` (435 MB, 8-bit RLE) | ~220 / **~205** | **~142** / ~190 | **~290** / ~440 |
+| `big16.psd` (252 MB, 16-bit ZIP-pred.) | ~200 / **~113** | **~65** / ~1185 | **~770** / ~5200 |
+
+¹ Upstream's `get_image_data()` does not decode smart-object layers, so it
+performed no pixel work on that file; the port decodes them.
+² Upstream re-embeds the smart-object payload through OpenImageIO on write;
+this port passes the linked bytes through verbatim.
+
+Upstream parallelizes channel codec work across channels
+(`std::execution::par` over the channel table); this port currently
+decompresses and compresses channels serially, which is what the 16-bit
+ZIP-prediction numbers above isolate. On RLE-compressed data the two are
+already at parity.
+
+Reproduce the Rust side with:
+
+```text
+cargo run -p psd --release --example rw_bench -- --out <dir> <file.psd> ...
+```
+
 ## Deliberate differences from upstream
 
 Where upstream has a bug or an accident, this port fixes it and says so in a
