@@ -19,6 +19,29 @@ pub(crate) struct ChannelJob<'a, T> {
     pub height: usize,
     pub version: Version,
     pub forced: Option<Compression>,
+    /// Scanline counts measured by [`prepare_byte_hint`](Self::prepare_byte_hint),
+    /// handed to the encoder so an RLE plane is walked once to count and once
+    /// to pack, never counted twice.
+    rle_counts: Option<psd_codecs::rle::ScanlineCounts>,
+}
+
+impl<'a, T> ChannelJob<'a, T> {
+    pub(crate) fn new(
+        source: ChannelSource<'a, T>,
+        width: usize,
+        height: usize,
+        version: Version,
+        forced: Option<Compression>,
+    ) -> Self {
+        Self {
+            source,
+            width,
+            height,
+            version,
+            forced,
+            rle_counts: None,
+        }
+    }
 }
 
 pub(crate) struct EncodedChannel<'a> {
@@ -40,8 +63,10 @@ enum Payload<'a> {
 }
 
 impl<T: BitDepth> ChannelJob<'_, T> {
-    /// Exact byte-plane reservation also fixes the automatic codec choice, so
-    /// the subsequent encode does not repeat the counting pass.
+    /// The exact payload length when it is known before encoding: stored
+    /// payloads, and 8-bit planes whose Raw/RLE choice an exact scanline count
+    /// settles. The count is kept for the encode, which then packs without
+    /// counting again. `None` means the length depends on deflate.
     pub(crate) fn prepare_byte_hint(&mut self) -> Result<Option<usize>> {
         let samples = self
             .width
@@ -58,37 +83,39 @@ impl<T: BitDepth> ChannelJob<'_, T> {
                     Some(Compression::Raw) => Ok(Some(bytes.len())),
                     None | Some(Compression::Rle) => {
                         let width = if self.version == Version::Psd { 2 } else { 4 };
-                        let rle = psd_codecs::rle::encoded_scanlines_len(&bytes, self.width, width)
+                        let counts = psd_codecs::rle::count_scanlines(&bytes, self.width, width)
                             .map_err(|error| PsdError::Compression(error.to_string()))?;
-                        if self.forced.is_none() {
-                            self.forced = Some(if rle < bytes.len() {
-                                Compression::Rle
-                            } else {
-                                Compression::Raw
-                            });
-                        }
-                        Ok(Some(if self.forced == Some(Compression::Raw) {
+                        let raw = self.forced.is_none()
+                            && crate::channels::rle_loses(&counts, bytes.len());
+                        let hint = if raw {
                             bytes.len()
                         } else {
-                            rle
-                        }))
+                            counts.encoded_len()
+                        };
+                        self.rle_counts = Some(counts);
+                        Ok(Some(hint))
                     }
                     _ => Ok(None),
                 }
             }
             ChannelSource::Uniform(_) if T::DEPTH == 8 => {
+                // A constant row packs to one two-byte packet per 128 pixels.
                 let raw = samples;
                 let table = if self.version == Version::Psd { 2 } else { 4 };
-                let rle = self
+                let packed_row = self
                     .width
                     .div_ceil(128)
                     .checked_mul(2)
-                    .and_then(|row| row.checked_add(table))
+                    .ok_or(invalid("RLE length overflows"))?;
+                let rle = packed_row
+                    .checked_add(table)
                     .and_then(|row| row.checked_mul(self.height))
                     .ok_or(invalid("RLE length overflows"))?;
+                let oversized = table == 2 && packed_row > u16::MAX as usize;
                 Ok(match self.forced {
                     Some(Compression::Raw) => Some(raw),
                     Some(Compression::Rle) => Some(rle),
+                    None if oversized => Some(raw),
                     None => Some(raw.min(rle)),
                     _ => None,
                 })
@@ -128,6 +155,7 @@ impl<'a, T: BitDepth> ChannelJob<'a, T> {
                     self.version,
                     self.forced,
                     policy,
+                    self.rle_counts,
                 )?;
                 (codec, Payload::Bytes(bytes))
             }
@@ -161,7 +189,8 @@ impl<'a, T: BitDepth> ChannelJob<'a, T> {
                             repeat_into(&mut row, &pattern, self.width)?;
                             let row = psd_codecs::rle::pack_bits_compress(&row);
                             let size_width = if self.version == Version::Psd { 2 } else { 4 };
-                            if size_width == 2 && row.len() > u16::MAX as usize {
+                            let oversized = size_width == 2 && row.len() > u16::MAX as usize;
+                            if oversized && self.forced.is_some() {
                                 return Err(PsdError::LengthOverflow {
                                     actual: row.len() as u64,
                                     width: 2,
@@ -175,7 +204,9 @@ impl<'a, T: BitDepth> ChannelJob<'a, T> {
                             let raw_len = samples
                                 .checked_mul(T::SIZE)
                                 .ok_or(invalid("uniform channel byte count overflows"))?;
-                            if self.forced.is_none() && encoded.len()? >= raw_len {
+                            // Same rule as sampled planes: raw when RLE is not
+                            // smaller or a row cannot be declared.
+                            if self.forced.is_none() && (oversized || encoded.len()? >= raw_len) {
                                 (
                                     Compression::Raw,
                                     Payload::Repeat {
@@ -281,20 +312,8 @@ impl Payload<'_> {
     }
 }
 
-fn repeat_into(sink: &mut dyn Write, pattern: &[u8], mut count: usize) -> Result<()> {
-    if pattern.is_empty() || count == 0 {
-        return Ok(());
-    }
-    let copies = (32 * 1024 / pattern.len()).max(1).min(count);
-    let mut block = Vec::with_capacity(pattern.len() * copies);
-    for _ in 0..copies {
-        block.extend_from_slice(pattern);
-    }
-    while count >= copies {
-        sink.write_all(&block)?;
-        count -= copies;
-    }
-    sink.write_all(&block[..count * pattern.len()])?;
+fn repeat_into(sink: &mut dyn Write, pattern: &[u8], count: usize) -> Result<()> {
+    psd_codecs::repeat::for_each_block(pattern, count as u64, |block| sink.write_all(block))?;
     Ok(())
 }
 

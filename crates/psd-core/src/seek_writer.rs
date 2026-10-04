@@ -183,17 +183,18 @@ fn write_layer_content<W: Write + Seek>(
         width: 2,
     })?;
     sink.write_all(&(if info.has_merged_alpha { -count } else { count }).to_be_bytes())?;
-    let mut offsets = Vec::with_capacity(info.layer_records.len());
+    // The records stay staged (they are metadata, small beside the channel
+    // data) so every channel length is patched in memory and the block is
+    // rewritten with one seek, not one per layer.
+    let records_start = sink.position();
+    let mut records = BeWriter::new();
+    let mut length_offsets = Vec::with_capacity(info.layer_records.len());
     for record in &info.layer_records {
-        let mut encoded = BeWriter::new();
-        let positions = record.write_with_channel_offsets(&mut encoded, header)?;
-        offsets.push(
-            positions
-                .first()
-                .map(|offset| sink.position() + *offset as u64 - 2),
-        );
-        sink.write_all(encoded.as_slice())?;
+        // Offsets are positions in `records`: each record's channel lengths.
+        length_offsets.push(record.write_with_channel_offsets(&mut records, header)?);
     }
+    let mut records = records.into_inner();
+    sink.write_all(&records)?;
     let start = sink.position();
     let sizes = channels(sink)?;
     if sizes.len() != info.layer_records.len()
@@ -221,16 +222,17 @@ fn write_layer_content<W: Write + Seek>(
             message: "streamed channel lengths do not match bytes written",
         });
     }
-    for ((record, sizes), offset) in info.layer_records.iter_mut().zip(sizes).zip(offsets) {
-        let mut encoded = BeWriter::new();
-        for (channel, size) in record.channels.iter_mut().zip(sizes) {
+    for ((record, sizes), offsets) in info.layer_records.iter_mut().zip(sizes).zip(length_offsets) {
+        for ((channel, size), offset) in record.channels.iter_mut().zip(sizes).zip(offsets) {
             channel.size = size;
-            encoded.i16(channel.index);
-            encoded.len(header.version, size)?;
+            let mut field = BeWriter::new();
+            field.len(header.version, size)?;
+            let field = field.as_slice();
+            records[offset..offset + field.len()].copy_from_slice(field);
         }
-        if let Some(offset) = offset {
-            sink.patch(offset, encoded.as_slice())?;
-        }
+    }
+    if !records.is_empty() {
+        sink.patch(records_start, &records)?;
     }
     Ok(())
 }

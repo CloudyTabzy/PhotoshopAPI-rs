@@ -754,6 +754,8 @@ impl<'a> LayerRecord<'a> {
         self.write_record(writer, header, |_| {})
     }
 
+    /// [`write`](Self::write), returning the position in `writer` of each
+    /// channel's length field so a streaming writer can fill them in later.
     pub(crate) fn write_with_channel_offsets(
         &self,
         writer: &mut BeWriter,

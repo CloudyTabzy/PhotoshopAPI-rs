@@ -9,11 +9,14 @@
 //! - [`rle`]: PackBits compress/decompress with PSD(2-byte)/PSB(4-byte)
 //!   scanline size tables (`Compress_RLE.h`, `Decompress_RLE*.h`)
 //! - `zip`: hand-assembled zlib stream (`0x78 0x5E` + raw deflate + BE
-//!   adler32) via libdeflate (`Compress_ZIP.h`, `Decompress_ZIP.h`)
+//!   adler32) via the selected `zip-backend-*` engine (`Compress_ZIP.h`,
+//!   `Decompress_ZIP.h`)
 //! - `prediction`: ZIP prediction delta encode/decode, incl. the f32
 //!   byte-deinterleave (`Compress_ZIP.h`, `Decompress_ZIP.h`)
 //! - `interleave`: planar <-> interleaved shuffling (`InterleavedToPlanar.h`,
 //!   `Render/Interleave.h`, `Deinterleave.h`)
+//! - [`repeat`]: bounded blocks of a repeated byte pattern, for uniform
+//!   payloads that are never materialized at full size
 //!
 //! Scanline-parallel paths ([`rle`], `prediction`) run on rayon once a
 //! payload exceeds `rle::PARALLEL_MIN_BYTES`; smaller payloads stay
@@ -27,6 +30,7 @@ pub mod endian;
 mod error;
 pub mod interleave;
 pub mod prediction;
+pub mod repeat;
 pub mod rle;
 pub mod zip;
 

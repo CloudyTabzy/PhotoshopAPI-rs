@@ -5,7 +5,7 @@
 //! retains the original streams. Also times
 //! the default eager `read`, which combines structure + decode.
 //!
-//! Usage: cargo run -p psd --release --example rw_bench --features image --
+//! Usage: cargo run -p psd --release --example rw_bench --
 //!          --out <dir> <file1.psd> [file2.psd ...]
 //!
 //! Prints CSV rows: file,phase,ms with phases read | extract | write |

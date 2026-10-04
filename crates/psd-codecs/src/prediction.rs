@@ -263,16 +263,23 @@ pub fn compress_with_policy<T: DeltaSample>(
     policy: crate::zip::CompressionPolicy,
 ) -> Result<Vec<u8>> {
     let mut scratch = Vec::new();
-    compress_blocks(data, width, height, policy, |block, width, _, encoded| {
-        scratch.clear();
-        scratch.extend_from_slice(block);
-        T::delta_rows(&mut scratch, width);
-        encoded.resize(block.len() * T::SIZE, 0);
-        for (value, bytes) in scratch.iter().zip(encoded.chunks_exact_mut(T::SIZE)) {
-            value.write_be_into(bytes);
-        }
-        Ok(())
-    })
+    compress_blocks(
+        data,
+        width,
+        height,
+        1,
+        policy,
+        |block, width, _, encoded| {
+            scratch.clear();
+            scratch.extend_from_slice(block);
+            T::delta_rows(&mut scratch, width);
+            encoded.resize(block.len() * T::SIZE, 0);
+            for (value, bytes) in scratch.iter().zip(encoded.chunks_exact_mut(T::SIZE)) {
+                value.write_be_into(bytes);
+            }
+            Ok(())
+        },
+    )
 }
 
 /// The f32 counterpart of [`compress`], including byte-plane prediction.
@@ -287,60 +294,88 @@ pub fn compress_f32_with_policy(
     height: usize,
     policy: crate::zip::CompressionPolicy,
 ) -> Result<Vec<u8>> {
-    compress_blocks(data, width, height, policy, |block, width, _, encoded| {
-        encoded.resize(block.len() * 4, 0);
-        for (row, src) in encoded.chunks_mut(width * 4).zip(block.chunks(width)) {
-            kernels::deinterleave_f32_row(row, src, width);
-            kernels::delta_bytes_row(row);
+    compress_blocks(
+        data,
+        width,
+        height,
+        4,
+        policy,
+        |block, width, _, encoded| {
+            encoded.resize(block.len() * 4, 0);
+            for (row, src) in encoded.chunks_mut(width * 4).zip(block.chunks(width)) {
+                kernels::deinterleave_f32_row(row, src, width);
+                kernels::delta_bytes_row(row);
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Bytes of each encoded window the deflate strategy probe compares.
+const PROBE_BYTES: usize = 16 * 1024;
+
+/// Append one encoded window's probe bytes to `sample`. Float rows are stored
+/// as `planes` byte planes, so on a wide row the first [`PROBE_BYTES`] would
+/// hold only the sign and exponent planes, which always compress well and
+/// would hide noisy low-order planes from the probe. Such rows contribute an
+/// equal share of every plane instead.
+fn extend_probe(sample: &mut Vec<u8>, encoded: &[u8], row_bytes: usize, planes: usize) {
+    if planes > 1 && row_bytes > PROBE_BYTES && encoded.len() >= row_bytes {
+        let plane = row_bytes / planes;
+        let share = PROBE_BYTES / planes;
+        for index in 0..planes {
+            sample.extend_from_slice(&encoded[index * plane..index * plane + share]);
         }
-        Ok(())
-    })
+    } else {
+        sample.extend_from_slice(&encoded[..encoded.len().min(PROBE_BYTES)]);
+    }
 }
 
 fn compress_blocks<T: BeConvert>(
     data: &[T],
     width: usize,
     height: usize,
+    planes: usize,
     policy: crate::zip::CompressionPolicy,
     mut encode: impl FnMut(&[T], usize, usize, &mut Vec<u8>) -> Result<()>,
 ) -> Result<Vec<u8>> {
     check_sample_count(data.len(), width, height)?;
-    {
-        if data.is_empty() {
-            return crate::zip::compress(&[]);
+    if data.is_empty() {
+        return crate::zip::compress(&[]);
+    }
+    let bytes = data
+        .len()
+        .checked_mul(T::SIZE)
+        .ok_or(CodecError::InvalidInput("image dimensions overflow"))?;
+    let rows = (BLOCK_SAMPLES / width).max(1);
+    let mut sample = Vec::new();
+    let mut encoded = Vec::new();
+    // Three separated windows choose the strategy (Balanced, Fast) and size
+    // the output for every policy, including a Compact replay.
+    if bytes >= 1024 * 1024 {
+        for first in [0, height / 2, height.saturating_sub(rows)] {
+            let last = first.saturating_add(rows).min(height);
+            encode(
+                &data[first * width..last * width],
+                width,
+                last - first,
+                &mut encoded,
+            )?;
+            extend_probe(&mut sample, &encoded, width * T::SIZE, planes);
         }
-        let bytes = data
-            .len()
-            .checked_mul(T::SIZE)
-            .ok_or(CodecError::InvalidInput("image dimensions overflow"))?;
-        let rows = (BLOCK_SAMPLES / width).max(1);
-        let mut sample = Vec::new();
-        let mut encoded = Vec::new();
-        if bytes >= 1024 * 1024 && policy != crate::zip::CompressionPolicy::Compact {
-            for first in [0, height / 2, height.saturating_sub(rows)] {
-                let last = first.saturating_add(rows).min(height);
-                encode(
-                    &data[first * width..last * width],
-                    width,
-                    last - first,
-                    &mut encoded,
-                )?;
-                sample.extend_from_slice(&encoded[..encoded.len().min(16 * 1024)]);
+    }
+    let mut policy = policy;
+    'attempt: loop {
+        let mut encoder = crate::zip::StreamingEncoder::with_policy(&sample, bytes, policy)?;
+        for block in data.chunks(rows * width) {
+            encode(block, width, block.len() / width, &mut encoded)?;
+            encoder.push(&encoded)?;
+            if encoder.needs_replay() {
+                policy = crate::zip::CompressionPolicy::Compact;
+                continue 'attempt;
             }
         }
-        let mut policy = policy;
-        'attempt: loop {
-            let mut encoder = crate::zip::StreamingEncoder::with_policy(&sample, bytes, policy)?;
-            for block in data.chunks(rows * width) {
-                encode(block, width, block.len() / width, &mut encoded)?;
-                encoder.push(&encoded)?;
-                if encoder.needs_replay() {
-                    policy = crate::zip::CompressionPolicy::Compact;
-                    continue 'attempt;
-                }
-            }
-            return encoder.finish();
-        }
+        return encoder.finish();
     }
 }
 
@@ -799,6 +834,23 @@ mod kernels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_float_probes_sample_every_byte_plane() {
+        // One 8192-pixel float row: four planes of 8 KiB, tagged 0..=3.
+        let width = 8192;
+        let row: Vec<u8> = (0..4u8).flat_map(|plane| vec![plane; width]).collect();
+        let mut sample = Vec::new();
+        extend_probe(&mut sample, &row, width * 4, 4);
+        assert_eq!(sample.len(), PROBE_BYTES);
+        for plane in 0..4u8 {
+            assert!(sample.contains(&plane), "plane {plane} missing");
+        }
+        // Narrow rows and integer planes keep the leading window.
+        let mut sample = Vec::new();
+        extend_probe(&mut sample, &row, width * 4, 1);
+        assert_eq!(sample, row[..PROBE_BYTES]);
+    }
 
     #[test]
     fn implicit_constant_planes_match_materialized_prediction_at_every_depth() {

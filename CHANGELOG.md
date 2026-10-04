@@ -12,6 +12,67 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.32] - 2026-10-04
+
+### Added
+
+- `psd_codecs::rle::count_scanlines` measures every scanline's PackBits length
+  once; `compress_counted_scanlines` then writes the channel into a single
+  buffer of exactly that size. `ScanlineCounts::fits_table` reports whether
+  every row fits its PSD/PSB size-table entry.
+- `psd_codecs::repeat::for_each_block` feeds a long repeated byte pattern to a
+  sink in bounded blocks.
+
+### Changed
+
+- RLE channels are packed directly into their final buffer: no per-block
+  staging and no concatenation copy, so a packed plane is held once instead of
+  twice. The scanline count that chooses between Raw and RLE now also sizes
+  that buffer, and `to_bytes` reuses the count it takes for its reservation
+  instead of counting each plane again.
+- Automatic 8-bit codec selection stores a plane raw when one of its rows
+  packs too long for a PSD size-table entry, instead of failing the save.
+  An explicit RLE request still reports the overflow.
+- `to_bytes` for documents with deflate-coded channels starts from the known
+  part of the file's size instead of an empty buffer, and trims the returned
+  buffer when growth left more than about 3% unused capacity (0.13.30 could
+  return up to twice the needed capacity). 8-bit documents, whose size is
+  known up front, still write into one exactly reserved buffer.
+- Large ZIP streams with no usable sample (constant planes such as the
+  synthesized opaque alpha, repeated payloads) reserve a small initial output
+  instead of the full deflate bound of the plane, which committed a whole
+  plane per concurrent job for output of a few kilobytes. `Compact` encoding
+  now sizes its output from the same sampled windows as the other policies.
+- The deflate strategy probe samples every byte plane of wide 32-bit rows;
+  it previously saw only the sign and exponent planes, so Huffman-only coding
+  was never chosen for wide float channels.
+- The codec scheduler keeps up to four jobs per pool thread in flight, still
+  bounded by the workspace budget, so one slow channel at the head of the
+  order no longer leaves the other threads idle. A coordinator running on a
+  Rayon worker blocks briefly when no queued work is runnable instead of
+  spinning a core.
+- The seekable writer backpatches all channel lengths with one rewrite of the
+  staged layer records instead of one seek pair per layer.
+- Read-phase timings are `tracing` debug events (`document read phase`, with
+  `phase` and `elapsed_ms` fields) instead of stderr output gated by the
+  `PSD_PHASE_TIMING` environment variable, which is removed.
+- Read progress events (since 0.13.29) are reported as each layer finishes
+  building, in record order, and carry the layer's resolved name (its Unicode
+  name when present) rather than the legacy Pascal name.
+
+### Fixed
+
+- A save no longer fails when a temporary file name beside the document is
+  already taken, for instance left behind by a crashed process whose id was
+  reused: the next name is used and the leftover is not touched.
+- `decode_layer_pixels` and `decode_all_layer_pixels` accept a real-user-mask
+  (`-3`) record that does not decode, keeping it raw exactly as an eager read
+  does (older Photoshop files carry marker-only or undersized `-3` records
+  whose payload Photoshop ignores). Previously every call failed on such a
+  document. A per-layer decode returns that plane's budget reservation.
+- A synthesized transparency channel too large to address is reported as
+  `InvalidImageBounds` again, as before 0.13.29.
+
 ## [0.13.31] - 2026-10-04
 
 ### Changed
@@ -106,7 +167,7 @@ v0.9.1 that this project ports.
   temporary files, avoiding shared-buffer corruption or accidental cleanup
   of a temporary file owned by another save.
 
-## [0.13.28] - 2026-10-05
+## [0.13.28] - 2026-10-04
 
 ### Changed
 

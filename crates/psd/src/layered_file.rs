@@ -45,12 +45,30 @@ const DIVIDER_NAME: &str = "</Layer group>";
 /// default, and what a new document is created with.
 const DEFAULT_DPI: f32 = 72.0;
 
-/// A temporary path beside `path`, so replacing it is a rename within one
-/// filesystem. A process-local sequence keeps concurrent saves from sharing
-/// a temporary file, even when both writers target the same document path.
-fn temporary_sibling(path: &Path) -> Result<PathBuf> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Report one document-read phase's wall time as a `tracing` debug event, so
+/// a subscriber can separate parsing (and page-in of a mapped file) from
+/// channel decoding. Without a subscriber at debug level this costs nothing.
+fn trace_read_phase(phase: &'static str, start: std::time::Instant) {
+    tracing::debug!(
+        phase,
+        elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
+        "document read phase"
+    );
+}
+
+/// Process-local counter behind temporary file names.
+static TEMPORARY_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Create a new temporary file beside `path`, so replacing `path` is a rename
+/// within one filesystem. Names carry the process id and a process-local
+/// sequence, so concurrent saves never share a file, and creation is
+/// exclusive, so a save never truncates a file it did not create. A name that
+/// is already taken — by another save, or left behind by a crashed process
+/// that had the same id — is skipped for the next one instead of failing the
+/// save; the leftover itself is not touched.
+fn create_temporary_sibling(path: &Path) -> Result<(PathBuf, std::fs::File)> {
+    use std::sync::atomic::Ordering;
+    const ATTEMPTS: usize = 1024;
     let name = path
         .file_name()
         .ok_or(PsdError::InvalidData {
@@ -58,11 +76,27 @@ fn temporary_sibling(path: &Path) -> Result<PathBuf> {
             message: "a document path needs a file name",
         })?
         .to_string_lossy();
-    Ok(path.with_file_name(format!(
-        ".{name}.tmp-{}-{}",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    )))
+    for _ in 0..ATTEMPTS {
+        let candidate = path.with_file_name(format!(
+            ".{name}.tmp-{}-{}",
+            std::process::id(),
+            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no unused temporary file name beside the document",
+    )
+    .into())
 }
 
 fn absolute_or_current_dir(path: &Path) -> Result<PathBuf> {
@@ -187,12 +221,22 @@ fn read_rect_extents(rect: Rect, kind: &'static str, version: Version) -> Result
     Ok((width, height))
 }
 
+/// The extents of mask channel `key`: its own mask record's rectangle, or the
+/// layer `bounds` when the layer carries none. Reads, the read-time budget
+/// and writes all size mask channels through here, so they cannot disagree.
 fn mask_channel_extents(
-    rect: Rect,
-    kind: &'static str,
+    mask: Option<&psd_core::LayerMaskData>,
+    bounds: Rect,
+    key: ChannelKey,
     version: Version,
     empty_payload: bool,
 ) -> Result<(usize, usize)> {
+    let rect = mask_channel_rect(mask, key).unwrap_or(bounds);
+    let kind = if key == ChannelKey::REAL_USER_MASK {
+        "real mask"
+    } else {
+        "mask"
+    };
     match read_rect_extents(rect, kind, version) {
         Ok(extents) => Ok(extents),
         // PhotoshopAPI/src/PhotoshopFile/LayerAndMaskInformation.cpp passes
@@ -209,9 +253,10 @@ fn mask_channel_extents(
     }
 }
 
-/// Charge one retained channel plane before calling its decoder. This adapts
-/// a remaining-budget model used by independent readers to planar typed
-/// channels.
+/// A layer record's pixel extents. A degenerate rectangle whose non-mask
+/// channels carry no payload (an empty gradient-fill layer with a 0 x -1
+/// rectangle, say) has no pixels to allocate and reads as zero-area rather
+/// than being rejected; Photoshop opens these files.
 fn layer_record_extents(record: &LayerRecord<'_>, version: Version) -> Result<(usize, usize)> {
     let rect = Rect::new(record.top, record.left, record.bottom, record.right);
     match read_rect_extents(rect, "layer", version) {
@@ -229,27 +274,27 @@ fn layer_record_extents(record: &LayerRecord<'_>, version: Version) -> Result<(u
     }
 }
 
+/// The extents of one channel of a layer record being read: mask channels by
+/// their mask record (`mask`, falling back to the record `bounds`), every
+/// other channel by the layer's `layer_extents`.
 fn channel_record_extents(
-    record: &LayerRecord<'_>,
+    mask: Option<&psd_core::LayerMaskData>,
+    bounds: Rect,
     key: ChannelKey,
     empty: bool,
     layer_extents: (usize, usize),
     version: Version,
 ) -> Result<(usize, usize)> {
     if key.is_mask() {
-        let bounds = Rect::new(record.top, record.left, record.bottom, record.right);
-        let rect = mask_channel_rect(record.mask_data.as_ref(), key).unwrap_or(bounds);
-        let kind = if key == ChannelKey::REAL_USER_MASK {
-            "real mask"
-        } else {
-            "mask"
-        };
-        mask_channel_extents(rect, kind, version, empty)
+        mask_channel_extents(mask, bounds, key, version, empty)
     } else {
         Ok(layer_extents)
     }
 }
 
+/// Charge one retained channel plane before calling its decoder. This adapts
+/// a remaining-budget model used by independent readers to planar typed
+/// channels.
 pub(crate) fn charge_decoded_bitmap(
     remaining: &mut Option<usize>,
     width: usize,
@@ -615,13 +660,10 @@ impl<T: BitDepth> LayeredFile<T> {
         options: ReadOptions,
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<Self> {
-        let phase_timing = std::env::var_os("PSD_PHASE_TIMING").is_some();
         let phase_start = std::time::Instant::now();
         let mut reader = BeReader::new(bytes);
         let file = PhotoshopFile::read_borrowed(&mut reader)?;
-        if phase_timing {
-            eprintln!("parse: {:.1}ms", phase_start.elapsed().as_secs_f64() * 1e3);
-        }
+        trace_read_phase("parse", phase_start);
         let stored_merged_image = if file.layer_and_mask_info.layer_info.layer_records.is_empty() {
             let start = reader.position();
             // LayerInfo cannot express a negative zero layer count. For a
@@ -707,7 +749,6 @@ impl<T: BitDepth> LayeredFile<T> {
             layers: Vec::new(),
             root_children: Vec::new(),
         };
-        let phase_timing = std::env::var_os("PSD_PHASE_TIMING").is_some();
         let phase_start = std::time::Instant::now();
         let mut remaining_bitmap_memory = options.total_memory_limit;
         document.build_layers(
@@ -718,20 +759,10 @@ impl<T: BitDepth> LayeredFile<T> {
             progress,
         )?;
         document.remaining_bitmap_memory = remaining_bitmap_memory;
-        if phase_timing {
-            eprintln!(
-                "build_layers: {:.1}ms",
-                phase_start.elapsed().as_secs_f64() * 1e3
-            );
-        }
+        trace_read_phase("build_layers", phase_start);
         let phase_start = std::time::Instant::now();
         document.text_cache = TextCacheBaseline::capture(&document);
-        if phase_timing {
-            eprintln!(
-                "text_cache: {:.1}ms",
-                phase_start.elapsed().as_secs_f64() * 1e3
-            );
-        }
+        trace_read_phase("text_cache", phase_start);
         Ok(document)
     }
 
@@ -778,7 +809,8 @@ impl<T: BitDepth> LayeredFile<T> {
                     continue;
                 }
                 let (width, height) = channel_record_extents(
-                    &record,
+                    record.mask_data.as_ref(),
+                    Rect::new(record.top, record.left, record.bottom, record.right),
                     key,
                     channel.data.is_empty(),
                     extents,
@@ -901,10 +933,6 @@ impl<T: BitDepth> LayeredFile<T> {
         }
         let mut channel_iter = channel_data.channels.into_iter();
         let layer_rect = Rect::new(record.top, record.left, record.bottom, record.right);
-        // A layer whose non-mask channels all carry no payload has no pixels
-        // to allocate, so a degenerate rectangle (an empty gradient-fill
-        // layer with a 0 x -1 rectangle, say) is read as zero-area rather
-        // than rejected. Photoshop opens these files.
         let is_group = matches!(
             divider,
             Some(SectionDivider::OpenFolder | SectionDivider::ClosedFolder)
@@ -916,18 +944,14 @@ impl<T: BitDepth> LayeredFile<T> {
                 if !keep(key) {
                     continue;
                 }
-                let (width, height) = if key.is_mask() {
-                    let rect =
-                        mask_channel_rect(record.mask_data.as_ref(), key).unwrap_or(layer_rect);
-                    let kind = if key == ChannelKey::REAL_USER_MASK {
-                        "real mask"
-                    } else {
-                        "mask"
-                    };
-                    mask_channel_extents(rect, kind, version, channel.data.is_empty())?
-                } else {
-                    layer_extents
-                };
+                let (width, height) = channel_record_extents(
+                    record.mask_data.as_ref(),
+                    layer_rect,
+                    key,
+                    channel.data.is_empty(),
+                    layer_extents,
+                    version,
+                )?;
                 if options.use_raw_data {
                     channels.insert_raw(
                         key,
@@ -2092,12 +2116,14 @@ impl<T: BitDepth> LayeredFile<T> {
                     let jobs = record
                         .channels
                         .iter()
-                        .map(|_| ChannelJob {
-                            source: ChannelSource::Stored(Compression::Raw, &[]),
-                            width: 0,
-                            height: 0,
-                            version: self.version,
-                            forced: None,
+                        .map(|_| {
+                            ChannelJob::new(
+                                ChannelSource::Stored(Compression::Raw, &[]),
+                                0,
+                                0,
+                                self.version,
+                                None,
+                            )
                         })
                         .collect();
                     (record, jobs)
@@ -2180,23 +2206,31 @@ impl<T: BitDepth> LayeredFile<T> {
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<Vec<u8>> {
         let (mut file, mut layers) = self.prepare_write()?;
-        let capacity = if T::DEPTH == 8 {
-            let mut known = Some(file.size_hint());
-            for layer in &mut layers {
-                for job in &mut layer.channels {
-                    let hint = job.prepare_byte_hint()?;
-                    known = known.zip(hint).and_then(|(sum, bytes)| {
-                        bytes.checked_add(2).and_then(|n| sum.checked_add(n))
-                    });
+        // Every payload length known up front (stored channels, and 8-bit
+        // planes whose Raw/RLE choice a scanline count settles) is summed.
+        // When all are known the buffer is reserved at the file's size.
+        // Deflate-coded payloads are only measured by encoding them, so the
+        // sum is then a lower bound the buffer grows past; the returned bytes
+        // are trimmed when growth left material slack. (A chunked buffer
+        // assembled at the end measured slower and with a higher commit peak
+        // than in-place growth, so growth stays with the allocator.)
+        let mut capacity = file.size_hint();
+        let mut exact = true;
+        for layer in &mut layers {
+            for job in &mut layer.channels {
+                match job.prepare_byte_hint()? {
+                    Some(bytes) => capacity = capacity.saturating_add(bytes.saturating_add(2)),
+                    None => exact = false,
                 }
             }
-            known.unwrap_or(0)
-        } else {
-            0
-        };
+        }
         let mut sink = std::io::Cursor::new(Vec::with_capacity(capacity));
         self.write_prepared(&mut file, layers, &mut sink, options, progress)?;
-        Ok(sink.into_inner())
+        let mut bytes = sink.into_inner();
+        if !exact && bytes.capacity() - bytes.len() > bytes.len() / 32 {
+            bytes.shrink_to_fit();
+        }
+        Ok(bytes)
     }
 
     fn write_prepared<W: std::io::Write + std::io::Seek>(
@@ -2292,13 +2326,8 @@ impl<T: BitDepth> LayeredFile<T> {
         // Metadata and geometry validation precede creation. Codec failures
         // discard the private temporary; the target is committed only on success.
         let (mut file, layers) = self.prepare_write()?;
-        let temporary = temporary_sibling(path)?;
-        // Exclusive creation leaves an existing temporary file untouched. If
-        // it fails, nothing created by this save needs cleanup.
-        let sink = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
+        // If creation fails, nothing made by this save needs cleanup.
+        let (temporary, sink) = create_temporary_sibling(path)?;
         let written = (|| -> Result<()> {
             let mut sink = std::io::BufWriter::with_capacity(1 << 20, sink);
             self.write_prepared(&mut file, layers, &mut sink, options, progress)?;
@@ -2549,9 +2578,10 @@ impl<T: BitDepth> LayeredFile<T> {
                 .checked_mul(height)
                 .and_then(|samples| samples.checked_mul(std::mem::size_of::<T>()))
                 .filter(|&bytes| bytes <= isize::MAX as usize)
-                .ok_or(PsdError::InvalidData {
-                    offset: 0,
-                    message: "synthesized channel byte count overflows",
+                .ok_or(PsdError::InvalidImageBounds {
+                    kind: "layer",
+                    width: i64::from(bounds.right) - i64::from(bounds.left),
+                    height: i64::from(bounds.bottom) - i64::from(bounds.top),
                 })?;
         }
         let mut channels = Vec::with_capacity(keys.len());
@@ -2571,12 +2601,13 @@ impl<T: BitDepth> LayeredFile<T> {
                 // Preserve the encoded payload until a caller decodes or
                 // replaces it.
                 let (width, height) = if key.is_mask() {
-                    let kind = if key == ChannelKey::REAL_USER_MASK {
-                        "real mask"
-                    } else {
-                        "mask"
-                    };
-                    mask_channel_extents(rect, kind, self.version, raw.payload.is_empty())?
+                    mask_channel_extents(
+                        layer.mask.as_ref(),
+                        bounds,
+                        key,
+                        self.version,
+                        raw.payload.is_empty(),
+                    )?
                 } else if stub_channels {
                     (0, 0)
                 } else {
@@ -2642,13 +2673,13 @@ impl<T: BitDepth> LayeredFile<T> {
                 index: key.index(),
                 size: 2,
             });
-            jobs.push(ChannelJob {
+            jobs.push(ChannelJob::new(
                 source,
-                width: rect.width().max(0) as usize,
-                height: rect.height().max(0) as usize,
-                version: self.version,
-                forced: layer.write_compression(key, self.compression),
-            });
+                rect.width().max(0) as usize,
+                rect.height().max(0) as usize,
+                self.version,
+                layer.write_compression(key, self.compression),
+            ));
         }
 
         // Pass-through is spelled one of two ways in the wild: `pass` on the
@@ -2739,6 +2770,40 @@ fn fraction_delta(pixels: i32, extent: u32) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leftover_temporaries_from_a_reused_process_id_do_not_block_saves() {
+        use std::sync::atomic::Ordering;
+        let directory =
+            std::env::temp_dir().join(format!("psd-temp-leftover-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("document.psd");
+        // A crashed process with this id left the next names behind.
+        let next = TEMPORARY_SEQUENCE.load(Ordering::Relaxed);
+        let leftovers: Vec<_> = (next..next + 64)
+            .map(|sequence| {
+                let leftover = directory.join(format!(
+                    ".document.psd.tmp-{}-{sequence}",
+                    std::process::id()
+                ));
+                std::fs::write(&leftover, b"stale").unwrap();
+                leftover
+            })
+            .collect();
+        let (temporary, file) = create_temporary_sibling(&path).unwrap();
+        drop(file);
+        assert!(!leftovers.contains(&temporary));
+        for leftover in &leftovers {
+            assert_eq!(std::fs::read(leftover).unwrap(), b"stale");
+        }
+        // A whole save succeeds beside them as well.
+        LayeredFile::<u8>::new(ColorMode::Rgb, 4, 4)
+            .unwrap()
+            .write(&path)
+            .unwrap();
+        assert!(path.is_file());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 
     #[test]
     fn synthesized_alpha_rejects_extreme_coordinates_before_allocation() {

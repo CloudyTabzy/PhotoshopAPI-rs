@@ -10,6 +10,12 @@ use psd_core::Result;
 
 const SCRATCH_BUDGET: usize = 128 * 1024 * 1024;
 const PARALLEL_MIN_BYTES: usize = 64 * 1024;
+/// Jobs in flight per pool thread, finished-but-unconsumed results included.
+/// More than one keeps threads busy behind a slow job at the head of the
+/// order; the workspace budget still bounds what they may hold.
+const WINDOW_PER_THREAD: usize = 4;
+/// How long a pool-worker coordinator blocks once no queued work is runnable.
+const IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
 
 pub(crate) fn for_each_ordered<J: Send, O: Send>(
     jobs: Vec<(J, usize)>,
@@ -20,7 +26,9 @@ pub(crate) fn for_each_ordered<J: Send, O: Send>(
 }
 
 /// Credits remain reserved until an output has been consumed, so completed
-/// results cannot accumulate behind a slow earlier job without a bound.
+/// results cannot accumulate behind a slow earlier job without a bound. At
+/// most [`WINDOW_PER_THREAD`] jobs per pool thread are in flight; a job whose
+/// cost alone exceeds `budget` runs when nothing else is outstanding.
 pub(crate) fn for_each_ordered_with_budget<J: Send, O: Send>(
     jobs: Vec<(J, usize)>,
     budget: usize,
@@ -40,7 +48,7 @@ pub(crate) fn for_each_ordered_with_budget<J: Send, O: Send>(
         }
         return Ok(());
     }
-    let threads = rayon::current_num_threads();
+    let window = rayon::current_num_threads().saturating_mul(WINDOW_PER_THREAD);
     let compute = &compute;
     let cancel = AtomicBool::new(false);
     rayon::in_place_scope(|scope| {
@@ -59,7 +67,7 @@ pub(crate) fn for_each_ordered_with_budget<J: Send, O: Send>(
         let mut completed = BTreeMap::new();
         loop {
             while let Some((_, (_, cost))) = jobs.peek() {
-                if outstanding >= threads
+                if outstanding >= window
                     || (outstanding > 0 && reserved.saturating_add(*cost) > budget)
                 {
                     break;
@@ -85,12 +93,24 @@ pub(crate) fn for_each_ordered_with_budget<J: Send, O: Send>(
             }
             while !completed.contains_key(&next) {
                 let result = if rayon::current_thread_index().is_some() {
+                    // A pool worker must keep running queued work (its own
+                    // spawned jobs may sit in its deque). When nothing is
+                    // runnable here, other workers hold the outstanding jobs,
+                    // so wait briefly instead of spinning a core.
                     loop {
                         match receiver.try_recv() {
                             Ok(result) => break result,
                             Err(mpsc::TryRecvError::Empty) => {
-                                rayon::yield_now();
-                                std::thread::yield_now();
+                                if rayon::yield_now() == Some(rayon::Yield::Executed) {
+                                    continue;
+                                }
+                                match receiver.recv_timeout(IDLE_WAIT) {
+                                    Ok(result) => break result,
+                                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                        panic!("codec result channel disconnected")
+                                    }
+                                }
                             }
                             Err(mpsc::TryRecvError::Disconnected) => {
                                 panic!("codec result channel disconnected")
@@ -161,6 +181,48 @@ mod tests {
             .unwrap();
         });
         assert_eq!(order, [0, 1, 2]);
+    }
+
+    #[test]
+    fn a_slow_head_job_does_not_idle_the_other_threads() {
+        // Two threads: job 0 holds its thread until job 3 has run. With one
+        // slot per thread, job 3 could not start before job 0 was consumed.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut order = Vec::new();
+        // `install` runs the coordinator on a pool worker, so the window is
+        // sized from this two-thread pool, not the global one.
+        pool.install(|| {
+            for_each_ordered_with_budget(
+                (0..6).map(|index| (index, 65536)).collect(),
+                usize::MAX,
+                |index| {
+                    let (lock, ready) = &*gate;
+                    if index == 0 {
+                        let guard = lock.lock().unwrap();
+                        let (guard, _) = ready
+                            .wait_timeout_while(guard, std::time::Duration::from_secs(5), |ready| {
+                                !*ready
+                            })
+                            .unwrap();
+                        assert!(*guard, "job 3 must run while job 0 is still pending");
+                    } else if index == 3 {
+                        *lock.lock().unwrap() = true;
+                        ready.notify_all();
+                    }
+                    Ok(index)
+                },
+                |index| {
+                    order.push(index);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+        assert_eq!(order, [0, 1, 2, 3, 4, 5]);
     }
 
     #[test]

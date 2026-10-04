@@ -190,28 +190,51 @@ impl<T> ChannelStore<T> {
     }
 }
 
+/// Decode one retained raw channel. `Ok(None)` marks a real-user-mask (`-3`)
+/// record that does not decode: older Photoshop files carry marker-only or
+/// undersized `-3` records whose payload Photoshop ignores, and an eager read
+/// keeps exactly those raw. A later lazy decode must accept the same document
+/// rather than fail on it every time; the record round-trips unchanged.
+fn decode_retained<T: BitDepth>(
+    key: ChannelKey,
+    raw: &RawChannelData,
+    source_depth: u16,
+) -> Result<Option<Vec<T>>> {
+    match decompress_channel::<T>(
+        raw.compression,
+        &raw.payload,
+        raw.width,
+        raw.height,
+        raw.version,
+        source_depth,
+    ) {
+        Ok(samples) => Ok(Some(samples)),
+        Err(error) if key == ChannelKey::REAL_USER_MASK => {
+            tracing::debug!("real user mask did not decode ({error}); keeping its record raw");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl<T: BitDepth> ChannelStore<T> {
     /// Decode independent entries, releasing each successful payload immediately.
     /// Failed entries remain raw; the spent budget and first error are reported.
+    /// A real-user-mask record that does not decode stays raw without an error
+    /// (see [`decode_retained`]).
     pub(crate) fn decode_raw_in_place(&mut self, source_depth: u16) -> (usize, Option<PsdError>) {
         let mut spent = 0usize;
         let mut first_error = None;
-        for entry in self.channels.values_mut() {
+        for (&key, entry) in self.channels.iter_mut() {
             let ChannelEntry::Raw(raw) = entry else {
                 continue;
             };
-            match decompress_channel::<T>(
-                raw.compression,
-                &raw.payload,
-                raw.width,
-                raw.height,
-                raw.version,
-                source_depth,
-            ) {
-                Ok(samples) => {
+            match decode_retained::<T>(key, raw, source_depth) {
+                Ok(Some(samples)) => {
                     spent += samples.len() * T::SIZE;
                     *entry = ChannelEntry::Decoded(samples);
                 }
+                Ok(None) => {}
                 Err(error) => {
                     if first_error.is_none() {
                         first_error = Some(error);
@@ -223,7 +246,8 @@ impl<T: BitDepth> ChannelStore<T> {
     }
 
     /// Stage raw channel decodes without changing the store. Reserving the
-    /// full layer budget first keeps a failed decode atomic.
+    /// full layer budget first keeps a failed decode atomic; the reservation
+    /// of a real-user-mask record that stays raw is returned afterwards.
     pub(crate) fn decode_raw(
         &self,
         source_depth: u16,
@@ -236,26 +260,21 @@ impl<T: BitDepth> ChannelStore<T> {
             jobs.push(((key, raw), scratch));
         }
         let mut decoded = Vec::with_capacity(jobs.len());
+        let mut refund = 0usize;
         crate::parallel::for_each_ordered(
             jobs,
-            |(key, raw)| {
-                Ok((
-                    key,
-                    decompress_channel::<T>(
-                        raw.compression,
-                        &raw.payload,
-                        raw.width,
-                        raw.height,
-                        raw.version,
-                        source_depth,
-                    )?,
-                ))
-            },
-            |channel| {
-                decoded.push(channel);
+            |(key, raw)| Ok((key, raw, decode_retained::<T>(key, raw, source_depth)?)),
+            |(key, raw, samples)| {
+                match samples {
+                    Some(samples) => decoded.push((key, samples)),
+                    None => refund += raw.width * raw.height * T::SIZE,
+                }
                 Ok(())
             },
         )?;
+        if let Some(remaining) = remaining {
+            *remaining += refund;
+        }
         Ok(decoded)
     }
 
@@ -467,8 +486,9 @@ pub(crate) fn decompress_merged_channel<T: BitDepth>(
 /// Compress typed samples into `(codec, payload)` for one channel.
 ///
 /// Codec choice mirrors Photoshop/upstream: 16/32-bit always
-/// use ZIP prediction (32-bit never plain ZIP), small 8-bit planes use RLE
-/// when it beats the raw size and large planes sample its benefit first.
+/// use ZIP prediction (32-bit never plain ZIP), and 8-bit uses RLE when its
+/// exact packed size, counted over every scanline, beats the raw size and
+/// every row fits its size-table entry; otherwise the plane is stored raw.
 /// An explicit override wins (except that 32-bit ZIP is
 /// upgraded to ZIP prediction, as Photoshop insists).
 pub fn compress_channel<T: BitDepth>(
@@ -485,11 +505,22 @@ pub fn compress_channel<T: BitDepth>(
         version,
         forced,
         psd_codecs::zip::CompressionPolicy::Balanced,
+        None,
     )?;
     Ok((codec, bytes.into_owned()))
 }
 
+/// Whether automatic selection stores a plane raw instead of as RLE: PackBits
+/// is not smaller, or a row outgrows its PSD/PSB size-table entry (which only
+/// raw storage can hold).
+pub(crate) fn rle_loses(counts: &rle::ScanlineCounts, raw_len: usize) -> bool {
+    !counts.fits_table() || counts.encoded_len() >= raw_len
+}
+
 /// Encode without copying native byte samples merely to write them out.
+/// `rle_counts`, when given, are [`rle::count_scanlines`] of these samples'
+/// big-endian bytes, measured earlier (to reserve output); they are reused
+/// rather than counted again.
 pub(crate) fn encode_channel<'a, T: BitDepth>(
     data: &'a [T],
     width: usize,
@@ -497,6 +528,7 @@ pub(crate) fn encode_channel<'a, T: BitDepth>(
     version: Version,
     forced: Option<Compression>,
     policy: psd_codecs::zip::CompressionPolicy,
+    rle_counts: Option<rle::ScanlineCounts>,
 ) -> Result<(Compression, std::borrow::Cow<'a, [u8]>)> {
     // Validate extents first: a non-empty shape with an empty channel must be
     // a typed write-time error, not a corrupt file (Photoshop reads a bare Raw
@@ -528,22 +560,20 @@ pub(crate) fn encode_channel<'a, T: BitDepth>(
             // the channel turns out not to compress and is stored raw.
             let raw = be_bytes(data);
             let size_width = if version == Version::Psd { 2 } else { 4 };
-            // Count every row before choosing Raw. Dispersed samples cannot
-            // reliably represent heterogeneous planes.
-            if forced.is_none() && T::DEPTH == 8 && raw.len() >= 1024 * 1024 {
-                let encoded =
-                    rle::encoded_scanlines_len(&raw, width, size_width).map_err(codec_error)?;
-                if encoded >= raw.len() {
-                    return Ok((Compression::Raw, raw));
+            // Every row is counted before anything is packed: the counts
+            // decide Raw against RLE exactly (sampled rows cannot represent
+            // heterogeneous planes) and size the one output buffer.
+            let counts = match rle_counts {
+                Some(counts) => counts,
+                None => {
+                    rle::count_scanlines(&raw, width * T::SIZE, size_width).map_err(codec_error)?
                 }
+            };
+            if forced.is_none() && rle_loses(&counts, raw.len()) {
+                return Ok((Compression::Raw, raw));
             }
-            let packed =
-                rle::compress_scanlines(&raw, width * T::SIZE, size_width).map_err(codec_error)?;
-            if forced.is_none() && packed.len() >= raw.len() {
-                Ok((Compression::Raw, raw))
-            } else {
-                Ok((Compression::Rle, packed.into()))
-            }
+            let packed = rle::compress_counted_scanlines(&raw, &counts).map_err(codec_error)?;
+            Ok((Compression::Rle, packed.into()))
         }
         Compression::Zip => Ok((
             Compression::Zip,
@@ -585,6 +615,51 @@ mod tests {
             decompress_channel::<u8>(codec, &bytes, width, height, Version::Psd, 8).unwrap(),
             data
         );
+    }
+
+    #[test]
+    fn a_real_user_mask_that_stays_raw_returns_its_budget_reservation() {
+        let mut store = ChannelStore::<u8>::new();
+        let raw =
+            |payload: Vec<u8>| RawChannelData::new(Compression::Raw, payload, 2, 2, Version::Psd);
+        store.insert_raw(ChannelKey::ALPHA, raw(vec![1, 2, 3, 4]));
+        store.insert_raw(ChannelKey::REAL_USER_MASK, raw(vec![9]));
+        // Both planes are reserved up front; the undecodable `-3` one is refunded.
+        let mut remaining = Some(8);
+        let decoded = store.decode_raw(8, &mut remaining).unwrap();
+        assert_eq!(decoded, [(ChannelKey::ALPHA, vec![1, 2, 3, 4])]);
+        assert_eq!(remaining, Some(4));
+        // Bulk decoding charges only what it decoded and reports no error.
+        let (spent, error) = store.decode_raw_in_place(8);
+        assert_eq!((spent, error.is_none()), (4, true));
+        assert!(store.is_raw(ChannelKey::REAL_USER_MASK));
+        // Any other channel that does not decode is still an error.
+        store.insert_raw(ChannelKey::color(0), raw(vec![9]));
+        assert!(store.decode_raw(8, &mut None).is_err());
+        assert!(store.decode_raw_in_place(8).1.is_some());
+    }
+
+    #[test]
+    fn automatic_rle_stores_raw_when_a_row_outgrows_the_psd_size_table() {
+        // A 70,000-pixel row packs smaller than raw yet longer than a 2-byte
+        // PSD size entry can declare: only raw storage can hold it.
+        let width = 70_000;
+        let mut state = 0x1234_5678u32;
+        let mut data: Vec<u8> = (0..66_000)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state >> 24) as u8
+            })
+            .collect();
+        data.resize(width, 0);
+        let (codec, bytes) = compress_channel(&data, width, 1, Version::Psd, None).unwrap();
+        assert_eq!(codec, Compression::Raw);
+        assert_eq!(bytes, data);
+        // PSB's 4-byte entries hold it, and an explicit RLE request on PSD
+        // still reports the overflow.
+        let (codec, _) = compress_channel(&data, width, 1, Version::Psb, None).unwrap();
+        assert_eq!(codec, Compression::Rle);
+        assert!(compress_channel(&data, width, 1, Version::Psd, Some(Compression::Rle)).is_err());
     }
 
     #[test]

@@ -390,6 +390,8 @@ fn policies_and_workspace_limits_preserve_pixels_and_streamed_layouts() {
                 .to_bytes_with_options(options.with_working_memory_limit(512 * 1024))
                 .unwrap();
             assert_eq!(sequential, bounded);
+            // Growth slack beyond a small margin is trimmed from the result.
+            assert!(bounded.capacity() - bounded.len() <= bounded.len() / 32);
             let staged = document.to_photoshop_file_with_options(options).unwrap();
             let mut buffered = psd::core::BeWriter::new();
             staged.write(&mut buffered).unwrap();
@@ -452,4 +454,70 @@ fn a_late_codec_failure_keeps_the_target_and_removes_the_private_temporary() {
     assert_eq!(std::fs::read(&path).unwrap(), b"original target");
     assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn seekable_writer_backpatches_channel_lengths_with_a_constant_number_of_seeks() {
+    use std::io::{Cursor, Seek, SeekFrom, Write};
+    struct CountingSink {
+        inner: Cursor<Vec<u8>>,
+        seeks: usize,
+    }
+    impl Write for CountingSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Seek for CountingSink {
+        fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+            self.seeks += 1;
+            self.inner.seek(from)
+        }
+    }
+
+    for layers in [1, 200] {
+        let document = synthetic::<u8>(4, layers);
+        let staged = document.to_photoshop_file().unwrap();
+        let mut buffered = BeWriter::new();
+        staged.write(&mut buffered).unwrap();
+        let payloads: Vec<Vec<(u16, Vec<u8>)>> = staged
+            .layer_and_mask_info
+            .layer_info
+            .channel_image_data
+            .iter()
+            .map(|layer| {
+                layer
+                    .channels
+                    .iter()
+                    .map(|channel| (channel.compression.as_raw(), channel.data.to_vec()))
+                    .collect()
+            })
+            .collect();
+        let mut file = document.to_photoshop_file().unwrap();
+        let mut sink = CountingSink {
+            inner: Cursor::new(Vec::new()),
+            seeks: 0,
+        };
+        file.write_seekable(&mut sink, |sink| {
+            let mut sizes = Vec::new();
+            for layer in &payloads {
+                let mut layer_sizes = Vec::new();
+                for (marker, data) in layer {
+                    sink.write_all(&marker.to_be_bytes())?;
+                    sink.write_all(data)?;
+                    layer_sizes.push(data.len() as u64 + 2);
+                }
+                sizes.push(layer_sizes);
+            }
+            Ok(sizes)
+        })
+        .unwrap();
+        assert_eq!(sink.inner.into_inner(), buffered.into_inner());
+        // Position query plus two section lengths and one record block, each
+        // a seek out and back: independent of the layer count.
+        assert!(sink.seeks <= 8, "{layers} layers took {} seeks", sink.seeks);
+    }
 }

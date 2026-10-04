@@ -121,6 +121,69 @@ fn bulk_decode_retains_failed_channels_and_charges_only_successful_samples() {
     }
 }
 
+#[test]
+fn undecodable_real_user_masks_stay_raw_through_every_decode_path() {
+    // One 8x8 layer plus a marker-only `-3` record, the shape older Photoshop
+    // files carry: the eager read keeps it raw, so later decodes must too.
+    let bytes = document_bytes_with_compressions(Version::Psd);
+    let mut source = PhotoshopFile::read(&mut BeReader::new(&bytes)).unwrap();
+    let info = &mut source.layer_and_mask_info.layer_info;
+    info.layer_records.truncate(1);
+    info.channel_image_data.truncate(1);
+    info.layer_records[0].channels.push(psd::core::ChannelInfo {
+        id: psd::core::ChannelId::from_index(-3, ColorMode::Rgb),
+        index: -3,
+        size: 3,
+    });
+    info.channel_image_data[0]
+        .channels
+        .push(psd::core::ChannelData {
+            compression: Compression::Raw,
+            data: vec![7].into(),
+        });
+    let mut writer = BeWriter::new();
+    source.write(&mut writer).unwrap();
+    let input = writer.into_inner();
+
+    let mut eager = LayeredFile::<u8>::from_bytes(&input).unwrap();
+    let id = eager.flatten()[0];
+    assert!(eager
+        .layer(id)
+        .unwrap()
+        .channels()
+        .unwrap()
+        .is_raw(ChannelKey::REAL_USER_MASK));
+    eager.decode_layer_pixels(id).unwrap();
+    eager.decode_all_layer_pixels().unwrap();
+
+    // A per-layer decode reserves every plane up front (atomicity), the `-3`
+    // one included, then decodes the rest and leaves `-3` raw.
+    let mut lazy = LayeredFile::<u8>::from_bytes_with_options(
+        &input,
+        ReadOptions {
+            use_raw_data: true,
+            total_memory_limit: Some(3 * 64),
+        },
+    )
+    .unwrap();
+    lazy.decode_layer_pixels(id).unwrap();
+    let channels = lazy.layer(id).unwrap().channels().unwrap();
+    assert!(channels.is_raw(ChannelKey::REAL_USER_MASK));
+    assert_eq!(channels.get(ChannelKey::ALPHA).unwrap(), [255; 64]);
+    let mut bulk = LayeredFile::<u8>::from_bytes_with_options(
+        &input,
+        ReadOptions::unlimited().with_raw_data(true),
+    )
+    .unwrap();
+    bulk.decode_all_layer_pixels().unwrap();
+    bulk.decode_all_layer_pixels().unwrap();
+    // The record round-trips byte for byte.
+    for document in [&eager, &bulk] {
+        let payloads = channel_payloads(&document.to_bytes().unwrap());
+        assert!(payloads[0].contains(&(Compression::Raw, vec![7])));
+    }
+}
+
 fn document_bytes_with_compressions(version: Version) -> Vec<u8> {
     let codecs = [
         Compression::Raw,

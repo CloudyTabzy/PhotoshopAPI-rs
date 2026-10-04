@@ -153,43 +153,107 @@ pub fn encoded_scanlines_len(
     scanline_bytes: usize,
     size_width: usize,
 ) -> Result<usize> {
-    if scanline_bytes == 0
-        || !data.len().is_multiple_of(scanline_bytes)
-        || !matches!(size_width, 2 | 4)
-    {
-        return Err(CodecError::InvalidInput("invalid scanline geometry"));
+    Ok(count_scanlines(data, scanline_bytes, size_width)?.encoded_len())
+}
+
+/// The packed length of every scanline of one channel, measured once.
+///
+/// The counts size the scanline table and the packet bytes exactly, so a
+/// caller can decide between Raw and RLE without a compressed buffer, and
+/// [`compress_counted_scanlines`] then writes every row straight into its
+/// final position: one output allocation, no per-block staging or copy.
+#[derive(Debug, Clone)]
+pub struct ScanlineCounts {
+    sizes: Vec<usize>,
+    data_len: usize,
+    scanline_bytes: usize,
+    size_width: usize,
+    encoded_len: usize,
+}
+
+impl ScanlineCounts {
+    /// Bytes of the encoded channel: the size table plus every packed row.
+    pub fn encoded_len(&self) -> usize {
+        self.encoded_len
     }
-    let table = (data.len() / scanline_bytes)
-        .checked_mul(size_width)
-        .ok_or(CodecError::InvalidInput("scanline table length overflows"))?;
-    let packets = if data.len() >= PARALLEL_MIN_BYTES {
+
+    /// Whether every packed row fits a size-table entry (2 bytes for PSD,
+    /// 4 for PSB). A row that does not can only be stored raw.
+    pub fn fits_table(&self) -> bool {
+        self.oversized_row().is_none()
+    }
+
+    fn oversized_row(&self) -> Option<usize> {
+        let limit = table_entry_limit(self.size_width);
+        self.sizes.iter().copied().find(|&size| size > limit)
+    }
+}
+
+fn table_entry_limit(size_width: usize) -> usize {
+    if size_width == 2 {
+        u16::MAX as usize
+    } else {
+        u32::MAX as usize
+    }
+}
+
+fn check_scanline_geometry(
+    data_len: usize,
+    scanline_bytes: usize,
+    size_width: usize,
+) -> Result<()> {
+    if scanline_bytes == 0 {
+        return Err(CodecError::InvalidInput("scanline length must be non-zero"));
+    }
+    if size_width != 2 && size_width != 4 {
+        return Err(CodecError::InvalidInput(
+            "scanline size width must be 2 (PSD) or 4 (PSB)",
+        ));
+    }
+    if !data_len.is_multiple_of(scanline_bytes) {
+        return Err(CodecError::InvalidInput(
+            "channel data does not divide evenly into scanlines",
+        ));
+    }
+    Ok(())
+}
+
+/// Measure every scanline's PackBits length; large channels count rows in
+/// parallel. Rows too long for a size-table entry are reported by
+/// [`ScanlineCounts::fits_table`], not rejected, so an automatic codec choice
+/// can still store such a channel raw.
+pub fn count_scanlines(
+    data: &[u8],
+    scanline_bytes: usize,
+    size_width: usize,
+) -> Result<ScanlineCounts> {
+    check_scanline_geometry(data.len(), scanline_bytes, size_width)?;
+    let sizes: Vec<usize> = if data.len() >= PARALLEL_MIN_BYTES {
         data.par_chunks(scanline_bytes)
             .map(pack_bits_encoded_len)
-            .try_fold(
-                || 0usize,
-                |a, b| {
-                    a.checked_add(b)
-                        .ok_or(CodecError::InvalidInput("compressed length overflows"))
-                },
-            )
-            .try_reduce(
-                || 0,
-                |a, b| {
-                    a.checked_add(b)
-                        .ok_or(CodecError::InvalidInput("compressed length overflows"))
-                },
-            )
+            .collect()
     } else {
         data.chunks(scanline_bytes)
             .map(pack_bits_encoded_len)
-            .try_fold(0usize, |a, b| {
-                a.checked_add(b)
-                    .ok_or(CodecError::InvalidInput("compressed length overflows"))
-            })
-    }?;
-    table
-        .checked_add(packets)
-        .ok_or(CodecError::InvalidInput("compressed length overflows"))
+            .collect()
+    };
+    let overflow = || CodecError::InvalidInput("compressed length overflows");
+    let packets = sizes
+        .iter()
+        .try_fold(0usize, |sum, &size| sum.checked_add(size))
+        .ok_or_else(overflow)?;
+    let encoded_len = sizes
+        .len()
+        .checked_mul(size_width)
+        .and_then(|table| table.checked_add(packets))
+        .ok_or_else(overflow)?;
+    Ok(ScanlineCounts {
+        sizes,
+        data_len: data.len(),
+        scanline_bytes,
+        size_width,
+        encoded_len,
+    })
 }
 
 /// Run packet: header `257 - len`, then the repeated byte.
@@ -206,6 +270,47 @@ fn write_literal(out: &mut Vec<u8>, bytes: &[u8]) {
     debug_assert!((1..=MAX_PACKET_LEN).contains(&bytes.len()));
     out.push(bytes.len() as u8 - 1);
     out.extend_from_slice(bytes);
+}
+
+/// Pack one scanline into `out`, which must be exactly its counted length
+/// (padding included). The packets are the ones [`pack_bits_compress_into`]
+/// emits; a length mismatch means the counts describe other data.
+fn pack_bits_write(data: &[u8], out: &mut [u8]) -> Result<()> {
+    let mut cursor = 0usize;
+    let mut fits = true;
+    visit_packets(data, |packet| {
+        let need = match packet {
+            Packet::Literal(bytes) => bytes.len() + 1,
+            Packet::Run { .. } => 2,
+        };
+        let Some(dest) = out.get_mut(cursor..cursor + need).filter(|_| fits) else {
+            fits = false;
+            return;
+        };
+        match packet {
+            Packet::Literal(bytes) => {
+                dest[0] = bytes.len() as u8 - 1;
+                dest[1..].copy_from_slice(bytes);
+            }
+            Packet::Run { len, byte } => {
+                dest[0] = (257 - len) as u8;
+                dest[1] = byte;
+            }
+        }
+        cursor += need;
+    });
+    if fits && cursor % 2 == 1 {
+        if let Some(pad) = out.get_mut(cursor) {
+            *pad = 128;
+            cursor += 1;
+        }
+    }
+    if !fits || cursor != out.len() {
+        return Err(CodecError::InvalidInput(
+            "scanline counts do not describe this data",
+        ));
+    }
+    Ok(())
 }
 
 /// Decompress exactly `out_len` bytes from a PackBits stream.
@@ -348,71 +453,69 @@ pub fn compress_scanlines(
     scanline_bytes: usize,
     size_width: usize,
 ) -> Result<Vec<u8>> {
-    if scanline_bytes == 0 {
-        return Err(CodecError::InvalidInput("scanline length must be non-zero"));
-    }
-    if size_width != 2 && size_width != 4 {
-        return Err(CodecError::InvalidInput(
-            "scanline size width must be 2 (PSD) or 4 (PSB)",
-        ));
-    }
-    if !data.len().is_multiple_of(scanline_bytes) {
-        return Err(CodecError::InvalidInput(
-            "channel data does not divide evenly into scanlines",
-        ));
-    }
-
-    let rows = data.len() / scanline_bytes;
-
-    // Rows are packed a block at a time: one byte buffer and one size list per
-    // block instead of a `Vec` per scanline (a large 8-bit document has
-    // hundreds of thousands of rows, each of which used to allocate and grow
-    // its own buffer). Blocks are independent and rayon's collect preserves
-    // their order, so the table-first layout is unchanged.
-    let block_rows = block_rows(rows, scanline_bytes, data.len() >= PARALLEL_MIN_BYTES);
-    let block_bytes = block_rows * scanline_bytes;
-    let pack_block = |block: &[u8]| -> PackedBlock {
-        let mut bytes = Vec::new();
-        let mut sizes = Vec::with_capacity(block.len() / scanline_bytes);
-        for row in block.chunks(scanline_bytes) {
-            sizes.push(pack_bits_compress_into(row, &mut bytes));
-        }
-        PackedBlock { bytes, sizes }
-    };
-    let blocks: Vec<PackedBlock> = if data.len() >= PARALLEL_MIN_BYTES {
-        data.par_chunks(block_bytes).map(pack_block).collect()
-    } else {
-        data.chunks(block_bytes).map(pack_block).collect()
-    };
-
-    let packed_len: usize = blocks.iter().map(|b| b.bytes.len()).sum();
-    let mut out = Vec::with_capacity(rows * size_width + packed_len);
-    for size in blocks.iter().flat_map(|b| &b.sizes) {
-        if size_width == 2 {
-            let size = u16::try_from(*size).map_err(|_| CodecError::OutputLength {
-                expected: u16::MAX as usize,
-                actual: *size,
-            })?;
-            out.extend_from_slice(&size.to_be_bytes());
-        } else {
-            let size = u32::try_from(*size).map_err(|_| CodecError::OutputLength {
-                expected: u32::MAX as usize,
-                actual: *size,
-            })?;
-            out.extend_from_slice(&size.to_be_bytes());
-        }
-    }
-    for block in &blocks {
-        out.extend_from_slice(&block.bytes);
-    }
-    Ok(out)
+    compress_counted_scanlines(data, &count_scanlines(data, scanline_bytes, size_width)?)
 }
 
-/// The packed rows of one block of scanlines: their bytes back to back, and
-/// each row's packed length.
-struct PackedBlock {
-    bytes: Vec<u8>,
-    sizes: Vec<usize>,
+/// [`compress_scanlines`] with the row lengths already measured by
+/// [`count_scanlines`] over the same `data`.
+///
+/// The output is allocated once at its exact length: the size table is
+/// written from the counts, then blocks of rows pack (in parallel for large
+/// channels) directly into disjoint ranges of that buffer. A row too long for
+/// its size-table entry is an [`CodecError::OutputLength`] error; counts that
+/// do not describe `data` are an [`CodecError::InvalidInput`] error.
+pub fn compress_counted_scanlines(data: &[u8], counts: &ScanlineCounts) -> Result<Vec<u8>> {
+    let scanline_bytes = counts.scanline_bytes;
+    let size_width = counts.size_width;
+    if data.len() != counts.data_len {
+        return Err(CodecError::InvalidInput(
+            "scanline counts do not describe this data",
+        ));
+    }
+    if let Some(size) = counts.oversized_row() {
+        return Err(CodecError::OutputLength {
+            expected: table_entry_limit(size_width),
+            actual: size,
+        });
+    }
+    let rows = counts.sizes.len();
+    let mut out = vec![0u8; counts.encoded_len];
+    let (table, mut packets) = out.split_at_mut(rows * size_width);
+    for (entry, &size) in table.chunks_exact_mut(size_width).zip(&counts.sizes) {
+        if size_width == 2 {
+            entry.copy_from_slice(&(size as u16).to_be_bytes());
+        } else {
+            entry.copy_from_slice(&(size as u32).to_be_bytes());
+        }
+    }
+
+    // Blocks keep rayon's task count proportional to threads rather than to
+    // rows (a large 8-bit document has hundreds of thousands of scanlines).
+    let parallel = data.len() >= PARALLEL_MIN_BYTES;
+    let block_rows = block_rows(rows, scanline_bytes, parallel);
+    let mut blocks = Vec::with_capacity(rows.div_ceil(block_rows));
+    for (input, sizes) in data
+        .chunks(block_rows * scanline_bytes)
+        .zip(counts.sizes.chunks(block_rows))
+    {
+        let (block, rest) = std::mem::take(&mut packets).split_at_mut(sizes.iter().sum());
+        packets = rest;
+        blocks.push((input, sizes, block));
+    }
+    let pack_block = |(input, sizes, block): (&[u8], &[usize], &mut [u8])| -> Result<()> {
+        let mut offset = 0;
+        for (row, &size) in input.chunks(scanline_bytes).zip(sizes) {
+            pack_bits_write(row, &mut block[offset..offset + size])?;
+            offset += size;
+        }
+        Ok(())
+    };
+    if parallel {
+        blocks.into_par_iter().try_for_each(pack_block)?;
+    } else {
+        blocks.into_iter().try_for_each(pack_block)?;
+    }
+    Ok(out)
 }
 
 /// Rows per compression block. Sequential compression is one block. Parallel
@@ -917,5 +1020,45 @@ mod block_tests {
             Err(CodecError::OutputLength { .. })
         ));
         assert!(compress_scanlines(&noisy, 70_000, 4).is_ok());
+        // Counting never rejects the row; it reports that only Raw can hold it.
+        let counts = count_scanlines(&noisy, 70_000, 2).unwrap();
+        assert!(!counts.fits_table());
+        assert!(count_scanlines(&noisy, 70_000, 4).unwrap().fits_table());
+    }
+
+    #[test]
+    fn counted_encode_writes_the_reference_layout_in_one_exact_buffer() {
+        // Sequential and parallel sizes, both table widths, odd row lengths.
+        for (width, height) in [(1, 1), (3, 7), (129, 33), (1000, 300), (4097, 40)] {
+            let data = image(width, height);
+            for size_width in [2, 4] {
+                let counts = count_scanlines(&data, width, size_width).unwrap();
+                let packed = compress_counted_scanlines(&data, &counts).unwrap();
+                assert_eq!(packed, reference(&data, width, size_width));
+                assert_eq!(packed.len(), counts.encoded_len());
+                assert_eq!(packed.capacity(), packed.len());
+                assert_eq!(
+                    encoded_scanlines_len(&data, width, size_width).unwrap(),
+                    packed.len()
+                );
+            }
+        }
+        assert!(compress_scanlines(&[], 4, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn counts_from_other_data_are_rejected_instead_of_misplacing_rows() {
+        let data = image(300, 12);
+        let counts = count_scanlines(&data, 300, 2).unwrap();
+        // Same length, different content: row lengths no longer match.
+        let other = vec![9u8; data.len()];
+        assert!(matches!(
+            compress_counted_scanlines(&other, &counts),
+            Err(CodecError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            compress_counted_scanlines(&data[..300], &counts),
+            Err(CodecError::InvalidInput(_))
+        ));
     }
 }

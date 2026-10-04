@@ -40,6 +40,9 @@ pub enum CompressionPolicy {
     #[default]
     Balanced,
     /// Always use default level-4 LZ77/deflate; avoid sampling decisions.
+    /// On noisy 16/32-bit prediction data this costs the full LZ77 search for
+    /// little gain: on one large 16-bit benchmark it was about three times
+    /// slower than `Balanced` for output about 1.5% smaller.
     Compact,
     /// Use sampled strategy selection without the full-input redundancy guard.
     Fast,
@@ -147,10 +150,16 @@ mod zlib_compress {
         }
     }
 
+    /// First reservation for a large stream that no sample can size. The
+    /// output grows past it as needed; reserving `compress_bound` instead
+    /// would commit a whole plane for a constant one that packs to kilobytes.
+    const UNSAMPLED_CAPACITY: usize = 64 * 1024;
+
     // Noisy prediction data has few useful matches. Compare three small,
     // separated windows before paying for a full LZ77 search. Huffman-only
     // is selected only when its estimated size is within 2% of the default
     // and the default cannot halve the input. Smooth channels retain LZ77.
+    // `Compact` never changes strategy; its sample only sizes the output.
     fn strategy(
         data: &[u8],
         total_len: usize,
@@ -158,8 +167,12 @@ mod zlib_compress {
     ) -> Result<(zlib_rs::Strategy, usize)> {
         use zlib_rs::Strategy;
         const SAMPLE: usize = 16 * 1024;
-        if policy == CompressionPolicy::Compact || total_len < 1024 * 1024 {
+        if total_len < 1024 * 1024 {
             return Ok((Strategy::Default, zlib_rs::compress_bound(total_len)));
+        }
+        if data.len() < SAMPLE {
+            let capacity = UNSAMPLED_CAPACITY.min(zlib_rs::compress_bound(total_len));
+            return Ok((Strategy::Default, capacity));
         }
         let mut output = vec![0; zlib_rs::compress_bound(SAMPLE)];
         let starts = [0, (data.len() - SAMPLE) / 2, data.len() - SAMPLE];
@@ -187,7 +200,7 @@ mod zlib_compress {
                 }
                 sizes[index] += written.len();
             }
-            if index == 0 && sizes[0] < 3 * SAMPLE / 2 {
+            if index == 0 && (policy == CompressionPolicy::Compact || sizes[0] < 3 * SAMPLE / 2) {
                 return Ok((Strategy::Default, capacity(sizes[0])));
             }
         }
@@ -203,7 +216,13 @@ mod zlib_compress {
     }
 
     pub(super) fn compress_with_policy(data: &[u8], policy: CompressionPolicy) -> Result<Vec<u8>> {
-        let (mut strategy, _) = strategy(data, data.len(), policy)?;
+        // The whole input is at hand, so the output is sized by the bound;
+        // Compact has no strategy to sample for.
+        let mut strategy = if policy == CompressionPolicy::Compact {
+            zlib_rs::Strategy::Default
+        } else {
+            strategy(data, data.len(), policy)?.0
+        };
         if strategy == zlib_rs::Strategy::HuffmanOnly
             && policy == CompressionPolicy::Balanced
             && RedundancyGuard::new().observe(data)
@@ -310,6 +329,11 @@ mod zlib_compress {
 
         pub(crate) fn needs_replay(&self) -> bool {
             self.replay
+        }
+
+        #[cfg(test)]
+        pub(crate) fn reserved(&self) -> usize {
+            self.output.capacity()
         }
     }
 
@@ -425,6 +449,10 @@ impl StreamingEncoder {
     pub(crate) fn needs_replay(&self) -> bool {
         false
     }
+    #[cfg(test)]
+    pub(crate) fn reserved(&self) -> usize {
+        self.output.capacity()
+    }
 }
 
 /// Compress a repeated byte pattern using fixed-size input blocks.
@@ -436,18 +464,8 @@ pub fn compress_repeated(pattern: &[u8], count: usize) -> Result<Vec<u8>> {
         .len()
         .checked_mul(count)
         .ok_or(CodecError::InvalidInput("repeated length overflows"))?;
-    let copies = (32 * 1024 / pattern.len()).max(1).min(count);
-    let mut block = Vec::with_capacity(pattern.len() * copies);
-    for _ in 0..copies {
-        block.extend_from_slice(pattern);
-    }
     let mut encoder = StreamingEncoder::with_policy(&[], total, CompressionPolicy::Compact)?;
-    let mut remaining = count;
-    while remaining >= copies {
-        encoder.push(&block)?;
-        remaining -= copies;
-    }
-    encoder.push(&block[..remaining * pattern.len()])?;
+    crate::repeat::for_each_block(pattern, count as u64, |block| encoder.push(block))?;
     encoder.finish()
 }
 
@@ -615,6 +633,27 @@ mod tests {
                 compact.len()
             );
         }
+    }
+
+    #[test]
+    fn unsampled_large_streams_reserve_a_bounded_output_not_a_whole_plane() {
+        let total = 256 * 1024 * 1024;
+        for policy in [
+            CompressionPolicy::Balanced,
+            CompressionPolicy::Compact,
+            CompressionPolicy::Fast,
+        ] {
+            // No sample, or one too short to probe: no panic, small reservation.
+            for sample in [&[][..], &[3u8; 100][..]] {
+                let encoder = StreamingEncoder::with_policy(sample, total, policy).unwrap();
+                assert!(encoder.reserved() <= 64 * 1024, "{policy:?}");
+            }
+        }
+        // Constant planes take that path and still round-trip exactly.
+        let count = 3 * 1024 * 1024;
+        let packed = compress_repeated(&[1, 2, 3], count).unwrap();
+        let expected: Vec<u8> = [1, 2, 3].iter().copied().cycle().take(3 * count).collect();
+        assert_eq!(decompress(&packed, expected.len()).unwrap(), expected);
     }
 
     fn sample_data() -> Vec<u8> {

@@ -402,6 +402,12 @@ in the fresh run took 114.7 and 171.5 ms respectively. Decoded channels match
 their inputs. Upstream re-embeds smart-object data through OpenImageIO on write;
 Rust preserves untouched linked bytes.
 
+Serializing the same two files without disk I/O (`to_bytes`, 0.13.32, same
+machine, eager-read documents) took about 125 ms for `big8.psd` and 320 ms for
+`big16.psd`, stable across runs, while three saves of `big8.psd` over the same
+output path ranged from 134 ms to 6.4 s. The large-file write variance above
+comes from storage, not from encoding.
+
 Heap allocation peaks (MiB; source file cache and thread stacks excluded),
 comparing 0.13.29 with 0.13.30:
 
