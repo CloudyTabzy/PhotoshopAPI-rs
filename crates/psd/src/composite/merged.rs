@@ -24,7 +24,7 @@ pub(crate) struct MergedImageData {
     pub channels: u16,
     pub transparency: bool,
     /// Compression marker followed by the original payload.
-    section: Vec<u8>,
+    section: std::sync::Arc<Vec<u8>>,
 }
 
 impl MergedImageData {
@@ -88,7 +88,7 @@ impl MergedImageData {
             color_mode: self.color_mode,
             channels: self.channels,
             transparency: self.transparency,
-            section,
+            section: std::sync::Arc::new(section),
         })
     }
 
@@ -119,12 +119,12 @@ impl MergedImageData {
             color_mode: header.color_mode,
             channels: header.num_channels,
             transparency,
-            section: section.to_vec(),
+            section: std::sync::Arc::new(section.to_vec()),
         }))
     }
 
-    pub fn section(&self) -> &[u8] {
-        &self.section
+    pub(crate) fn shared_section(&self) -> std::sync::Arc<Vec<u8>> {
+        self.section.clone()
     }
 
     pub fn decode<T: BitDepth>(&self) -> Result<Vec<Vec<T>>> {

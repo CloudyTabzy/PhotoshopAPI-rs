@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use psd_codecs::endian::{be_bytes, decode_be_bytes, encode_be_bytes};
+use psd_codecs::endian::{be_bytes, decode_be_bytes};
 use psd_codecs::rle;
 use psd_codecs::zip;
 use psd_core::{Compression, PsdError, Result, Version};
@@ -478,6 +478,26 @@ pub fn compress_channel<T: BitDepth>(
     version: Version,
     forced: Option<Compression>,
 ) -> Result<(Compression, Vec<u8>)> {
+    let (codec, bytes) = encode_channel(
+        data,
+        width,
+        height,
+        version,
+        forced,
+        psd_codecs::zip::CompressionPolicy::Balanced,
+    )?;
+    Ok((codec, bytes.into_owned()))
+}
+
+/// Encode without copying native byte samples merely to write them out.
+pub(crate) fn encode_channel<'a, T: BitDepth>(
+    data: &'a [T],
+    width: usize,
+    height: usize,
+    version: Version,
+    forced: Option<Compression>,
+    policy: psd_codecs::zip::CompressionPolicy,
+) -> Result<(Compression, std::borrow::Cow<'a, [u8]>)> {
     // Validate extents first: a non-empty shape with an empty channel must be
     // a typed write-time error, not a corrupt file (Photoshop reads a bare Raw
     // marker for the expected `width * height` samples as corrupt, and the
@@ -489,7 +509,7 @@ pub fn compress_channel<T: BitDepth>(
         });
     }
     if data.is_empty() {
-        return Ok((Compression::Raw, Vec::new()));
+        return Ok((Compression::Raw, std::borrow::Cow::Borrowed(&[])));
     }
 
     let mut codec = match forced {
@@ -502,52 +522,40 @@ pub fn compress_channel<T: BitDepth>(
     }
 
     match codec {
-        Compression::Raw => Ok((Compression::Raw, encode_be_bytes(data))),
+        Compression::Raw => Ok((Compression::Raw, be_bytes(data))),
         Compression::Rle => {
             // 8-bit samples are their own bytes, so nothing is copied unless
             // the channel turns out not to compress and is stored raw.
             let raw = be_bytes(data);
             let size_width = if version == Version::Psd { 2 } else { 4 };
-            // Automatic 8-bit compression samples dispersed rows before
-            // encoding a large plane. Near-incompressible data is stored raw,
-            // avoiding a full PackBits allocation and traversal. An explicit
-            // RLE override always encodes every row. Upstream always runs RLE
-            // here; this heuristic may trade a small size saving for latency.
+            // Count every row before choosing Raw. Dispersed samples cannot
+            // reliably represent heterogeneous planes.
             if forced.is_none() && T::DEPTH == 8 && raw.len() >= 1024 * 1024 {
-                let rows = height.min(16);
-                let mut packed = Vec::new();
-                let mut sampled_bytes = 0usize;
-                for index in 0..rows {
-                    let row = if rows == 1 {
-                        0
-                    } else {
-                        index * (height - 1) / (rows - 1)
-                    };
-                    packed.clear();
-                    rle::pack_bits_compress_into(&raw[row * width..(row + 1) * width], &mut packed);
-                    sampled_bytes += packed.len() + size_width;
-                }
-                if sampled_bytes.saturating_mul(100)
-                    >= rows.saturating_mul(width).saturating_mul(99)
-                {
-                    return Ok((Compression::Raw, raw.into_owned()));
+                let encoded =
+                    rle::encoded_scanlines_len(&raw, width, size_width).map_err(codec_error)?;
+                if encoded >= raw.len() {
+                    return Ok((Compression::Raw, raw));
                 }
             }
             let packed =
                 rle::compress_scanlines(&raw, width * T::SIZE, size_width).map_err(codec_error)?;
             if forced.is_none() && packed.len() >= raw.len() {
-                Ok((Compression::Raw, raw.into_owned()))
+                Ok((Compression::Raw, raw))
             } else {
-                Ok((Compression::Rle, packed))
+                Ok((Compression::Rle, packed.into()))
             }
         }
         Compression::Zip => Ok((
             Compression::Zip,
-            zip::compress(&be_bytes(data)).map_err(codec_error)?,
+            zip::compress_with_policy(&be_bytes(data), policy)
+                .map_err(codec_error)?
+                .into(),
         )),
         Compression::ZipPrediction => Ok((
             Compression::ZipPrediction,
-            T::zip_prediction_compress(data, width, height).map_err(codec_error)?,
+            T::zip_prediction_compress_with_policy(data, width, height, policy)
+                .map_err(codec_error)?
+                .into(),
         )),
     }
 }
@@ -555,6 +563,29 @@ pub fn compress_channel<T: BitDepth>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_rle_measures_heterogeneous_planes_instead_of_trusting_sample_rows() {
+        let width = 256;
+        let height = 4096;
+        let mut data = vec![0u8; width * height];
+        let mut state = 0x1234_5678u32;
+        // Every row the old sampler inspected is noisy; the rest are flat.
+        for index in 0..16 {
+            let row = index * (height - 1) / 15;
+            for byte in &mut data[row * width..(row + 1) * width] {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                *byte = (state >> 24) as u8;
+            }
+        }
+        let (codec, bytes) = compress_channel(&data, width, height, Version::Psd, None).unwrap();
+        assert_eq!(codec, Compression::Rle);
+        assert!(bytes.len() < data.len() / 10);
+        assert_eq!(
+            decompress_channel::<u8>(codec, &bytes, width, height, Version::Psd, 8).unwrap(),
+            data
+        );
+    }
 
     #[test]
     fn channel_keys_map_to_raw_indices() {

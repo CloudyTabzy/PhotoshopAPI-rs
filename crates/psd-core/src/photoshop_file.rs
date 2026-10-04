@@ -109,6 +109,33 @@ impl<'a> PhotoshopFile<'a> {
             .sum();
         payload + self.image_data.raw_section().map_or(0, <[u8]>::len) + (1 << 20)
     }
+
+    /// Write a metadata outline, producing channel bytes when their positions
+    /// are reached. The callback writes compression markers and payloads in
+    /// record/channel order and returns their complete lengths in that order.
+    /// Length fields are validated and backpatched before returning. The sink
+    /// can contain partial data on failure; atomic replacement belongs to the
+    /// document layer. Layerless documents do not invoke the callback.
+    pub fn write_seekable<W: std::io::Write + std::io::Seek>(
+        &mut self,
+        sink: &mut W,
+        channels: impl FnOnce(&mut dyn std::io::Write) -> Result<Vec<Vec<u64>>>,
+    ) -> Result<()> {
+        let mut sink = crate::seek_writer::PositionWriter::new(sink)?;
+        let mut leading = BeWriter::new();
+        self.header.write(&mut leading);
+        self.color_mode_data.write(&mut leading, &self.header)?;
+        self.image_resources.write(&mut leading)?;
+        std::io::Write::write_all(&mut sink, leading.as_slice())?;
+        drop(leading);
+        crate::seek_writer::write_layer_section(
+            &mut self.layer_and_mask_info,
+            &mut sink,
+            &self.header,
+            channels,
+        )?;
+        self.image_data.write_to(&mut sink, &self.header)
+    }
 }
 
 #[cfg(test)]

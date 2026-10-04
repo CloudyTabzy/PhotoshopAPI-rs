@@ -30,6 +30,13 @@ use crate::layer::{
 };
 use crate::progress::{ignore_progress, ProgressEvent};
 use crate::text::TextCacheBaseline;
+use crate::write_pipeline::{ChannelJob, ChannelSource};
+use crate::WriteOptions;
+
+struct PlannedLayer<'a, T> {
+    name: &'a str,
+    channels: Vec<ChannelJob<'a, T>>,
+}
 
 /// The name Photoshop gives the bounding section divider of a group.
 const DIVIDER_NAME: &str = "</Layer group>";
@@ -1929,6 +1936,68 @@ impl<T: BitDepth> LayeredFile<T> {
         &self,
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<PhotoshopFile<'_>> {
+        self.to_photoshop_file_with_options_and_progress(WriteOptions::default(), progress)
+    }
+
+    /// Assemble channels using an explicit lossless policy and workspace limit.
+    pub fn to_photoshop_file_with_options(
+        &self,
+        options: WriteOptions,
+    ) -> Result<PhotoshopFile<'_>> {
+        self.to_photoshop_file_with_options_and_progress(options, &mut ignore_progress)
+    }
+
+    fn to_photoshop_file_with_options_and_progress(
+        &self,
+        options: WriteOptions,
+        progress: &mut dyn FnMut(ProgressEvent<'_>),
+    ) -> Result<PhotoshopFile<'_>> {
+        let (mut file, layers) = self.prepare_write()?;
+        let total = layers.len();
+        let jobs = layers
+            .into_iter()
+            .enumerate()
+            .map(|(index, layer)| {
+                let work = layer
+                    .channels
+                    .iter()
+                    .map(ChannelJob::work_bytes)
+                    .max()
+                    .unwrap_or(0);
+                ((index, layer), work)
+            })
+            .collect();
+        crate::parallel::for_each_ordered_with_budget(
+            jobs,
+            options.working_memory_limit,
+            |(index, layer)| {
+                let mut channels = Vec::with_capacity(layer.channels.len());
+                let mut sizes = Vec::with_capacity(layer.channels.len());
+                for job in layer.channels {
+                    let encoded = job.encode(options.compression_policy)?;
+                    sizes.push(encoded.disk_len()?);
+                    channels.push(encoded.into_data()?);
+                }
+                Ok((index, layer.name, channels, sizes))
+            },
+            |(index, name, channels, sizes)| {
+                for (info, size) in file.layer_and_mask_info.layer_info.layer_records[index]
+                    .channels
+                    .iter_mut()
+                    .zip(sizes)
+                {
+                    info.size = size;
+                }
+                file.layer_and_mask_info.layer_info.channel_image_data[index] =
+                    ChannelImageData { channels };
+                progress(ProgressEvent::Layer { name, index, total });
+                Ok(())
+            },
+        )?;
+        Ok(file)
+    }
+
+    fn prepare_write(&self) -> Result<(PhotoshopFile<'_>, Vec<PlannedLayer<'_, T>>)> {
         // The merged channel count is computed at write time: created
         // documents start at the color-mode count and would otherwise never
         // pick up alpha layers (upstream's `hasAlpha &=` latent bug; upstream
@@ -2004,67 +2073,43 @@ impl<T: BitDepth> LayeredFile<T> {
                         message: "the retained layerless image no longer matches the document header; materialize it before saving",
                     });
                 }
-                image_data.set_raw_section(Some(merged.section().to_vec()));
+                image_data.set_shared_raw_section(Some(merged.shared_section()));
             }
         }
 
         let mut plan = Vec::new();
         self.plan_records(&self.root_children, &mut plan);
-        let total = plan.len();
-        let mut records = Vec::with_capacity(total);
-        let mut channel_data = Vec::with_capacity(total);
-        let jobs = plan
-            .into_iter()
-            .enumerate()
-            .map(|(index, layer)| {
-                let mut scratch = layer.and_then(Layer::channels).map_or(0, |channels| {
-                    channels
-                        .iter()
-                        .map(|(_, samples)| samples.len().saturating_mul(T::SIZE).saturating_mul(2))
-                        .max()
-                        .unwrap_or(0)
-                });
-                if let Some(layer) = layer.filter(|layer| {
-                    matches!(layer.kind, LayerKind::Image(_) | LayerKind::Text(_))
-                        && !layer
-                            .channels()
-                            .is_some_and(|channels| channels.contains(ChannelKey::ALPHA))
-                        && !(index == 0 && self.covers_canvas(layer))
-                }) {
-                    let (width, height) = read_rect_extents(layer.bounds, "layer", self.version)?;
-                    // Synthesized transparency is temporary storage, separate
-                    // from the channels already owned by the document.
-                    scratch = scratch.saturating_add(
-                        width
-                            .saturating_mul(height)
-                            .saturating_mul(std::mem::size_of::<T>()),
-                    );
+        let mut records = Vec::with_capacity(plan.len());
+        let mut channel_data = Vec::with_capacity(plan.len());
+        let mut layers = Vec::with_capacity(plan.len());
+        for (index, layer) in plan.into_iter().enumerate() {
+            let (record, jobs) = match layer {
+                Some(layer) => {
+                    self.prepare_record(layer, self.blocks_for_record(layer)?, index == 0)?
                 }
-                Ok(((index, layer), scratch))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        crate::parallel::for_each_ordered(
-            jobs,
-            |(index, layer)| {
-                let (record, data) = match layer {
-                    Some(layer) => {
-                        self.build_record(layer, self.blocks_for_record(layer)?, index == 0)?
-                    }
-                    None => self.build_divider_record()?,
-                };
-                Ok((layer, record, data))
-            },
-            |(layer, record, data)| {
-                progress(ProgressEvent::Layer {
-                    name: layer.map_or(DIVIDER_NAME, |layer| layer.name.as_str()),
-                    index: records.len(),
-                    total,
-                });
-                records.push(record);
-                channel_data.push(data);
-                Ok(())
-            },
-        )?;
+                None => {
+                    let (record, _) = self.build_divider_record()?;
+                    let jobs = record
+                        .channels
+                        .iter()
+                        .map(|_| ChannelJob {
+                            source: ChannelSource::Stored(Compression::Raw, &[]),
+                            width: 0,
+                            height: 0,
+                            version: self.version,
+                            forced: None,
+                        })
+                        .collect();
+                    (record, jobs)
+                }
+            };
+            layers.push(PlannedLayer {
+                name: layer.map_or(DIVIDER_NAME, |layer| layer.name.as_str()),
+                channels: jobs,
+            });
+            records.push(record);
+            channel_data.push(ChannelImageData::default());
+        }
 
         // Refresh DPI/ICC while preserving every other resource block. The
         // resolution resource is the authority for a document read from disk: it
@@ -2091,21 +2136,24 @@ impl<T: BitDepth> LayeredFile<T> {
             image_resources.set_icc_profile(IccProfileBlock::new(self.icc_profile.clone()));
         }
 
-        Ok(PhotoshopFile {
-            header,
-            color_mode_data: self.color_mode_data.clone(),
-            image_resources,
-            layer_and_mask_info: LayerAndMaskInformation {
-                layer_info: LayerInfo {
-                    layer_records: records,
-                    channel_image_data: channel_data,
-                    has_merged_alpha,
+        Ok((
+            PhotoshopFile {
+                header,
+                color_mode_data: self.color_mode_data.clone(),
+                image_resources,
+                layer_and_mask_info: LayerAndMaskInformation {
+                    layer_info: LayerInfo {
+                        layer_records: records,
+                        channel_image_data: channel_data,
+                        has_merged_alpha,
+                    },
+                    global_layer_mask_info: self.global_layer_mask_info.clone(),
+                    additional_layer_info: self.document_blocks_for_output(),
                 },
-                global_layer_mask_info: self.global_layer_mask_info.clone(),
-                additional_layer_info: self.document_blocks_for_output(),
+                image_data,
             },
-            image_data,
-        })
+            layers,
+        ))
     }
 
     /// Serialize the whole document.
@@ -2118,12 +2166,93 @@ impl<T: BitDepth> LayeredFile<T> {
         &self,
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<Vec<u8>> {
-        let mut file = self.to_photoshop_file_with_progress(progress)?;
-        // Streaming into a buffer of the right size: the file is assembled in
-        // place, not grown by doubling (which briefly holds two copies).
-        let mut bytes = Vec::with_capacity(file.size_hint());
-        file.write_to(&mut bytes)?;
-        Ok(bytes)
+        self.to_bytes_with_options_and_progress(WriteOptions::default(), progress)
+    }
+
+    /// Serialize with a lossless policy and explicit codec workspace limit.
+    pub fn to_bytes_with_options(&self, options: WriteOptions) -> Result<Vec<u8>> {
+        self.to_bytes_with_options_and_progress(options, &mut ignore_progress)
+    }
+
+    fn to_bytes_with_options_and_progress(
+        &self,
+        options: WriteOptions,
+        progress: &mut dyn FnMut(ProgressEvent<'_>),
+    ) -> Result<Vec<u8>> {
+        let (mut file, mut layers) = self.prepare_write()?;
+        let capacity = if T::DEPTH == 8 {
+            let mut known = Some(file.size_hint());
+            for layer in &mut layers {
+                for job in &mut layer.channels {
+                    let hint = job.prepare_byte_hint()?;
+                    known = known.zip(hint).and_then(|(sum, bytes)| {
+                        bytes.checked_add(2).and_then(|n| sum.checked_add(n))
+                    });
+                }
+            }
+            known.unwrap_or(0)
+        } else {
+            0
+        };
+        let mut sink = std::io::Cursor::new(Vec::with_capacity(capacity));
+        self.write_prepared(&mut file, layers, &mut sink, options, progress)?;
+        Ok(sink.into_inner())
+    }
+
+    fn write_prepared<W: std::io::Write + std::io::Seek>(
+        &self,
+        file: &mut PhotoshopFile<'_>,
+        layers: Vec<PlannedLayer<'_, T>>,
+        sink: &mut W,
+        options: WriteOptions,
+        progress: &mut dyn FnMut(ProgressEvent<'_>),
+    ) -> Result<()> {
+        let total = layers.len();
+        let mut sizes: Vec<Vec<u64>> = layers
+            .iter()
+            .map(|layer| vec![0; layer.channels.len()])
+            .collect();
+        let mut jobs = Vec::new();
+        for (index, layer) in layers.into_iter().enumerate() {
+            let count = layer.channels.len();
+            if count == 0 {
+                jobs.push(((index, 0, true, layer.name, None), 0));
+            }
+            for (channel, job) in layer.channels.into_iter().enumerate() {
+                let work = job.work_bytes();
+                jobs.push((
+                    (index, channel, channel + 1 == count, layer.name, Some(job)),
+                    work,
+                ));
+            }
+        }
+        file.write_seekable(sink, |sink| {
+            crate::parallel::for_each_ordered_with_budget(
+                jobs,
+                options.working_memory_limit,
+                |(index, channel, last, name, job)| {
+                    let encoded = job
+                        .map(|job| job.encode(options.compression_policy))
+                        .transpose()?;
+                    Ok((index, channel, last, name, encoded))
+                },
+                |(index, channel, last, name, encoded)| {
+                    if let Some(encoded) = encoded {
+                        let length = encoded.disk_len()?;
+                        // Validate the field before emitting this channel.
+                        let mut check = BeWriter::new();
+                        check.len(self.version, length)?;
+                        encoded.write_to(sink)?;
+                        sizes[index][channel] = length;
+                    }
+                    if last {
+                        progress(ProgressEvent::Layer { name, index, total });
+                    }
+                    Ok(())
+                },
+            )?;
+            Ok(sizes)
+        })
     }
 
     /// Write the document to disk.
@@ -2144,10 +2273,25 @@ impl<T: BitDepth> LayeredFile<T> {
         path: impl AsRef<Path>,
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<()> {
+        self.write_with_options_and_progress(path, WriteOptions::default(), progress)
+    }
+
+    /// Save atomically with an explicit lossless policy and workspace limit.
+    pub fn write_with_options(&self, path: impl AsRef<Path>, options: WriteOptions) -> Result<()> {
+        self.write_with_options_and_progress(path, options, &mut ignore_progress)
+    }
+
+    fn write_with_options_and_progress(
+        &self,
+        path: impl AsRef<Path>,
+        options: WriteOptions,
+        progress: &mut dyn FnMut(ProgressEvent<'_>),
+    ) -> Result<()> {
         use std::io::Write as _;
         let path = path.as_ref();
-        // Compression can fail; it happens before any file is created.
-        let mut file = self.to_photoshop_file_with_progress(progress)?;
+        // Metadata and geometry validation precede creation. Codec failures
+        // discard the private temporary; the target is committed only on success.
+        let (mut file, layers) = self.prepare_write()?;
         let temporary = temporary_sibling(path)?;
         // Exclusive creation leaves an existing temporary file untouched. If
         // it fails, nothing created by this save needs cleanup.
@@ -2157,7 +2301,7 @@ impl<T: BitDepth> LayeredFile<T> {
             .open(&temporary)?;
         let written = (|| -> Result<()> {
             let mut sink = std::io::BufWriter::with_capacity(1 << 20, sink);
-            file.write_to(&mut sink)?;
+            self.write_prepared(&mut file, layers, &mut sink, options, progress)?;
             sink.flush()?;
             Ok(())
         })();
@@ -2358,12 +2502,12 @@ impl<T: BitDepth> LayeredFile<T> {
         Ok((record, ChannelImageData { channels: data }))
     }
 
-    fn build_record<'a>(
+    fn prepare_record<'a>(
         &'a self,
         layer: &'a Layer<T>,
         blocks: Option<Cow<'a, AdditionalLayerInfo>>,
         is_bottom_record: bool,
-    ) -> Result<(LayerRecord<'a>, ChannelImageData<'a>)> {
+    ) -> Result<(LayerRecord<'a>, Vec<ChannelJob<'a, T>>)> {
         let bounds = layer.bounds;
         let stub_channels = matches!(
             layer.kind,
@@ -2399,27 +2543,19 @@ impl<T: BitDepth> LayeredFile<T> {
             keys.push(ChannelKey::ALPHA);
         }
         keys.sort_by_key(|key| channel_sort_key(*key));
-        let opaque_alpha = if synthesize_alpha {
+        if synthesize_alpha {
             let (width, height) = read_rect_extents(bounds, "layer", self.version)?;
-            let samples = width
+            width
                 .checked_mul(height)
-                .filter(|&samples| {
-                    samples
-                        .checked_mul(std::mem::size_of::<T>())
-                        .is_some_and(|bytes| bytes <= isize::MAX as usize)
-                })
-                .ok_or(PsdError::InvalidImageBounds {
-                    kind: "layer",
-                    width: i64::from(bounds.right) - i64::from(bounds.left),
-                    height: i64::from(bounds.bottom) - i64::from(bounds.top),
+                .and_then(|samples| samples.checked_mul(std::mem::size_of::<T>()))
+                .filter(|&bytes| bytes <= isize::MAX as usize)
+                .ok_or(PsdError::InvalidData {
+                    offset: 0,
+                    message: "synthesized channel byte count overflows",
                 })?;
-            vec![T::from_f32(1.0); samples]
-        } else {
-            Vec::new()
-        };
-
-        let mut channels = Vec::new();
-        let mut data = Vec::new();
+        }
+        let mut channels = Vec::with_capacity(keys.len());
+        let mut jobs = Vec::with_capacity(keys.len());
         for key in keys {
             let rect = if key.is_mask() {
                 mask_channel_rect(layer.mask.as_ref(), key).unwrap_or(bounds)
@@ -2430,84 +2566,88 @@ impl<T: BitDepth> LayeredFile<T> {
             } else {
                 bounds
             };
-            let (compression, payload) =
-                if let Some(raw) = layer.channels().and_then(|channels| channels.raw(key)) {
-                    // Preserve the encoded payload until a caller decodes or
-                    // replaces it.
-                    let (width, height) = if key.is_mask() {
-                        let kind = if key == ChannelKey::REAL_USER_MASK {
-                            "real mask"
-                        } else {
-                            "mask"
-                        };
-                        mask_channel_extents(rect, kind, self.version, raw.payload.is_empty())?
-                    } else if stub_channels {
-                        (0, 0)
+            let source = if let Some(raw) = layer.channels().and_then(|channels| channels.raw(key))
+            {
+                // Preserve the encoded payload until a caller decodes or
+                // replaces it.
+                let (width, height) = if key.is_mask() {
+                    let kind = if key == ChannelKey::REAL_USER_MASK {
+                        "real mask"
                     } else {
-                        read_rect_extents(rect, "layer", self.version)?
+                        "mask"
                     };
-                    if (raw.width, raw.height) != (width, height) {
-                        return Err(PsdError::InvalidData {
-                            offset: 0,
-                            message: "decode raw channel data before changing its geometry",
-                        });
-                    }
-                    // PhotoshopAPI/src/PhotoshopFile/LayerAndMaskInformation.cpp
-                    // converts plain ZIP to ZIP prediction for 32-bit channels.
-                    // Raw passthrough must keep that write-time requirement.
-                    if T::DEPTH == 32 && raw.compression == Compression::Zip {
-                        return Err(PsdError::InvalidData {
-                            offset: 0,
-                            message: "decode raw 32-bit ZIP channels before writing",
-                        });
-                    }
-                    if raw.compression == Compression::Rle && raw.version != self.version {
-                        return Err(PsdError::InvalidData {
-                            offset: 0,
-                            message: "decode raw RLE channels before changing PSD/PSB version",
-                        });
-                    }
-                    let requested_compression =
-                        layer.write_compression(key, self.compression).map(|codec| {
-                            if T::DEPTH == 32 && codec == Compression::Zip {
-                                Compression::ZipPrediction
-                            } else {
-                                codec
-                            }
-                        });
-                    if requested_compression.is_some_and(|codec| codec != raw.compression) {
-                        return Err(PsdError::InvalidData {
-                            offset: 0,
-                            message: "decode raw channels before changing their compression",
-                        });
-                    }
-                    (raw.compression, Cow::Borrowed(raw.payload.as_slice()))
+                    mask_channel_extents(rect, kind, self.version, raw.payload.is_empty())?
+                } else if stub_channels {
+                    (0, 0)
                 } else {
-                    let samples: &[T] = if key == ChannelKey::ALPHA && synthesize_alpha {
-                        &opaque_alpha
-                    } else {
-                        layer
-                            .channels()
-                            .and_then(|channels| channels.get(key))
-                            .unwrap_or(&[])
-                    };
-                    let (compression, payload) = compress_channel(
-                        samples,
-                        rect.width().max(0) as usize,
-                        rect.height().max(0) as usize,
-                        self.version,
-                        layer.write_compression(key, self.compression),
-                    )?;
-                    (compression, Cow::Owned(payload))
+                    read_rect_extents(rect, "layer", self.version)?
                 };
+                if (raw.width, raw.height) != (width, height) {
+                    return Err(PsdError::InvalidData {
+                        offset: 0,
+                        message: "decode raw channel data before changing its geometry",
+                    });
+                }
+                // PhotoshopAPI/src/PhotoshopFile/LayerAndMaskInformation.cpp
+                // converts plain ZIP to ZIP prediction for 32-bit channels.
+                // Raw passthrough must keep that write-time requirement.
+                if T::DEPTH == 32 && raw.compression == Compression::Zip {
+                    return Err(PsdError::InvalidData {
+                        offset: 0,
+                        message: "decode raw 32-bit ZIP channels before writing",
+                    });
+                }
+                if raw.compression == Compression::Rle && raw.version != self.version {
+                    return Err(PsdError::InvalidData {
+                        offset: 0,
+                        message: "decode raw RLE channels before changing PSD/PSB version",
+                    });
+                }
+                let requested_compression =
+                    layer.write_compression(key, self.compression).map(|codec| {
+                        if T::DEPTH == 32 && codec == Compression::Zip {
+                            Compression::ZipPrediction
+                        } else {
+                            codec
+                        }
+                    });
+                if requested_compression.is_some_and(|codec| codec != raw.compression) {
+                    return Err(PsdError::InvalidData {
+                        offset: 0,
+                        message: "decode raw channels before changing their compression",
+                    });
+                }
+                ChannelSource::Stored(raw.compression, raw.payload.as_slice())
+            } else {
+                if key == ChannelKey::ALPHA && synthesize_alpha {
+                    ChannelSource::Uniform(T::from_f32(1.0))
+                } else {
+                    let samples = layer
+                        .channels()
+                        .and_then(|channels| channels.get(key))
+                        .unwrap_or(&[]);
+                    let expected =
+                        (rect.width().max(0) as usize).checked_mul(rect.height().max(0) as usize);
+                    if expected != Some(samples.len()) {
+                        return Err(PsdError::InvalidData {
+                            offset: 0,
+                            message: "channel sample count does not match its extents",
+                        });
+                    }
+                    ChannelSource::Samples(samples)
+                }
+            };
             channels.push(ChannelInfo {
                 id: CoreChannelId::from_index(key.index(), self.color_mode),
                 index: key.index(),
-                size: payload.len() as u64 + 2,
+                size: 2,
             });
-            data.push(ChannelData {
-                compression,
-                data: payload,
+            jobs.push(ChannelJob {
+                source,
+                width: rect.width().max(0) as usize,
+                height: rect.height().max(0) as usize,
+                version: self.version,
+                forced: layer.write_compression(key, self.compression),
             });
         }
 
@@ -2545,7 +2685,7 @@ impl<T: BitDepth> LayeredFile<T> {
             blending_ranges: layer.blending_ranges.clone(),
             additional_layer_info: blocks,
         };
-        Ok((record, ChannelImageData { channels: data }))
+        Ok((record, jobs))
     }
 
     /// The patterns the document carries, from its `Patt`, `Pat2` and `Pat3`

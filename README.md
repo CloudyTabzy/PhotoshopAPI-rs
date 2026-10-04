@@ -357,9 +357,10 @@ LGPL-2.1-or-later` — an either/or choice, so the LGPL terms never apply.
 ## Performance
 
 Read → materialize layer pixels → write, measured against the C++ upstream
-(v0.9.1, MSVC Release) on the same machine. Large-document results are medians
-of five runs with a warm file cache, idle storage before each run and rotated
-implementation order. Lower is better; times are milliseconds.
+(v0.9.1, MSVC Release) on the same machine. The Rust large-document results
+are medians of five runs with a warm file cache and alternating file order;
+the C++ results are from an earlier five-run session. Lower is better; times
+are milliseconds.
 
 Upstream decodes PSD compression during `read` and stores pixels internally
 compressed; its `get_image_data()` extracts that internal storage. Rust's lazy
@@ -368,8 +369,8 @@ read retains PSD streams, then `decode_all_layer_pixels()` decodes them. Compare
 
 | Document | Read + extract C++ / Rust | Write C++ / Rust | Total C++ / Rust |
 |---|---|---|---|
-| `big8.psd` (435 MB, 8-bit) | 347.6 / **159.8** | 280.9 / **187.9** | 627.2 / **349.4** |
-| `big16.psd` (252 MB, 16-bit) | 274.8 / **196.0** | 596.7 / **468.6** | 871.5 / **665.2** |
+| `big8.psd` (435 MB, 8-bit) | 347.6 / **160.1** | 280.9 / **171.1** | 627.2 / **331.3** |
+| `big16.psd` (252 MB, 16-bit) | 274.8 / **200.4** | 596.7 / **343.3** | 871.5 / **546.2** |
 
 The synthetic workloads contain 12 RGB+alpha layers at 4000×3000 (8-bit)
 and 10 at 2000×3000 (16-bit), with opaque alpha and no masks or effects. RGB
@@ -379,11 +380,13 @@ arithmetic, in layer/channel/row/column order. Let `n = state >> 24`: 8-bit
 samples are `(g as u8) ^ (n & 15)`; 16-bit samples are `((g & 255) << 8) | n`.
 These specify the pixel workloads; encoded sizes depend on the writer/backend.
 
-Against the previous Rust pipeline, total time falls from 915.8 to 349.4 ms
-(2.6×) for the large 8-bit document and from 6630.5 to 665.2 ms (10.0×) for
-16-bit. Default eager read takes 122.2 and 173.9 ms respectively. The large
-8-bit output is byte-identical to the previous writer; the 16-bit output is
-1.37% larger, with every decoded channel unchanged.
+Against Rust 0.13.29 in separate five-run measurements on the same machine,
+the 8-bit total falls from 347.2 to 331.3 ms and the 16-bit total from 660.7
+to 546.2 ms. A 256 MiB writer workspace keeps enough 16-bit channel jobs in
+flight to offset the ZIP guard and streaming overhead. Both totals are below
+the previously measured C++ figures. Default eager read takes 115.8 and
+176.9 ms respectively. Decoded channels match their inputs. Write times vary
+with storage contention; the table reports medians, not worst cases.
 
 Small-document runs also improve: `example.psd` takes about 3.5 ms total versus
 6.4 ms previously and 42.1 ms upstream; `smart_object_file_no_warp.psd` takes
@@ -392,30 +395,35 @@ Rust: upstream extraction omits layer kinds outside `ImageLayer`. Upstream
 also re-embeds smart-object data through OpenImageIO on write; Rust preserves
 untouched linked bytes.
 
-Heap allocation peaks (MiB; source file cache and thread stacks excluded):
+Heap allocation peaks (MiB; source file cache and thread stacks excluded),
+comparing 0.13.29 with 0.13.30:
 
 | Operation | Previous Rust | Current Rust |
 |---|---:|---:|
-| Eager read, large 8-bit | 572.3 | 549.5 |
-| Write, large 8-bit | 987.7 | 965.7 |
-| Eager read, large 16-bit | 477.2 | 458.4 |
-| Write, large 16-bit | 709.5 | 697.5 |
-| Bulk lazy extraction, large 16-bit | 493.2 | 538.3 |
+| Eager read, large 8-bit | 549.5 | 549.5 |
+| Write, large 8-bit | 965.7 | 551.6 |
+| `to_bytes`, large 8-bit | 1380.0 | 965.8 |
+| Eager read, large 16-bit | 458.4 | 458.4 |
+| Write, large 16-bit | 697.5 | 537.7 |
+| `to_bytes`, large 16-bit | 931.3 | 788.0 |
 
-Bulk extraction trades bounded concurrent raw/decoded overlap for throughput.
-Jobs use an estimated 128 MiB codec workspace budget; this is separate from the
-pixel budget and is not a process-memory ceiling. Individual layer decoding
-remains atomic. Bulk decoding retains failed channels, releases successful ones
-and returns the first error in document order. A caller's Rayon pool controls
-available threads; small workloads stay sequential.
+Bulk extraction uses an estimated 128 MiB codec workspace budget; writing
+defaults to 256 MiB. These are separate from the pixel budget and are not a
+process-memory ceiling.
+Individual layer decoding remains atomic. Bulk decoding retains failed
+channels, releases successful ones and returns the first error in document
+order. A caller's Rayon pool controls available threads; small workloads stay
+sequential. The writer keeps only a bounded window of encoded channels and
+releases each payload after writing it. `to_bytes` also holds its returned file.
 
-Automatic compression samples large inputs: sixteen dispersed rows decide
-whether 8-bit RLE is worthwhile, and three ZIP windows compare default deflate
-with Huffman-only encoding. These are size estimates; heterogeneous documents
-can behave differently. An explicit RLE override bypasses its sampling policy.
-The writer still stages compressed channels before streaming them, and
-`to_bytes` also holds the returned file. Sustained disk contention can dominate
-write timings; the figures above describe these measured workloads.
+Automatic 8-bit RLE selection counts every scanline exactly. For large ZIP
+inputs, three windows choose between default deflate and Huffman-only encoding;
+the balanced policy also checks for redundancy elsewhere in the channel and
+replays prediction with default deflate when needed. This guard is a heuristic,
+not a compressed-size guarantee. `WriteOptions` offers `Compact` for default
+level-4 deflate throughout, `Fast` for sampled selection alone, and a working
+memory limit for codec jobs. Sustained disk contention can dominate writes;
+the figures above describe these measured workloads.
 
 Reproduce the Rust side with:
 
@@ -455,8 +463,7 @@ The full list is in [CHANGELOG.md](CHANGELOG.md) under *Changed* and *Fixed*.
 ## Roadmap
 
 - Indexed and Duotone color modes
-- Performance benchmarks and documentation (images and benchmark data are not
-  published yet, so no speed claims are made here)
+- Publish reproducible large-document benchmark inputs and raw timing data
 
 ## License
 

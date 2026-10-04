@@ -39,82 +39,157 @@ pub fn pack_bits_compress(data: &[u8]) -> Vec<u8> {
 /// nothing.
 pub fn pack_bits_compress_into(data: &[u8], out: &mut Vec<u8>) -> usize {
     let start = out.len();
-    if data.is_empty() {
-        return 0;
-    }
-    // Packed rows of noisy data can exceed the input by one header per 128
-    // bytes; reserving that bound once means the row never reallocates.
-    out.reserve(data.len() + data.len() / MAX_PACKET_LEN + 2);
-
-    // Constant scanlines (notably opaque alpha) need only run packets. Fixed
-    // array equality lets LLVM compare many bytes at once, while preserving
-    // the upstream packet boundaries, including a one-byte final literal.
-    let byte = data[0];
-    let mut chunks = data.chunks_exact(32);
-    if chunks.by_ref().all(|chunk| chunk == [byte; 32])
-        && chunks.remainder().iter().all(|&value| value == byte)
-    {
-        for run in data.chunks(MAX_PACKET_LEN) {
-            write_run(out, run.len(), byte);
-        }
-        return out.len() - start;
-    }
-
-    let mut run_len: usize = 0;
-    let mut lit_len: usize = 0;
-
-    // Mirrors the upstream loop which inspects (prev, curr) pairs.
-    for i in 1..data.len() {
-        let prev = data[i - 1];
-        let curr = data[i];
-
-        if prev == curr {
-            // A repeat starts: flush any pending literal run first
-            // (upstream flushes `data[i - nonRunLen - 1 ..= i - 2]`).
-            if lit_len != 0 {
-                write_literal(out, &data[i - lit_len - 1..i - 1]);
-                lit_len = 0;
-            }
-
-            run_len += 1;
-            if run_len == MAX_PACKET_LEN {
-                write_run(out, run_len, curr);
-                run_len = 0;
-            }
-        } else {
-            // Run ended (or never started).
-            if run_len != 0 {
-                run_len += 1;
-                write_run(out, run_len, prev);
-                run_len = 0;
-            } else {
-                lit_len += 1;
-            }
-
-            if lit_len == MAX_PACKET_LEN {
-                // Upstream flushes `data[i - nonRunLen ..= i - 1]` here;
-                // the current byte stays pending for the next iteration.
-                write_literal(out, &data[i - lit_len..i]);
-                lit_len = 0;
-            }
-        }
-    }
-
-    // Flush the tail (upstream "encode the last item" epilogue).
-    let n = data.len();
-    if run_len != 0 {
-        run_len += 1;
-        write_run(out, run_len, data[n - 1]);
-    } else {
-        lit_len += 1;
-        write_literal(out, &data[n - lit_len..]);
-    }
-
-    // Pad this row to 2-byte alignment with the no-op packet.
+    visit_packets(data, |packet| match packet {
+        Packet::Literal(bytes) => write_literal(out, bytes),
+        Packet::Run { len, byte } => write_run(out, len, byte),
+    });
     if !(out.len() - start).is_multiple_of(2) {
         out.push(128);
     }
     out.len() - start
+}
+
+/// Exact PackBits length, including row alignment, without allocating or
+/// copying packets. It shares packet boundaries with the encoder.
+pub fn pack_bits_encoded_len(data: &[u8]) -> usize {
+    let mut len = 0usize;
+    visit_packets(data, |packet| {
+        len += match packet {
+            Packet::Literal(bytes) => bytes.len() + 1,
+            Packet::Run { .. } => 2,
+        };
+    });
+    len + len % 2
+}
+
+#[derive(Clone, Copy)]
+enum Packet<'a> {
+    Literal(&'a [u8]),
+    Run { len: usize, byte: u8 },
+}
+
+#[inline]
+fn visit_packets(data: &[u8], mut emit: impl FnMut(Packet<'_>)) {
+    let mut cursor = 0usize;
+    while cursor < data.len() {
+        if cursor + 1 < data.len() && data[cursor] == data[cursor + 1] {
+            let byte = data[cursor];
+            let mut run = equal_prefix(&data[cursor..], byte);
+            while run >= MAX_PACKET_LEN {
+                emit(Packet::Run {
+                    len: MAX_PACKET_LEN,
+                    byte,
+                });
+                cursor += MAX_PACKET_LEN;
+                run -= MAX_PACKET_LEN;
+            }
+            if run >= 2 {
+                emit(Packet::Run { len: run, byte });
+                cursor += run;
+                continue;
+            }
+            // A one-byte remainder belongs to the next literal, exactly as
+            // upstream's run-match counter leaves its current byte pending.
+            if run == 0 {
+                continue;
+            }
+        }
+        let end = data.len().min(cursor.saturating_add(MAX_PACKET_LEN + 1));
+        let literals = first_repeat(&data[cursor..end])
+            .unwrap_or(end - cursor)
+            .min(MAX_PACKET_LEN);
+        emit(Packet::Literal(&data[cursor..cursor + literals]));
+        cursor += literals;
+    }
+}
+
+#[inline]
+fn first_repeat(bytes: &[u8]) -> Option<usize> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let mut offset = 0;
+    while offset + 8 < bytes.len() {
+        let left = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let right = u64::from_le_bytes(bytes[offset + 1..offset + 9].try_into().unwrap());
+        let different = left ^ right;
+        let zeros = different.wrapping_sub(ONES) & !different & HIGH;
+        if zeros != 0 {
+            // Borrow propagation can mark later bytes, but the first marked
+            // byte is always the first actual zero. Never count these bits.
+            return Some(offset + zeros.trailing_zeros() as usize / 8);
+        }
+        offset += 8;
+    }
+    bytes[offset..]
+        .windows(2)
+        .position(|pair| pair[0] == pair[1])
+        .map(|i| offset + i)
+}
+
+#[inline]
+fn equal_prefix(bytes: &[u8], byte: u8) -> usize {
+    let repeated = u64::from_le_bytes([byte; 8]);
+    let mut offset = 0;
+    while offset + 8 <= bytes.len() {
+        let different =
+            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) ^ repeated;
+        if different != 0 {
+            return offset + different.trailing_zeros() as usize / 8;
+        }
+        offset += 8;
+    }
+    offset
+        + bytes[offset..]
+            .iter()
+            .position(|&value| value != byte)
+            .unwrap_or(bytes.len() - offset)
+}
+
+/// Exact table and packet length for a complete channel. Large images count
+/// independent rows in parallel; no compressed channel is staged merely to
+/// decide whether storing the raw bytes would be smaller.
+pub fn encoded_scanlines_len(
+    data: &[u8],
+    scanline_bytes: usize,
+    size_width: usize,
+) -> Result<usize> {
+    if scanline_bytes == 0
+        || !data.len().is_multiple_of(scanline_bytes)
+        || !matches!(size_width, 2 | 4)
+    {
+        return Err(CodecError::InvalidInput("invalid scanline geometry"));
+    }
+    let table = (data.len() / scanline_bytes)
+        .checked_mul(size_width)
+        .ok_or(CodecError::InvalidInput("scanline table length overflows"))?;
+    let packets = if data.len() >= PARALLEL_MIN_BYTES {
+        data.par_chunks(scanline_bytes)
+            .map(pack_bits_encoded_len)
+            .try_fold(
+                || 0usize,
+                |a, b| {
+                    a.checked_add(b)
+                        .ok_or(CodecError::InvalidInput("compressed length overflows"))
+                },
+            )
+            .try_reduce(
+                || 0,
+                |a, b| {
+                    a.checked_add(b)
+                        .ok_or(CodecError::InvalidInput("compressed length overflows"))
+                },
+            )
+    } else {
+        data.chunks(scanline_bytes)
+            .map(pack_bits_encoded_len)
+            .try_fold(0usize, |a, b| {
+                a.checked_add(b)
+                    .ok_or(CodecError::InvalidInput("compressed length overflows"))
+            })
+    }?;
+    table
+        .checked_add(packets)
+        .ok_or(CodecError::InvalidInput("compressed length overflows"))
 }
 
 /// Run packet: header `257 - len`, then the repeated byte.
@@ -428,6 +503,99 @@ pub fn decompress_scanlines(
 
 #[cfg(test)]
 mod tests {
+    fn reference(data: &[u8]) -> Vec<u8> {
+        if data.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let start = 0;
+        let mut run_len: usize = 0;
+        let mut lit_len: usize = 0;
+
+        // Mirrors the upstream loop which inspects (prev, curr) pairs.
+        for i in 1..data.len() {
+            let prev = data[i - 1];
+            let curr = data[i];
+
+            if prev == curr {
+                // A repeat starts: flush any pending literal run first
+                // (upstream flushes `data[i - nonRunLen - 1 ..= i - 2]`).
+                if lit_len != 0 {
+                    write_literal(&mut out, &data[i - lit_len - 1..i - 1]);
+                    lit_len = 0;
+                }
+
+                run_len += 1;
+                if run_len == MAX_PACKET_LEN {
+                    write_run(&mut out, run_len, curr);
+                    run_len = 0;
+                }
+            } else {
+                // Run ended (or never started).
+                if run_len != 0 {
+                    run_len += 1;
+                    write_run(&mut out, run_len, prev);
+                    run_len = 0;
+                } else {
+                    lit_len += 1;
+                }
+
+                if lit_len == MAX_PACKET_LEN {
+                    // Upstream flushes `data[i - nonRunLen ..= i - 1]` here;
+                    // the current byte stays pending for the next iteration.
+                    write_literal(&mut out, &data[i - lit_len..i]);
+                    lit_len = 0;
+                }
+            }
+        }
+
+        // Flush the tail (upstream "encode the last item" epilogue).
+        let n = data.len();
+        if run_len != 0 {
+            run_len += 1;
+            write_run(&mut out, run_len, data[n - 1]);
+        } else {
+            lit_len += 1;
+            write_literal(&mut out, &data[n - lit_len..]);
+        }
+
+        // Pad this row to 2-byte alignment with the no-op packet.
+        if !(out.len() - start).is_multiple_of(2) {
+            out.push(128);
+        }
+        out
+    }
+
+    #[test]
+    fn packet_walk_and_exact_lengths_match_the_original_state_machine() {
+        let mut state = 0x1234_5678u32;
+        for len in [0, 1, 7, 8, 9, 31, 32, 127, 128, 129, 255, 256, 257, 4097] {
+            for range in [1, 2, 3, 16, 256] {
+                let data: Vec<_> = (0..len)
+                    .map(|_| {
+                        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                        ((state >> 24) % range) as u8
+                    })
+                    .collect();
+                let expected = reference(&data);
+                assert_eq!(
+                    pack_bits_compress(&data),
+                    expected,
+                    "{len} bytes, range {range}"
+                );
+                assert_eq!(pack_bits_encoded_len(&data), expected.len());
+            }
+        }
+        // Long runs with a one-byte remainder followed by literals or another run.
+        for run in [127, 128, 129, 255, 256, 257, 4096] {
+            let mut data = vec![7; run];
+            data.extend_from_slice(&[8, 9, 9, 9, 10]);
+            assert_eq!(pack_bits_compress(&data), reference(&data));
+        }
+        // Verify the byte-zero trick when a zero is followed by a one.
+        assert_eq!(first_repeat(&[1, 1, 0, 2, 3, 4, 5, 6, 7]), Some(0));
+    }
+
     use super::*;
 
     /// The Wikipedia PackBits example, pinned byte-for-byte by upstream

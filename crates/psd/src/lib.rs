@@ -34,6 +34,9 @@ pub mod smart_object;
 pub mod text;
 pub mod tree;
 pub mod warp;
+pub mod write_options;
+mod write_pipeline;
+pub use write_options::{CompressionPolicy, WriteOptions};
 
 // Re-export the raw-format layer so callers can reach placed-layer and
 // linked-data types (`psd::core::PlacedLayer`, …) through the document API.

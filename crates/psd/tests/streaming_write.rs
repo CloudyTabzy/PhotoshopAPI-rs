@@ -238,12 +238,17 @@ fn a_lazy_document_writes_its_compressed_channels_without_copying_them() {
         }
     }
 
-    // A decoded document compresses afresh, so its payloads are its own.
+    // Encoded payloads own their bytes; native raw byte samples can be
+    // borrowed directly without an identity copy.
     let document = synthetic::<u8>(16, 1);
     let staged = document.to_photoshop_file().unwrap();
     for layer in &staged.layer_and_mask_info.layer_info.channel_image_data {
         for channel in &layer.channels {
-            assert!(matches!(channel.data, Cow::Owned(_)));
+            if channel.compression == psd::core::Compression::Raw {
+                assert!(matches!(channel.data, Cow::Borrowed(_)));
+            } else {
+                assert!(matches!(channel.data, Cow::Owned(_)));
+            }
         }
     }
 }
@@ -364,5 +369,87 @@ fn concurrent_saves_use_distinct_temporaries_and_commit_complete_documents() {
         .file_name()
         .to_string_lossy()
         .contains(".tmp-")));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn policies_and_workspace_limits_preserve_pixels_and_streamed_layouts() {
+    for version in [psd::core::Version::Psd, psd::core::Version::Psb] {
+        let mut document = synthetic::<u16>(256, 3);
+        document.version = version;
+        for policy in [
+            psd::CompressionPolicy::Balanced,
+            psd::CompressionPolicy::Compact,
+            psd::CompressionPolicy::Fast,
+        ] {
+            let options = psd::WriteOptions::default().with_compression_policy(policy);
+            let sequential = document
+                .to_bytes_with_options(options.with_working_memory_limit(0))
+                .unwrap();
+            let bounded = document
+                .to_bytes_with_options(options.with_working_memory_limit(512 * 1024))
+                .unwrap();
+            assert_eq!(sequential, bounded);
+            let staged = document.to_photoshop_file_with_options(options).unwrap();
+            let mut buffered = psd::core::BeWriter::new();
+            staged.write(&mut buffered).unwrap();
+            assert_eq!(sequential, buffered.into_inner());
+            let reread = LayeredFile::<u16>::from_bytes(&bounded).unwrap();
+            for (expected, actual) in document.layers().zip(reread.layers()) {
+                for (key, samples) in expected.channels().unwrap().iter() {
+                    assert!(
+                        Some(samples) == actual.channels().unwrap().get(key),
+                        "channel {key:?} changed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn seekable_writer_checks_callback_counts_and_actual_bytes() {
+    let document = synthetic::<u8>(4, 1);
+    for wrong_length in [false, true] {
+        let mut file = document.to_photoshop_file().unwrap();
+        let mut sink = std::io::Cursor::new(Vec::new());
+        let result = file.write_seekable(&mut sink, |sink| {
+            sink.write_all(&[0; 3])?;
+            Ok(if wrong_length {
+                vec![vec![100; 4]]
+            } else {
+                Vec::new()
+            })
+        });
+        assert!(result.is_err());
+    }
+}
+
+#[test]
+fn a_late_codec_failure_keeps_the_target_and_removes_the_private_temporary() {
+    let directory =
+        std::env::temp_dir().join(format!("psd-late-codec-error-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("document.psd");
+    std::fs::write(&path, b"original target").unwrap();
+    let mut document = LayeredFile::<f32>::new(ColorMode::Rgb, 30000, 1).unwrap();
+    let mut layer = Layer::new_image("Noisy wide row", Rect::new(0, 0, 1, 30000));
+    layer.compression = Some(psd::core::Compression::Rle);
+    let mut state = 0x1234_5678u32;
+    let data = (0..30000)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            f32::from_bits(state)
+        })
+        .collect();
+    layer
+        .image_mut()
+        .unwrap()
+        .channels
+        .insert(ChannelKey::color(0), data);
+    document.add_layer(layer);
+    assert!(document.write(&path).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"original target");
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
     std::fs::remove_dir_all(directory).unwrap();
 }

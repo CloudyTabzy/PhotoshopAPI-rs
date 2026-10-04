@@ -252,8 +252,18 @@ const BLOCK_SAMPLES: usize = 32 * 1024;
 /// Prediction-encode and compress integers a block at a time. Only the
 /// compressed result is retained at channel size; prediction uses small blocks.
 pub fn compress<T: DeltaSample>(data: &[T], width: usize, height: usize) -> Result<Vec<u8>> {
+    compress_with_policy(data, width, height, crate::zip::CompressionPolicy::Balanced)
+}
+
+/// Prediction compression with an explicit lossless size/speed policy.
+pub fn compress_with_policy<T: DeltaSample>(
+    data: &[T],
+    width: usize,
+    height: usize,
+    policy: crate::zip::CompressionPolicy,
+) -> Result<Vec<u8>> {
     let mut scratch = Vec::new();
-    compress_blocks(data, width, height, |block, width, _, encoded| {
+    compress_blocks(data, width, height, policy, |block, width, _, encoded| {
         scratch.clear();
         scratch.extend_from_slice(block);
         T::delta_rows(&mut scratch, width);
@@ -267,7 +277,17 @@ pub fn compress<T: DeltaSample>(data: &[T], width: usize, height: usize) -> Resu
 
 /// The f32 counterpart of [`compress`], including byte-plane prediction.
 pub fn compress_f32(data: &[f32], width: usize, height: usize) -> Result<Vec<u8>> {
-    compress_blocks(data, width, height, |block, width, _, encoded| {
+    compress_f32_with_policy(data, width, height, crate::zip::CompressionPolicy::Balanced)
+}
+
+/// Float prediction compression with an explicit lossless size/speed policy.
+pub fn compress_f32_with_policy(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    policy: crate::zip::CompressionPolicy,
+) -> Result<Vec<u8>> {
+    compress_blocks(data, width, height, policy, |block, width, _, encoded| {
         encoded.resize(block.len() * 4, 0);
         for (row, src) in encoded.chunks_mut(width * 4).zip(block.chunks(width)) {
             kernels::deinterleave_f32_row(row, src, width);
@@ -281,27 +301,10 @@ fn compress_blocks<T: BeConvert>(
     data: &[T],
     width: usize,
     height: usize,
+    policy: crate::zip::CompressionPolicy,
     mut encode: impl FnMut(&[T], usize, usize, &mut Vec<u8>) -> Result<()>,
 ) -> Result<Vec<u8>> {
     check_sample_count(data.len(), width, height)?;
-    #[cfg(feature = "zip-backend-miniz")]
-    {
-        if data.is_empty() {
-            return crate::zip::compress(&[]);
-        }
-        data.len()
-            .checked_mul(T::SIZE)
-            .ok_or(CodecError::InvalidInput("image dimensions overflow"))?;
-        let rows = (BLOCK_SAMPLES / width).max(1);
-        let mut block_bytes = Vec::new();
-        let mut encoded = Vec::with_capacity(data.len() * T::SIZE);
-        for block in data.chunks(rows * width) {
-            encode(block, width, block.len() / width, &mut block_bytes)?;
-            encoded.extend_from_slice(&block_bytes);
-        }
-        crate::zip::compress(&encoded)
-    }
-    #[cfg(any(feature = "zip-backend-zlib-rs", feature = "zip-backend-linflate"))]
     {
         if data.is_empty() {
             return crate::zip::compress(&[]);
@@ -313,7 +316,7 @@ fn compress_blocks<T: BeConvert>(
         let rows = (BLOCK_SAMPLES / width).max(1);
         let mut sample = Vec::new();
         let mut encoded = Vec::new();
-        if bytes >= 1024 * 1024 {
+        if bytes >= 1024 * 1024 && policy != crate::zip::CompressionPolicy::Compact {
             for first in [0, height / 2, height.saturating_sub(rows)] {
                 let last = first.saturating_add(rows).min(height);
                 encode(
@@ -325,13 +328,60 @@ fn compress_blocks<T: BeConvert>(
                 sample.extend_from_slice(&encoded[..encoded.len().min(16 * 1024)]);
             }
         }
-        let mut encoder = crate::zip::StreamingEncoder::new(&sample, bytes)?;
-        for block in data.chunks(rows * width) {
-            encode(block, width, block.len() / width, &mut encoded)?;
-            encoder.push(&encoded)?;
+        let mut policy = policy;
+        'attempt: loop {
+            let mut encoder = crate::zip::StreamingEncoder::with_policy(&sample, bytes, policy)?;
+            for block in data.chunks(rows * width) {
+                encode(block, width, block.len() / width, &mut encoded)?;
+                encoder.push(&encoded)?;
+                if encoder.needs_replay() {
+                    policy = crate::zip::CompressionPolicy::Compact;
+                    continue 'attempt;
+                }
+            }
+            return encoder.finish();
         }
-        encoder.finish()
     }
+}
+
+/// Compress a constant integer plane without allocating the plane.
+pub fn compress_constant<T: DeltaSample>(value: T, width: usize, height: usize) -> Result<Vec<u8>> {
+    compress_constant_with(value, width, height, encode::<T>)
+}
+
+/// Compress a constant float plane with byte-plane prediction.
+pub fn compress_constant_f32(value: f32, width: usize, height: usize) -> Result<Vec<u8>> {
+    compress_constant_with(value, width, height, encode_f32)
+}
+
+fn compress_constant_with<T: BeConvert>(
+    value: T,
+    width: usize,
+    height: usize,
+    encode: impl Fn(&[T], usize, usize) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let samples = width
+        .checked_mul(height)
+        .ok_or(CodecError::InvalidInput("image dimensions overflow"))?;
+    let bytes = samples
+        .checked_mul(T::SIZE)
+        .ok_or(CodecError::InvalidInput("image dimensions overflow"))?;
+    if samples == 0 {
+        return crate::zip::compress(&[]);
+    }
+    let rows = (BLOCK_SAMPLES / width).max(1).min(height);
+    let data = vec![value; width * rows];
+    let block = encode(&data, width, rows)?;
+    let mut encoder = crate::zip::StreamingEncoder::with_policy(
+        &[],
+        bytes,
+        crate::zip::CompressionPolicy::Compact,
+    )?;
+    for _ in 0..height / rows {
+        encoder.push(&block)?;
+    }
+    encoder.push(&block[..height % rows * width * T::SIZE])?;
+    encoder.finish()
 }
 
 /// Prediction-decode integer samples. Mirrors `RemovePredictionEncoding<T>`.
@@ -749,6 +799,63 @@ mod kernels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_constant_planes_match_materialized_prediction_at_every_depth() {
+        for (width, height) in [(1, 1), (7, 300), (40000, 3), (512, 512)] {
+            let bytes = compress_constant(65535u16, width, height).unwrap();
+            assert_eq!(
+                decompress::<u16>(&bytes, width, height).unwrap(),
+                vec![65535; width * height]
+            );
+            let bytes = compress_constant(255u8, width, height).unwrap();
+            assert_eq!(
+                decompress::<u8>(&bytes, width, height).unwrap(),
+                vec![255; width * height]
+            );
+            let bytes = compress_constant_f32(1.0, width, height).unwrap();
+            assert_eq!(
+                decompress_f32(&bytes, width, height).unwrap(),
+                vec![1.0; width * height]
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_balanced_replays_when_probe_windows_miss_flat_regions() {
+        let width = 256;
+        let height = 8192;
+        let mut delta = vec![0u8; width * height];
+        let mut state = 0x1234_5678u32;
+        for start in [0, delta.len() / 2, delta.len() - BLOCK_SAMPLES] {
+            for byte in &mut delta[start..start + 16 * 1024] {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                *byte = (state >> 24) as u8;
+            }
+        }
+        let mut samples = delta.clone();
+        for row in samples.chunks_mut(width) {
+            for index in 1..width {
+                row[index] = row[index].wrapping_add(row[index - 1]);
+            }
+        }
+        let balanced = compress_with_policy(
+            &samples,
+            width,
+            height,
+            crate::zip::CompressionPolicy::Balanced,
+        )
+        .unwrap();
+        let compact = compress_with_policy(
+            &samples,
+            width,
+            height,
+            crate::zip::CompressionPolicy::Compact,
+        )
+        .unwrap();
+        assert_eq!(balanced, compact);
+        assert!(crate::zip::decompress(&balanced, delta.len()).unwrap() == delta);
+    }
 
     #[test]
     fn int_prediction_round_trip_u8() {

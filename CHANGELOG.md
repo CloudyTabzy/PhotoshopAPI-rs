@@ -12,6 +12,46 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.30] - 2026-10-04
+
+### Added
+
+- `WriteOptions` and `CompressionPolicy` provide explicit lossless encoding
+  controls through `write_with_options`, `to_bytes_with_options` and
+  `to_photoshop_file_with_options`. `Balanced` guards sampled ZIP decisions
+  against redundancy elsewhere in the input; `Compact` uses default level-4
+  deflate without strategy sampling; `Fast` retains sampled strategy selection.
+  A configurable working-memory limit controls concurrent codec jobs; the
+  writer defaults to 256 MiB and zero selects sequential execution.
+- `PhotoshopFile::write_seekable` produces channel data through a callback,
+  validates its actual lengths and patches PSD/PSB and nested-layer fields.
+
+### Changed
+
+- File saves and `to_bytes` now stream a bounded window of encoded channels
+  directly into their final sink. Compressed planes are released as consumed
+  instead of retained for the entire document. Native raw 8-bit samples are
+  borrowed during serialization; exact byte-plane reservations avoid growing
+  the returned buffer by repeated doubling.
+- Automatic RLE selection counts packets over every scanline. Sampling no
+  longer discards compression benefits in heterogeneous planes. A shared
+  packet walker finds transitions in machine-word groups without unsafe code
+  and retains the original PackBits packet boundaries.
+- Balanced ZIP encoding observes the full input for repeated words within
+  the deflate window, replaying prediction with default deflate when probes
+  missed strong redundancy. Periodic textures and mixed flat/noisy planes
+  are covered by regression tests; the guard is not a universal size bound.
+- The ordered scheduler refills individual slots as results are consumed,
+  keeps workspace credits until consumption, preserves callback/error order
+  and supports nested and single-thread Rayon pools. Worker panics cannot
+  leave the coordinator waiting for a missing result.
+- Opaque transparency and repeated channels use bounded input blocks or
+  repeated encoded rows instead of full synthetic planes, including the
+  miniz streaming backend. The synthetic merged-image placeholder streams
+  its repeated scanlines instead of assembling the whole section. Retained
+  layerless composites share immutable bytes between snapshots and write
+  staging.
+
 ## [0.13.29] - 2026-10-04
 
 ### Added

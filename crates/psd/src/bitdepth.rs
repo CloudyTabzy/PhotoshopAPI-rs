@@ -42,6 +42,31 @@ pub trait BitDepth: BeConvert + Copy + PartialEq + Default + Send + Sync + 'stat
         psd_codecs::zip::compress(&Self::zip_prediction_encode(data, width, height)?)
     }
 
+    /// Select a lossless policy; custom sample implementations retain their
+    /// original encoder unless they override this hook.
+    fn zip_prediction_compress_with_policy(
+        data: &[Self],
+        width: usize,
+        height: usize,
+        _policy: psd_codecs::zip::CompressionPolicy,
+    ) -> CodecResult<Vec<u8>> {
+        Self::zip_prediction_compress(data, width, height)
+    }
+
+    /// Compress an implicit constant plane. Built-in depths use bounded blocks.
+    fn zip_prediction_compress_constant(
+        value: Self,
+        width: usize,
+        height: usize,
+    ) -> CodecResult<Vec<u8>> {
+        let samples = width
+            .checked_mul(height)
+            .ok_or(psd_codecs::CodecError::InvalidInput(
+                "image dimensions overflow",
+            ))?;
+        Self::zip_prediction_compress(&vec![value; samples], width, height)
+    }
+
     /// Inflate prediction directly into typed storage where supported.
     fn zip_prediction_decompress(
         payload: &[u8],
@@ -100,6 +125,23 @@ impl BitDepth for u8 {
         prediction::compress(data, width, height)
     }
 
+    fn zip_prediction_compress_with_policy(
+        data: &[Self],
+        width: usize,
+        height: usize,
+        policy: psd_codecs::zip::CompressionPolicy,
+    ) -> CodecResult<Vec<u8>> {
+        prediction::compress_with_policy(data, width, height, policy)
+    }
+
+    fn zip_prediction_compress_constant(
+        value: Self,
+        width: usize,
+        height: usize,
+    ) -> CodecResult<Vec<u8>> {
+        prediction::compress_constant(value, width, height)
+    }
+
     fn zip_prediction_decompress(
         payload: &[u8],
         width: usize,
@@ -146,6 +188,23 @@ impl BitDepth for u16 {
         prediction::compress(data, width, height)
     }
 
+    fn zip_prediction_compress_with_policy(
+        data: &[Self],
+        width: usize,
+        height: usize,
+        policy: psd_codecs::zip::CompressionPolicy,
+    ) -> CodecResult<Vec<u8>> {
+        prediction::compress_with_policy(data, width, height, policy)
+    }
+
+    fn zip_prediction_compress_constant(
+        value: Self,
+        width: usize,
+        height: usize,
+    ) -> CodecResult<Vec<u8>> {
+        prediction::compress_constant(value, width, height)
+    }
+
     fn zip_prediction_decompress(
         payload: &[u8],
         width: usize,
@@ -188,6 +247,23 @@ impl BitDepth for f32 {
 
     fn zip_prediction_compress(data: &[Self], width: usize, height: usize) -> CodecResult<Vec<u8>> {
         prediction::compress_f32(data, width, height)
+    }
+
+    fn zip_prediction_compress_with_policy(
+        data: &[Self],
+        width: usize,
+        height: usize,
+        policy: psd_codecs::zip::CompressionPolicy,
+    ) -> CodecResult<Vec<u8>> {
+        prediction::compress_f32_with_policy(data, width, height, policy)
+    }
+
+    fn zip_prediction_compress_constant(
+        value: Self,
+        width: usize,
+        height: usize,
+    ) -> CodecResult<Vec<u8>> {
+        prediction::compress_constant_f32(value, width, height)
     }
 
     fn zip_prediction_decompress(

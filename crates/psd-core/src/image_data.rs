@@ -27,7 +27,7 @@ pub struct ImageData {
     pub num_channels: u16,
     /// Original merged section, when a document is layerless and the caller
     /// has retained it for compositing and lossless round trips.
-    raw_section: Option<Vec<u8>>,
+    raw_section: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl ImageData {
@@ -40,12 +40,61 @@ impl ImageData {
 
     /// Preserve an existing merged section verbatim on write.
     pub fn set_raw_section(&mut self, section: Option<Vec<u8>>) {
+        self.raw_section = section.map(std::sync::Arc::new);
+    }
+
+    /// Share immutable retained bytes with a document without cloning its
+    /// merged image for each serialization or document snapshot.
+    pub fn set_shared_raw_section(&mut self, section: Option<std::sync::Arc<Vec<u8>>>) {
         self.raw_section = section;
     }
 
     /// The retained section, including its two-byte compression marker.
     pub fn raw_section(&self) -> Option<&[u8]> {
-        self.raw_section.as_deref()
+        self.raw_section.as_deref().map(Vec::as_slice)
+    }
+
+    /// Emit retained bytes directly or stream the repeated merged placeholder
+    /// through bounded blocks.
+    pub(crate) fn write_to<W: std::io::Write>(
+        &self,
+        sink: &mut W,
+        header: &FileHeader,
+    ) -> Result<()> {
+        if let Some(section) = self.raw_section() {
+            if section.len() < 2 {
+                return Err(PsdError::InvalidData {
+                    offset: 0,
+                    message: "retained merged image section is truncated",
+                });
+            }
+            sink.write_all(section)?;
+        } else {
+            let scanline_bytes = Self::scanline_bytes(header);
+            let scanline_size = Self::scanline_size(scanline_bytes);
+            if header.version == Version::Psd && scanline_size > u64::from(u16::MAX) {
+                return Err(PsdError::LengthOverflow {
+                    actual: scanline_size,
+                    width: 2,
+                });
+            }
+            sink.write_all(&1u16.to_be_bytes())?;
+            let rows = u64::from(self.num_channels) * u64::from(header.height);
+            if header.version == Version::Psd {
+                write_repeated(sink, &(scanline_size as u16).to_be_bytes(), rows)?;
+            } else {
+                write_repeated(sink, &(scanline_size as u32).to_be_bytes(), rows)?;
+            }
+            let fill = if header.depth == BitDepth::ThirtyTwo {
+                0
+            } else {
+                MERGED_FILL
+            };
+            let mut row = BeWriter::new();
+            write_fill_scanline(&mut row, scanline_bytes, fill);
+            write_repeated(sink, row.as_slice(), rows)?;
+        }
+        Ok(())
     }
 
     /// Bytes per scanline (one channel) for the given header.
@@ -118,6 +167,23 @@ impl ImageData {
         }
         Ok(())
     }
+}
+
+fn write_repeated<W: std::io::Write>(sink: &mut W, pattern: &[u8], mut count: u64) -> Result<()> {
+    if count == 0 || pattern.is_empty() {
+        return Ok(());
+    }
+    let copies = count.min((32 * 1024 / pattern.len()).max(1) as u64) as usize;
+    let mut block = Vec::with_capacity(pattern.len() * copies);
+    for _ in 0..copies {
+        block.extend_from_slice(pattern);
+    }
+    while count >= copies as u64 {
+        sink.write_all(&block)?;
+        count -= copies as u64;
+    }
+    sink.write_all(&block[..count as usize * pattern.len()])?;
+    Ok(())
 }
 
 /// The byte the merged-image fill uses at integer depths; see
@@ -195,6 +261,27 @@ mod tests {
                 body.chunks_exact(2).all(|pair| pair[1] == expected),
                 "depth {depth:?}: unexpected bytes {body:02x?}"
             );
+        }
+    }
+
+    #[test]
+    fn streamed_placeholder_matches_buffered_across_versions_depths_and_row_tails() {
+        for version in [Version::Psd, Version::Psb] {
+            for depth in [BitDepth::Eight, BitDepth::Sixteen, BitDepth::ThirtyTwo] {
+                for width in [1, 2, 127, 128, 129, 300] {
+                    let header = header(version, depth, width);
+                    let image = ImageData::new(4);
+                    let mut buffered = BeWriter::new();
+                    image.write(&mut buffered, &header).unwrap();
+                    let mut streamed = Vec::new();
+                    image.write_to(&mut streamed, &header).unwrap();
+                    assert_eq!(
+                        streamed,
+                        buffered.as_slice(),
+                        "{version:?} {depth:?} {width}"
+                    );
+                }
+            }
         }
     }
 

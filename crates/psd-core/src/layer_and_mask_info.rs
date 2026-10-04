@@ -585,7 +585,7 @@ enum Piece<'b> {
 /// position and drops the copy of the data, which the writer regenerates from the
 /// layer tree). When there are no layers left to regenerate it from, the block
 /// has nothing to say and is not written.
-fn is_emptied_layer_data(block: &TaggedBlock, header: &FileHeader) -> bool {
+pub(crate) fn is_emptied_layer_data(block: &TaggedBlock, header: &FileHeader) -> bool {
     let key = match header.depth {
         BitDepth::Sixteen => TaggedBlockKey::LR16,
         BitDepth::ThirtyTwo => TaggedBlockKey::LR32,
@@ -605,7 +605,7 @@ fn pad_to_four(len: u64) -> u64 {
 }
 
 /// A length field of the width the file's version uses.
-fn length_field(version: Version, value: u64) -> Result<Vec<u8>> {
+pub(crate) fn length_field(version: Version, value: u64) -> Result<Vec<u8>> {
     let mut writer = BeWriter::new();
     writer.len(version, value)?;
     Ok(writer.into_inner())
@@ -751,6 +751,25 @@ impl<'a> LayerRecord<'a> {
     }
 
     pub fn write(&self, writer: &mut BeWriter, header: &FileHeader) -> Result<()> {
+        self.write_record(writer, header, |_| {})
+    }
+
+    pub(crate) fn write_with_channel_offsets(
+        &self,
+        writer: &mut BeWriter,
+        header: &FileHeader,
+    ) -> Result<Vec<usize>> {
+        let mut offsets = Vec::with_capacity(self.channels.len());
+        self.write_record(writer, header, |offset| offsets.push(offset))?;
+        Ok(offsets)
+    }
+
+    fn write_record(
+        &self,
+        writer: &mut BeWriter,
+        header: &FileHeader,
+        mut channel_offset: impl FnMut(usize),
+    ) -> Result<()> {
         writer.i32(self.top);
         writer.i32(self.left);
         writer.i32(self.bottom);
@@ -764,6 +783,7 @@ impl<'a> LayerRecord<'a> {
         writer.u16(channel_count);
         for channel in &self.channels {
             writer.i16(channel.index);
+            channel_offset(writer.position());
             writer.len(header.version, channel.size)?;
         }
 

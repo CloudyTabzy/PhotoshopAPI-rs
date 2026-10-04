@@ -33,6 +33,18 @@ use crate::error::{CodecError, Result};
 /// compress is derived from this, so changing it changes the byte stream.
 pub const COMPRESSION_LEVEL: i32 = 4;
 
+/// Lossless entropy-coding policy. Pixels and Photoshop framing are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressionPolicy {
+    /// Probe strategies and check the complete input for strong redundancy.
+    #[default]
+    Balanced,
+    /// Always use default level-4 LZ77/deflate; avoid sampling decisions.
+    Compact,
+    /// Use sampled strategy selection without the full-input redundancy guard.
+    Fast,
+}
+
 /// zlib header's second byte for a compression level (upstream's mapping in
 /// `ZIP_Impl::Compress`; the first byte is always `0x78`).
 #[cfg(feature = "zip-backend-miniz")]
@@ -55,6 +67,19 @@ fn zlib_header_byte(level: i32) -> u8 {
 /// entropy coding can differ between engines and compression strategies.
 pub fn compress(uncompressed: &[u8]) -> Result<Vec<u8>> {
     engine::compress(uncompressed)
+}
+
+/// Compress with an explicit lossless size/speed policy.
+pub fn compress_with_policy(data: &[u8], policy: CompressionPolicy) -> Result<Vec<u8>> {
+    #[cfg(any(feature = "zip-backend-zlib-rs", feature = "zip-backend-linflate"))]
+    {
+        zlib_compress::compress_with_policy(data, policy)
+    }
+    #[cfg(feature = "zip-backend-miniz")]
+    {
+        let _ = policy;
+        engine::compress(data)
+    }
 }
 
 /// Decompress a full zlib stream (header + deflate + adler32) into exactly
@@ -126,10 +151,14 @@ mod zlib_compress {
     // separated windows before paying for a full LZ77 search. Huffman-only
     // is selected only when its estimated size is within 2% of the default
     // and the default cannot halve the input. Smooth channels retain LZ77.
-    fn strategy(data: &[u8], total_len: usize) -> Result<(zlib_rs::Strategy, usize)> {
+    fn strategy(
+        data: &[u8],
+        total_len: usize,
+        policy: CompressionPolicy,
+    ) -> Result<(zlib_rs::Strategy, usize)> {
         use zlib_rs::Strategy;
         const SAMPLE: usize = 16 * 1024;
-        if total_len < 1024 * 1024 {
+        if policy == CompressionPolicy::Compact || total_len < 1024 * 1024 {
             return Ok((Strategy::Default, zlib_rs::compress_bound(total_len)));
         }
         let mut output = vec![0; zlib_rs::compress_bound(SAMPLE)];
@@ -170,7 +199,17 @@ mod zlib_compress {
     }
 
     pub(super) fn compress(data: &[u8]) -> Result<Vec<u8>> {
-        let (strategy, _) = strategy(data, data.len())?;
+        compress_with_policy(data, CompressionPolicy::Balanced)
+    }
+
+    pub(super) fn compress_with_policy(data: &[u8], policy: CompressionPolicy) -> Result<Vec<u8>> {
+        let (mut strategy, _) = strategy(data, data.len(), policy)?;
+        if strategy == zlib_rs::Strategy::HuffmanOnly
+            && policy == CompressionPolicy::Balanced
+            && RedundancyGuard::new().observe(data)
+        {
+            strategy = zlib_rs::Strategy::Default;
+        }
         // Write the complete stream once. The engine computes Adler during
         // compression, eliminating the raw-stream copy and a separate pass.
         let mut output = vec![0; zlib_rs::compress_bound(data.len())];
@@ -193,21 +232,41 @@ mod zlib_compress {
         deflate: zlib_rs::Deflate,
         output: Vec<u8>,
         scratch: Vec<u8>,
+        guard: Option<RedundancyGuard>,
+        replay: bool,
     }
 
     impl StreamingEncoder {
-        pub(crate) fn new(sample: &[u8], total_len: usize) -> Result<Self> {
-            let (strategy, capacity) = strategy(sample, total_len)?;
+        pub(crate) fn with_policy(
+            sample: &[u8],
+            total_len: usize,
+            policy: CompressionPolicy,
+        ) -> Result<Self> {
+            let (strategy, capacity) = strategy(sample, total_len, policy)?;
             Ok(Self {
                 deflate: zlib_rs::Deflate::new_with_config(config(strategy)),
                 // Sampled capacity avoids reserving the whole raw input for a
                 // tiny stream. Vec can still grow if the estimate was low.
                 output: Vec::with_capacity(capacity),
                 scratch: vec![0; 32 * 1024],
+                guard: (strategy == zlib_rs::Strategy::HuffmanOnly
+                    && policy == CompressionPolicy::Balanced)
+                    .then(RedundancyGuard::new),
+                replay: false,
             })
         }
 
         pub(crate) fn push(&mut self, mut input: &[u8]) -> Result<()> {
+            if self
+                .guard
+                .as_mut()
+                .is_some_and(|guard| guard.observe(input))
+            {
+                // The source is replayable in prediction::compress_blocks.
+                // Do not retain a second channel merely to support rollback.
+                self.replay = true;
+                return Ok(());
+            }
             while !input.is_empty() {
                 let before_in = self.deflate.total_in();
                 let before_out = self.deflate.total_out();
@@ -226,6 +285,9 @@ mod zlib_compress {
         }
 
         pub(crate) fn finish(mut self) -> Result<Vec<u8>> {
+            if self.replay {
+                return Err(CodecError::InvalidInput("adaptive stream requires replay"));
+            }
             loop {
                 let before = self.deflate.total_out();
                 let status = self
@@ -245,11 +307,149 @@ mod zlib_compress {
             self.output.shrink_to_fit();
             Ok(self.output)
         }
+
+        pub(crate) fn needs_replay(&self) -> bool {
+            self.replay
+        }
+    }
+
+    // A small dictionary observes the entire input at jittered 16-byte steps.
+    // Eight-byte matches within DEFLATE's window catch periodic textures and
+    // large flat regions that isolated probes can miss. This is a guard, not
+    // a promised compressed-size bound; Compact avoids the heuristic entirely.
+    struct RedundancyGuard {
+        entries: Vec<(u64, u64)>,
+        position: u64,
+        sampled: u64,
+        matches: u64,
+    }
+    impl RedundancyGuard {
+        fn new() -> Self {
+            Self {
+                entries: vec![(0, u64::MAX); 4096],
+                position: 0,
+                sampled: 0,
+                matches: 0,
+            }
+        }
+        fn observe(&mut self, bytes: &[u8]) -> bool {
+            let mut offset = 0usize;
+            while offset + 23 <= bytes.len() {
+                let jitter = (self.sampled.wrapping_mul(0x9E37_79B9) >> 28) as usize & 15;
+                let start = offset + jitter;
+                let word = u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap());
+                let bucket = (word.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize;
+                let position = self.position + start as u64;
+                let (previous, last) = self.entries[bucket];
+                if last != u64::MAX && position.saturating_sub(last) <= 32768 && previous == word {
+                    self.matches += 1;
+                }
+                self.entries[bucket] = (word, position);
+                self.sampled += 1;
+                if self.sampled >= 1024 && self.matches * 64 >= self.sampled {
+                    return true;
+                }
+                offset += 16;
+            }
+            self.position += bytes.len() as u64;
+            false
+        }
     }
 }
 
 #[cfg(any(feature = "zip-backend-zlib-rs", feature = "zip-backend-linflate"))]
 pub(crate) use zlib_compress::StreamingEncoder;
+
+#[cfg(feature = "zip-backend-miniz")]
+pub(crate) struct StreamingEncoder {
+    compressor: Box<miniz_oxide::deflate::core::CompressorOxide>,
+    output: Vec<u8>,
+    scratch: Vec<u8>,
+}
+
+#[cfg(feature = "zip-backend-miniz")]
+impl StreamingEncoder {
+    pub(crate) fn with_policy(
+        _sample: &[u8],
+        _total: usize,
+        _policy: CompressionPolicy,
+    ) -> Result<Self> {
+        let flags =
+            miniz_oxide::deflate::core::create_comp_flags_from_zip_params(COMPRESSION_LEVEL, 15, 0);
+        Ok(Self {
+            compressor: Box::new(miniz_oxide::deflate::core::CompressorOxide::new(flags)),
+            output: Vec::new(),
+            scratch: vec![0; 32 * 1024],
+        })
+    }
+    pub(crate) fn push(&mut self, mut input: &[u8]) -> Result<()> {
+        while !input.is_empty() {
+            let result = miniz_oxide::deflate::stream::deflate(
+                &mut self.compressor,
+                input,
+                &mut self.scratch,
+                miniz_oxide::MZFlush::None,
+            );
+            result.status.map_err(|_| CodecError::Deflate)?;
+            if result.bytes_consumed == 0 && result.bytes_written == 0 {
+                return Err(CodecError::Deflate);
+            }
+            self.output
+                .extend_from_slice(&self.scratch[..result.bytes_written]);
+            input = &input[result.bytes_consumed..];
+        }
+        Ok(())
+    }
+    pub(crate) fn finish(mut self) -> Result<Vec<u8>> {
+        loop {
+            let result = miniz_oxide::deflate::stream::deflate(
+                &mut self.compressor,
+                &[],
+                &mut self.scratch,
+                miniz_oxide::MZFlush::Finish,
+            );
+            let status = result.status.map_err(|_| CodecError::Deflate)?;
+            self.output
+                .extend_from_slice(&self.scratch[..result.bytes_written]);
+            if status == miniz_oxide::MZStatus::StreamEnd {
+                break;
+            }
+            if result.bytes_written == 0 {
+                return Err(CodecError::Deflate);
+            }
+        }
+        self.output[..2].copy_from_slice(&[0x78, 0x5E]);
+        self.output.shrink_to_fit();
+        Ok(self.output)
+    }
+    pub(crate) fn needs_replay(&self) -> bool {
+        false
+    }
+}
+
+/// Compress a repeated byte pattern using fixed-size input blocks.
+pub fn compress_repeated(pattern: &[u8], count: usize) -> Result<Vec<u8>> {
+    if pattern.is_empty() || count == 0 {
+        return compress(&[]);
+    }
+    let total = pattern
+        .len()
+        .checked_mul(count)
+        .ok_or(CodecError::InvalidInput("repeated length overflows"))?;
+    let copies = (32 * 1024 / pattern.len()).max(1).min(count);
+    let mut block = Vec::with_capacity(pattern.len() * copies);
+    for _ in 0..copies {
+        block.extend_from_slice(pattern);
+    }
+    let mut encoder = StreamingEncoder::with_policy(&[], total, CompressionPolicy::Compact)?;
+    let mut remaining = count;
+    while remaining >= copies {
+        encoder.push(&block)?;
+        remaining -= copies;
+    }
+    encoder.push(&block[..remaining * pattern.len()])?;
+    encoder.finish()
+}
 
 #[cfg(feature = "zip-backend-zlib-rs")]
 mod engine {
@@ -385,6 +585,37 @@ mod engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balanced_guards_unsampled_flat_regions_and_long_periodic_data() {
+        let mut state = 0x1234_5678u32;
+        let mut noise = |length| {
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (state >> 24) as u8
+                })
+                .collect::<Vec<_>>()
+        };
+        let size = 2 * 1024 * 1024;
+        let mut mixed = vec![0; size];
+        for start in [0, (size - 16 * 1024) / 2, size - 16 * 1024] {
+            mixed[start..start + 16 * 1024].copy_from_slice(&noise(16 * 1024));
+        }
+        let period = noise(32767);
+        let periodic: Vec<_> = period.iter().copied().cycle().take(size).collect();
+        for data in [mixed, periodic] {
+            let balanced = compress_with_policy(&data, CompressionPolicy::Balanced).unwrap();
+            let compact = compress_with_policy(&data, CompressionPolicy::Compact).unwrap();
+            assert_eq!(decompress(&balanced, data.len()).unwrap(), data);
+            assert!(
+                balanced.len() <= compact.len() + 32,
+                "{} vs {}",
+                balanced.len(),
+                compact.len()
+            );
+        }
+    }
 
     fn sample_data() -> Vec<u8> {
         // Repetitive-ish data so deflate actually compresses.
