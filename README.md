@@ -369,6 +369,13 @@ read retains PSD streams, then `decode_all_layer_pixels()` decodes them. Compare
 decode. Upstream extraction visits `ImageLayer` objects; Rust also materializes
 other layer kinds, so the extracted pixel counts can differ.
 
+<p align="center">
+<img src="docs/benchmarks/corpus_graphs.png" width="49%" alt="Corpus documents — read+extract and write times, C++ vs Rust"/>
+<img src="docs/benchmarks/synthetic_graphs.png" width="49%" alt="Large synthetic documents — read+extract and write times, C++ vs Rust"/>
+</p>
+
+Charts regenerate from the tables below via `docs/benchmarks/make_plots.py`.
+
 | Corpus document | Read + extract C++ / Rust | Write C++ / Rust | Total C++ / Rust |
 |---|---|---|---|
 | `Compression_Mixed_8bit.psd` | 9.81 / **1.19** | 22.84 / **1.71** | 33.31 / **2.95** |
@@ -438,6 +445,18 @@ level-4 deflate throughout, `Fast` for sampled selection alone, and a working
 memory limit for codec jobs. Sustained disk contention can dominate writes;
 the figures above describe these measured workloads.
 
+<details>
+<summary><b>Per-document charts</b></summary>
+<p align="center">
+<img src="docs/benchmarks/Compression_Mixed_8bit_combined_plot.png" width="32%" alt="Compression Mixed (8-bit)"/>
+<img src="docs/benchmarks/CMYK_16_combined_plot.png" width="32%" alt="CMYK (16-bit)"/>
+<img src="docs/benchmarks/example_combined_plot.png" width="32%" alt="Webtoon example (8-bit)"/>
+<img src="docs/benchmarks/smart_object_file_no_warp_combined_plot.png" width="32%" alt="Smart object, no warp (8-bit)"/>
+<img src="docs/benchmarks/big8_combined_plot.png" width="32%" alt="big8 (435 MB, 8-bit RLE)"/>
+<img src="docs/benchmarks/big16_combined_plot.png" width="32%" alt="big16 (252 MB, 16-bit ZIP-prediction)"/>
+</p>
+</details>
+
 Reproduce the Rust side with:
 
 ```text
@@ -474,8 +493,8 @@ The full list is in [CHANGELOG.md](CHANGELOG.md) under *Changed* and *Fixed*.
   container × compression, all written by Photoshop 2022.
 - Byte-exact codec vectors, and read → write → read structural plus pixel
   round-trip assertions.
-- CI on Windows, Linux and macOS: build, tests, `clippy -D warnings`, `fmt`, and
-  rustdoc with warnings denied.
+- Tested locally on Windows; `clippy -D warnings`, `cargo fmt` and rustdoc are
+  clean. No hosted CI at the moment.
 
 ## Roadmap
 
