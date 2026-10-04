@@ -608,8 +608,13 @@ impl<T: BitDepth> LayeredFile<T> {
         options: ReadOptions,
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<Self> {
+        let phase_timing = std::env::var_os("PSD_PHASE_TIMING").is_some();
+        let phase_start = std::time::Instant::now();
         let mut reader = BeReader::new(bytes);
         let file = PhotoshopFile::read_borrowed(&mut reader)?;
+        if phase_timing {
+            eprintln!("parse: {:.1}ms", phase_start.elapsed().as_secs_f64() * 1e3);
+        }
         let stored_merged_image = if file.layer_and_mask_info.layer_info.layer_records.is_empty() {
             let start = reader.position();
             // LayerInfo cannot express a negative zero layer count. For a
@@ -695,6 +700,8 @@ impl<T: BitDepth> LayeredFile<T> {
             layers: Vec::new(),
             root_children: Vec::new(),
         };
+        let phase_timing = std::env::var_os("PSD_PHASE_TIMING").is_some();
+        let phase_start = std::time::Instant::now();
         let mut remaining_bitmap_memory = options.total_memory_limit;
         document.build_layers(
             std::mem::take(&mut layer_and_mask_info.layer_info),
@@ -704,7 +711,20 @@ impl<T: BitDepth> LayeredFile<T> {
             progress,
         )?;
         document.remaining_bitmap_memory = remaining_bitmap_memory;
+        if phase_timing {
+            eprintln!(
+                "build_layers: {:.1}ms",
+                phase_start.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let phase_start = std::time::Instant::now();
         document.text_cache = TextCacheBaseline::capture(&document);
+        if phase_timing {
+            eprintln!(
+                "text_cache: {:.1}ms",
+                phase_start.elapsed().as_secs_f64() * 1e3
+            );
+        }
         Ok(document)
     }
 
