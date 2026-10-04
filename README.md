@@ -310,50 +310,6 @@ crates/psd-py/       PyO3 bindings
 fixtures/            vendored test corpus
 ```
 
-## Dependencies
-
-This port does use dependencies — it is not dependency-free. The point of the
-crate split is that most of them are confined to one layer, and the core format
-and codec crates pull in almost nothing.
-
-### Direct dependencies
-
-| Crate | Dependency | License | Why |
-|---|---|---|---|
-| `psd-core` | [`thiserror`](https://crates.io/crates/thiserror) 2.0 | MIT OR Apache-2.0 | Derive the `PsdError` enum |
-| `psd-core` | [`tracing`](https://crates.io/crates/tracing) 0.1 | MIT | `warn!` for recoverable anomalies |
-| `psd-core` | [`serde`](https://crates.io/crates/serde) 1.0 | MIT OR Apache-2.0 | Optional (`serde` feature) descriptor views |
-| `psd-codecs` | [`linflate`](https://crates.io/crates/linflate) 0.1 | MIT OR Apache-2.0 | Default byte-oriented ZIP inflate |
-| `psd-codecs` | [`zlib-rs`](https://crates.io/crates/zlib-rs) 0.6 | Zlib | ZIP deflate and direct typed inflate |
-| `psd-codecs` | [`miniz_oxide`](https://crates.io/crates/miniz_oxide) 0.9 | MIT OR Zlib OR Apache-2.0 | Optional ZIP backend |
-| `psd-codecs` | [`bytemuck`](https://crates.io/crates/bytemuck) 1.25 | Zlib OR Apache-2.0 OR MIT | Checked byte views for direct typed decode |
-| `psd-codecs` | [`fearless_simd`](https://crates.io/crates/fearless_simd) 1.0 | Apache-2.0 OR MIT | Portable prediction kernels |
-| `psd-codecs` | [`fearless_simd_macros`](https://crates.io/crates/fearless_simd_macros) 0.1 | Apache-2.0 OR MIT | Compile kernels for each SIMD backend |
-| `psd-codecs` | [`rayon`](https://crates.io/crates/rayon) 1.12 | MIT OR Apache-2.0 | Parallelism across scanlines and channels |
-| `psd-codecs` | [`thiserror`](https://crates.io/crates/thiserror) 2.0 | MIT OR Apache-2.0 | `CodecError` |
-| `psd` | [`memmap2`](https://crates.io/crates/memmap2) 0.9 | MIT OR Apache-2.0 | Memory-mapped reads |
-| `psd` | [`nalgebra`](https://crates.io/crates/nalgebra) 0.34 | Apache-2.0 | Homographies for smart-object placement |
-| `psd` | [`rayon`](https://crates.io/crates/rayon) 1.12 | MIT OR Apache-2.0 | Parallel channel decode and compositing |
-| `psd` | [`image`](https://crates.io/crates/image) 0.25 | MIT OR Apache-2.0 | JPEG/PNG smart-object sources (default feature) |
-| `psd` | [`uuid`](https://crates.io/crates/uuid) 1.26 | Apache-2.0 OR MIT | Smart-object linked-data identities |
-| `psd-py` | [`pyo3`](https://crates.io/crates/pyo3) 0.29 | MIT OR Apache-2.0 | Python bindings |
-| `psd-py` | [`numpy`](https://crates.io/crates/numpy) 0.29 | BSD-2-Clause | Zero-copy NumPy array interop |
-
-`serde_json` (MIT OR Apache-2.0) is a dev-dependency of `psd-core`, used only to
-assert descriptor serialization in tests.
-
-### Transitive dependencies
-
-With `--all-features` the resolved graph is **106 crates**, and every one of them
-is permissively licensed: MIT, Apache-2.0, BSD-2-Clause / BSD-3-Clause, Zlib,
-0BSD, Unlicense, Unicode-3.0, and Apache-2.0-with-LLVM-exception. There is **no
-GPL, AGPL, SSPL, EUPL or MPL** anywhere in the tree, so linking this library
-into a proprietary product does not oblige you to open-source anything.
-
-The one license expression mentioning LGPL is `r-efi` (a UEFI-target crate,
-not part of a normal desktop build), and it is `MIT OR Apache-2.0 OR
-LGPL-2.1-or-later` — an either/or choice, so the LGPL terms never apply.
-
 ## Performance
 
 Read → materialize layer pixels → write, measured on the same machine against
@@ -401,13 +357,12 @@ arithmetic, in layer/channel/row/column order. Let `n = state >> 24`: 8-bit
 samples are `(g as u8) ^ (n & 15)`; 16-bit samples are `((g & 255) << 8) | n`.
 These specify the pixel workloads; encoded sizes depend on the writer/backend.
 
-In an earlier, quieter five-run Rust comparison, this pipeline completed the
-two synthetic files in 331.3 and 546.2 ms versus 347.2 and 660.7 ms on 0.13.29.
-The fresh cross-implementation run does not establish a large-file write lead:
-both writers encountered multi-second storage stalls. Default eager Rust reads
-in the fresh run took 114.7 and 171.5 ms respectively. Decoded channels match
-their inputs. Upstream re-embeds smart-object data through OpenImageIO on write;
-Rust preserves untouched linked bytes.
+Under quieter storage the pipeline completes the two synthetic files in
+331.3 and 546.2 ms; the benchmark run does not establish a large-file write
+lead — both writers encountered multi-second storage stalls. Default eager
+Rust reads took 114.7 and 171.5 ms respectively. Decoded channels match
+their inputs. Upstream re-embeds smart-object data through OpenImageIO on
+write; Rust preserves untouched linked bytes.
 
 Serializing the same two files without disk I/O (`to_bytes`, 0.13.32, same
 machine, eager-read documents) took about 125 ms for `big8.psd` and 320 ms for
@@ -416,16 +371,16 @@ output path ranged from 134 ms to 6.4 s. The large-file write variance above
 comes from storage, not from encoding.
 
 Heap allocation peaks (MiB; source file cache and thread stacks excluded),
-comparing 0.13.29 with 0.13.30:
+for the synthetic documents:
 
-| Operation | Previous Rust | Current Rust |
-|---|---:|---:|
-| Eager read, large 8-bit | 549.5 | 549.5 |
-| Write, large 8-bit | 965.7 | 551.6 |
-| `to_bytes`, large 8-bit | 1380.0 | 965.8 |
-| Eager read, large 16-bit | 458.4 | 458.4 |
-| Write, large 16-bit | 697.5 | 537.7 |
-| `to_bytes`, large 16-bit | 931.3 | 788.0 |
+| Operation | Rust |
+|---|---:|
+| Eager read, large 8-bit | 549.5 |
+| Write, large 8-bit | 551.6 |
+| `to_bytes`, large 8-bit | 965.8 |
+| Eager read, large 16-bit | 458.4 |
+| Write, large 16-bit | 537.7 |
+| `to_bytes`, large 16-bit | 788.0 |
 
 Bulk extraction uses an estimated 128 MiB codec workspace budget; writing
 defaults to 256 MiB. These are separate from the pixel budget and are not a
@@ -466,6 +421,50 @@ cargo run -p psd --release --example rw_bench -- --out <dir> <file.psd> ...
 The C++ measurements used an argv-driven Release harness that times
 `LayeredFile<T>::read`, `get_image_data()` for each `ImageLayer`, and
 `LayeredFile<T>::write` to a separate output directory.
+
+## Dependencies
+
+This port does use dependencies — it is not dependency-free. The point of the
+crate split is that most of them are confined to one layer, and the core format
+and codec crates pull in almost nothing.
+
+### Direct dependencies
+
+| Crate | Dependency | License | Why |
+|---|---|---|---|
+| `psd-core` | [`thiserror`](https://crates.io/crates/thiserror) 2.0 | MIT OR Apache-2.0 | Derive the `PsdError` enum |
+| `psd-core` | [`tracing`](https://crates.io/crates/tracing) 0.1 | MIT | `warn!` for recoverable anomalies |
+| `psd-core` | [`serde`](https://crates.io/crates/serde) 1.0 | MIT OR Apache-2.0 | Optional (`serde` feature) descriptor views |
+| `psd-codecs` | [`linflate`](https://crates.io/crates/linflate) 0.1 | MIT OR Apache-2.0 | Default byte-oriented ZIP inflate |
+| `psd-codecs` | [`zlib-rs`](https://crates.io/crates/zlib-rs) 0.6 | Zlib | ZIP deflate and direct typed inflate |
+| `psd-codecs` | [`miniz_oxide`](https://crates.io/crates/miniz_oxide) 0.9 | MIT OR Zlib OR Apache-2.0 | Optional ZIP backend |
+| `psd-codecs` | [`bytemuck`](https://crates.io/crates/bytemuck) 1.25 | Zlib OR Apache-2.0 OR MIT | Checked byte views for direct typed decode |
+| `psd-codecs` | [`fearless_simd`](https://crates.io/crates/fearless_simd) 1.0 | Apache-2.0 OR MIT | Portable prediction kernels |
+| `psd-codecs` | [`fearless_simd_macros`](https://crates.io/crates/fearless_simd_macros) 0.1 | Apache-2.0 OR MIT | Compile kernels for each SIMD backend |
+| `psd-codecs` | [`rayon`](https://crates.io/crates/rayon) 1.12 | MIT OR Apache-2.0 | Parallelism across scanlines and channels |
+| `psd-codecs` | [`thiserror`](https://crates.io/crates/thiserror) 2.0 | MIT OR Apache-2.0 | `CodecError` |
+| `psd` | [`memmap2`](https://crates.io/crates/memmap2) 0.9 | MIT OR Apache-2.0 | Memory-mapped reads |
+| `psd` | [`nalgebra`](https://crates.io/crates/nalgebra) 0.34 | Apache-2.0 | Homographies for smart-object placement |
+| `psd` | [`rayon`](https://crates.io/crates/rayon) 1.12 | MIT OR Apache-2.0 | Parallel channel decode and compositing |
+| `psd` | [`image`](https://crates.io/crates/image) 0.25 | MIT OR Apache-2.0 | JPEG/PNG smart-object sources (default feature) |
+| `psd` | [`uuid`](https://crates.io/crates/uuid) 1.26 | Apache-2.0 OR MIT | Smart-object linked-data identities |
+| `psd-py` | [`pyo3`](https://crates.io/crates/pyo3) 0.29 | MIT OR Apache-2.0 | Python bindings |
+| `psd-py` | [`numpy`](https://crates.io/crates/numpy) 0.29 | BSD-2-Clause | Zero-copy NumPy array interop |
+
+`serde_json` (MIT OR Apache-2.0) is a dev-dependency of `psd-core`, used only to
+assert descriptor serialization in tests.
+
+### Transitive dependencies
+
+With `--all-features` the resolved graph is **106 crates**, and every one of them
+is permissively licensed: MIT, Apache-2.0, BSD-2-Clause / BSD-3-Clause, Zlib,
+0BSD, Unlicense, Unicode-3.0, and Apache-2.0-with-LLVM-exception. There is **no
+GPL, AGPL, SSPL, EUPL or MPL** anywhere in the tree, so linking this library
+into a proprietary product does not oblige you to open-source anything.
+
+The one license expression mentioning LGPL is `r-efi` (a UEFI-target crate,
+not part of a normal desktop build), and it is `MIT OR Apache-2.0 OR
+LGPL-2.1-or-later` — an either/or choice, so the LGPL terms never apply.
 
 ## Deliberate differences from upstream
 
