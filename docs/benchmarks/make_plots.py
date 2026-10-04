@@ -15,16 +15,16 @@ import matplotlib.pyplot as plt
 # file -> (title, cpp_read_extract, cpp_write, rs_read_extract, rs_write,
 #          write_range_cpp, write_range_rs)  — ms; ranges optional
 REAL = {
-    "Compression_Mixed_8bit.psd": ("Compression Mixed (8-bit)", 9.81, 22.84, 1.19, 1.71, None, None),
-    "CMYK_16.psd": ("CMYK (16-bit)", 79.59, 548.67, 5.37, 15.10, None, None),
-    "example.psd": ("Webtoon example (8-bit)", 29.03, 17.03, 1.80, 1.78, None, None),
-    "smart_object_file_no_warp.psd": ("Smart object, no warp (8-bit)", 28.87, 222.13, 5.20, 3.92, None, None),
+    "Compression_Mixed_8bit.psd": ("Compression Mixed (8-bit)", 10.93, 27.55, 1.12, 1.74, None, None),
+    "CMYK_16.psd": ("CMYK (16-bit)", 85.34, 560.07, 4.99, 9.87, None, None),
+    "example.psd": ("Webtoon example (8-bit)", 36.71, 17.52, 1.62, 1.56, None, None),
+    "smart_object_file_no_warp.psd": ("Smart object, no warp (8-bit)", 33.85, 230.48, 5.52, 3.65, None, None),
 }
 SYNTHETIC = {
-    "big8.psd": ("big8 (435 MB, 8-bit RLE)", 334.1, 672.9, 157.5, 2670.9,
-                 (286.2, 4052.0), (160.5, 3866.6)),
-    "big16.psd": ("big16 (252 MB, 16-bit ZIP-pred.)", 267.6, 624.6, 195.0, 2375.2,
-                  (595.3, 1019.7), (347.7, 2579.6)),
+    "big8.psd": ("big8 (435 MB, 8-bit RLE)", 349.41, 330.71, 156.75, 652.95,
+                 (285.8, 922.2), (166.0, 1820.1)),
+    "big16.psd": ("big16 (252 MB, 16-bit ZIP-pred.)", 276.76, 600.42, 199.86, 360.04,
+                  (592.9, 619.0), (355.7, 1020.0)),
 }
 
 CPP_RE, CPP_W = "#7f7fff", "#0000ff"   # upstream's blue shades
@@ -51,7 +51,8 @@ def combined_plot(name, title, cpp_re, cpp_w, rs_re, rs_w, rng_cpp, rng_rs):
             med = medians[i]
             ax.plot([i - 0.4, i + 0.4], [med, med], color="black", lw=1.5,
                     solid_capstyle="butt")
-            ax.text(i, med, f"median {med:g}", ha="center", va="bottom", fontsize=8)
+            ax.text(i + 0.44, med, f"median {med:g}", ha="left", va="center",
+                    fontsize=8)
     for bar, v in zip(bars, heights):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                 f"{v:,.2f}", ha="center", va="bottom", fontsize=9)

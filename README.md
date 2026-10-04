@@ -336,10 +336,10 @@ Phase-level detail, codec numbers, coverage notes and reproduction:
 
 | Corpus document | Read + extract C++ / Rust | Write C++ / Rust | Total C++ / Rust |
 |---|---|---|---|
-| `Compression_Mixed_8bit.psd` | 9.81 / **1.19** | 22.84 / **1.71** | 33.31 / **2.95** |
-| `CMYK_16.psd` | 79.59 / **5.37** | 548.67 / **15.10** | 627.44 / **20.58** |
-| `example.psd` | 29.03 / **1.80** | 17.03 / **1.78** | 46.18 / **3.75** |
-| `smart_object_file_no_warp.psd` | 28.87 / **5.20** | 222.13 / **3.92** | 251.00 / **9.02** |
+| `Compression_Mixed_8bit.psd` | 10.93 / **1.12** | 27.55 / **1.74** | 38.10 / **3.02** |
+| `CMYK_16.psd` | 85.34 / **4.99** | 560.07 / **9.87** | 646.03 / **15.20** |
+| `example.psd` | 36.71 / **1.62** | 17.52 / **1.56** | 53.98 / **3.39** |
+| `smart_object_file_no_warp.psd` | 33.85 / **5.52** | 230.48 / **3.65** | 264.50 / **9.35** |
 
 The large synthetic documents showed stable read plus extraction and highly
 variable writes. Parentheses give the full five-run write range, so the write
@@ -348,8 +348,8 @@ these storage conditions.
 
 | Synthetic document | Read + extract C++ / Rust | Write median C++ / Rust (range) | Total median C++ / Rust |
 |---|---|---|---|
-| `big8.psd` (435 MB, 8-bit) | 334.1 / **157.5** | 672.9 (286.2–4052.0) / 2670.9 (160.5–3866.6) | 1010.6 / 2828.6 |
-| `big16.psd` (252 MB, 16-bit) | 267.6 / **195.0** | 624.6 (595.3–1019.7) / 2375.2 (347.7–2579.6) | 896.0 / 2572.7 |
+| `big8.psd` (435 MB, 8-bit) | 349.4 / **156.8** | **330.7** (285.8–922.2) / 652.9 (166.0–1820.1) | **717.4** / 815.2 |
+| `big16.psd` (252 MB, 16-bit) | 276.8 / **199.9** | 600.4 (592.9–619.0) / **360.0** (355.7–1020.0) | 884.5 / **560.1** |
 
 The synthetic workloads contain 12 RGB+alpha layers at 4000×3000 (8-bit)
 and 10 at 2000×3000 (16-bit), with opaque alpha and no masks or effects. RGB
@@ -359,12 +359,12 @@ arithmetic, in layer/channel/row/column order. Let `n = state >> 24`: 8-bit
 samples are `(g as u8) ^ (n & 15)`; 16-bit samples are `((g & 255) << 8) | n`.
 These specify the pixel workloads; encoded sizes depend on the writer/backend.
 
-Under quieter storage the pipeline completes the two synthetic files in
-331.3 and 546.2 ms; the benchmark run does not establish a large-file write
-lead — both writers encountered multi-second storage stalls. Default eager
-Rust reads took 114.7 and 171.5 ms respectively. Decoded channels match
-their inputs. Upstream re-embeds smart-object data through OpenImageIO on
-write; Rust preserves untouched linked bytes.
+Rust's best write runs (166.0 and 355.7 ms) sit below C++'s best (285.8 and
+592.9 ms); the medians above are inflated by residual dirty-page throttling —
+`big8`'s Rust median rode one 1.8 s stall. Default eager Rust reads took
+118.8 and 177.8 ms respectively. Decoded channels match their inputs.
+Upstream re-embeds smart-object data through OpenImageIO on write; Rust
+preserves untouched linked bytes.
 
 Serializing the same two files without disk I/O (`to_bytes`, 0.13.32, same
 machine, eager-read documents) took about 125 ms for `big8.psd` and 320 ms for
