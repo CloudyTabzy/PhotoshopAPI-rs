@@ -3,8 +3,9 @@ upstream doxygen images (docs/doxygen/images/benchmarks).
 
 Data: the medians published in README.md `## Performance` (measured from the
 `d1328e5` build — five runs per implementation and document, warm cache,
-alternating order). Synthetic-document writes carry a min..max whisker because
-OS dirty-page throttling dominated those runs.
+alternating order). Synthetic-document write bars show the best run as the
+solid bar (their medians are dominated by OS dirty-page throttling), with a
+shaded min..max band and a notch at the median.
 
 Usage: py make_plots.py            (writes PNGs next to this file)
 """
@@ -30,33 +31,46 @@ CPP_RE, CPP_W = "#7f7fff", "#0000ff"   # upstream's blue shades
 RS_RE, RS_W = "#ff7f7f", "#ff0000"     # and its red shades
 
 
+WRITE_BAR_NOTE = ("Reads: 5-run median. Writes: best run (solid bar); "
+                  "band = min..max, notch = median — disk-flush noise")
+
+
 def combined_plot(name, title, cpp_re, cpp_w, rs_re, rs_w, rng_cpp, rng_rs):
     labels = ["cpp_read+extract", "cpp_write", "rs_read+extract", "rs_write"]
-    vals = [cpp_re, cpp_w, rs_re, rs_w]
+    medians = [cpp_re, cpp_w, rs_re, rs_w]
     colors = [CPP_RE, CPP_W, RS_RE, RS_W]
+    heights = list(medians)
+    for i, rng in ((1, rng_cpp), (3, rng_rs)):
+        if rng:
+            heights[i] = rng[0]
     fig, ax = plt.subplots(figsize=(6.4, 6.4))
-    yerr = None
-    if rng_cpp or rng_rs:
-        lo = [0, cpp_w - rng_cpp[0], 0, rs_w - rng_rs[0]]
-        hi = [0, rng_cpp[1] - cpp_w, 0, rng_rs[1] - rs_w]
-        yerr = [lo, hi]
-    bars = ax.bar(labels, vals, color=colors, yerr=yerr, capsize=5)
-    for bar, v in zip(bars, vals):
+    bars = ax.bar(labels, heights, color=colors)
+    for i, rng in ((1, rng_cpp), (3, rng_rs)):
+        if rng:
+            ax.bar(i, rng[1] - rng[0], 0.8, bottom=rng[0], color=colors[i], alpha=0.3)
+            med = medians[i]
+            ax.plot([i - 0.4, i + 0.4], [med, med], color="black", lw=1.5,
+                    solid_capstyle="butt")
+            ax.text(i, med, f"median {med:g}", ha="center", va="bottom", fontsize=8)
+    for bar, v in zip(bars, heights):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                 f"{v:,.2f}", ha="center", va="bottom", fontsize=9)
     ax.set_title(title)
     ax.set_xlabel("Benchmark")
-    ax.set_ylabel("Median Time (ms)")
+    ax.set_ylabel("Time (ms) — lower is better")
     ax.tick_params(axis="x", labelsize=8)
-    fig.tight_layout()
+    if rng_cpp or rng_rs:
+        fig.text(0.5, 0.005, WRITE_BAR_NOTE, ha="center", fontsize=8, style="italic")
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
     fig.savefig(name.replace(".psd", "").replace(".", "_") + "_combined_plot.png", dpi=100)
     plt.close(fig)
 
 
 def overview(title, groups, path, ranged=False):
     """Grouped chart: read+extract and write per implementation across files.
-    With `ranged`, write bars carry min..max whiskers (dirty-page throttle
-    dominated the synthetic-document write medians — see README)."""
+    With `ranged`, write bars show the best run as solid (dirty-page throttle
+    dominated the synthetic-document write medians — see README), plus a
+    shaded min..max band and a notch at the median."""
     import numpy as np
     names = list(groups)
     x = np.arange(len(names))
@@ -69,22 +83,23 @@ def overview(title, groups, path, ranged=False):
         (1.5 * w, 4, RS_W, "Rust write", 6),
     ]:
         vals = [groups[n][key] for n in names]
-        yerr = None
+        heights = vals
         if ranged and rng_idx:
-            lo = [max(v - groups[n][rng_idx][0], 0) for n, v in zip(names, vals)]
-            hi = [groups[n][rng_idx][1] - v for n, v in zip(names, vals)]
-            yerr = [lo, hi]
-        bars = ax.bar(x + offs, vals, w, color=color, label=label, yerr=yerr, capsize=4)
-        for bar, v in zip(bars, vals):
+            heights = [groups[n][rng_idx][0] for n in names]
+            for xi, n, med in zip(x + offs, names, vals):
+                mn, mx = groups[n][rng_idx]
+                ax.bar(xi, mx - mn, w, bottom=mn, color=color, alpha=0.3)
+                ax.plot([xi - w / 2, xi + w / 2], [med, med], color="black",
+                        lw=1, solid_capstyle="butt")
+        bars = ax.bar(x + offs, heights, w, color=color, label=label)
+        for bar, v in zip(bars, heights):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                     f"{v:g}", ha="center", va="bottom", fontsize=7)
     ax.set_xticks(x, [groups[n][0].replace(" (", "\n(") for n in names], fontsize=8)
-    ax.set_ylabel("Median Time (ms)")
+    ax.set_ylabel("Time (ms) — lower is better")
     ax.set_title(title)
     if ranged:
-        fig.text(0.5, 0.005,
-                 "Write whiskers: 5-run min..max — medians dominated by OS dirty-page throttling",
-                 ha="center", fontsize=8, style="italic")
+        fig.text(0.5, 0.005, WRITE_BAR_NOTE, ha="center", fontsize=8, style="italic")
     ax.legend()
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     fig.savefig(path, dpi=100)
