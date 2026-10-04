@@ -82,6 +82,14 @@ pub struct LayerAndMaskInformation<'a> {
 
 impl<'a> LayerAndMaskInformation<'a> {
     pub fn read(reader: &mut BeReader, header: &FileHeader) -> Result<Self> {
+        Self::read_with_channels(reader, header, |bytes| Cow::Owned(bytes.to_vec()))
+    }
+
+    pub(crate) fn read_with_channels<'data>(
+        reader: &mut BeReader<'data>,
+        header: &FileHeader,
+        payload: fn(&'data [u8]) -> Cow<'a, [u8]>,
+    ) -> Result<Self> {
         let offset = reader.position() as u64;
         let section_len =
             usize::try_from(reader.len(header.version)?).map_err(|_| PsdError::InvalidData {
@@ -102,7 +110,8 @@ impl<'a> LayerAndMaskInformation<'a> {
             return Ok(Self::default());
         }
 
-        let (mut layer_info, content_end) = LayerInfo::read_tracking_content_end(reader, header)?;
+        let (mut layer_info, content_end) =
+            LayerInfo::read_tracking_content_end(reader, header, payload)?;
 
         // 16/32-bit documents keep their layers in an `Lr16`/`Lr32` block after
         // an empty main section. That block is most of the file, so it is parsed
@@ -152,7 +161,7 @@ impl<'a> LayerAndMaskInformation<'a> {
                     AdditionalLayerInfo::read_eliding(reader, header, remaining, 4, nested_key)?;
                 if let (Some(key), Some(bytes)) = (nested_key, nested) {
                     let mut sub = BeReader::new(bytes);
-                    let parsed = LayerInfo::read_content(&mut sub, header, bytes.len())?.0;
+                    let parsed = LayerInfo::read_content(&mut sub, header, bytes.len(), payload)?.0;
                     if parsed.layer_records.is_empty() {
                         // Nothing to regenerate a block from: keep it as it was.
                         if let Some(block) = blocks.get_mut(key) {
@@ -396,15 +405,16 @@ impl<'a> LayerInfo<'a> {
     /// Read the standalone LayerInfo section including its length marker.
     /// A zero length (16/32-bit documents) yields an empty `LayerInfo`.
     pub fn read(reader: &mut BeReader, header: &FileHeader) -> Result<Self> {
-        Ok(Self::read_tracking_content_end(reader, header)?.0)
+        Ok(Self::read_tracking_content_end(reader, header, |bytes| Cow::Owned(bytes.to_vec()))?.0)
     }
 
     /// Read the section and report where its actual content ended, which can
     /// be up to four bytes before the declared end (alignment padding, or a
     /// declared length that over-counts by a couple of bytes).
-    pub(crate) fn read_tracking_content_end(
-        reader: &mut BeReader,
+    fn read_tracking_content_end<'data>(
+        reader: &mut BeReader<'data>,
         header: &FileHeader,
+        payload: fn(&'data [u8]) -> Cow<'a, [u8]>,
     ) -> Result<(Self, usize)> {
         let offset = reader.position() as u64;
         let section_len =
@@ -415,16 +425,17 @@ impl<'a> LayerInfo<'a> {
         if section_len == 0 {
             return Ok((Self::default(), reader.position()));
         }
-        Self::read_content(reader, header, section_len)
+        Self::read_content(reader, header, section_len, payload)
     }
 
     /// Read `content_len` bytes of layer count + records + channel data
     /// without a leading length marker (the payload of `Lr16`/`Lr32`).
     /// Returns the parsed info and the position where its content ended.
-    pub(crate) fn read_content(
-        reader: &mut BeReader,
+    fn read_content<'data>(
+        reader: &mut BeReader<'data>,
         header: &FileHeader,
         content_len: usize,
+        payload: fn(&'data [u8]) -> Cow<'a, [u8]>,
     ) -> Result<(Self, usize)> {
         let offset = reader.position() as u64;
         let end = reader
@@ -450,7 +461,9 @@ impl<'a> LayerInfo<'a> {
 
         let mut channel_image_data = Vec::with_capacity(count.min(1024));
         for record in &layer_records {
-            channel_image_data.push(ChannelImageData::read(reader, record)?);
+            channel_image_data.push(ChannelImageData::read_with_channels(
+                reader, record, payload,
+            )?);
         }
 
         let position = reader.position();
@@ -1511,6 +1524,14 @@ impl<'a> ChannelImageData<'a> {
     /// Read one layer's channels using the sizes declared in its record. The
     /// payloads are copied out of the reader, so the result owns them.
     pub fn read(reader: &mut BeReader, record: &LayerRecord) -> Result<Self> {
+        Self::read_with_channels(reader, record, |bytes| Cow::Owned(bytes.to_vec()))
+    }
+
+    fn read_with_channels<'data>(
+        reader: &mut BeReader<'data>,
+        record: &LayerRecord,
+        payload: fn(&'data [u8]) -> Cow<'a, [u8]>,
+    ) -> Result<Self> {
         let mut channels = Vec::with_capacity(record.channels.len().min(64));
         for info in &record.channels {
             let offset = reader.position() as u64;
@@ -1549,7 +1570,7 @@ impl<'a> ChannelImageData<'a> {
             })?;
             channels.push(ChannelData {
                 compression,
-                data: Cow::Owned(reader.take(payload_len)?.to_vec()),
+                data: payload(reader.take(payload_len)?),
             });
         }
         Ok(Self { channels })

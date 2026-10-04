@@ -27,6 +27,7 @@ pub mod composite;
 pub mod geometry;
 pub mod layer;
 pub mod layered_file;
+mod parallel;
 pub mod progress;
 pub mod render;
 pub mod smart_object;

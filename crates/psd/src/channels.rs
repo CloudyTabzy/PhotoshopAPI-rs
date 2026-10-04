@@ -191,6 +191,74 @@ impl<T> ChannelStore<T> {
 }
 
 impl<T: BitDepth> ChannelStore<T> {
+    /// Decode independent entries, releasing each successful payload immediately.
+    /// Failed entries remain raw; the spent budget and first error are reported.
+    pub(crate) fn decode_raw_in_place(&mut self, source_depth: u16) -> (usize, Option<PsdError>) {
+        let mut spent = 0usize;
+        let mut first_error = None;
+        for entry in self.channels.values_mut() {
+            let ChannelEntry::Raw(raw) = entry else {
+                continue;
+            };
+            match decompress_channel::<T>(
+                raw.compression,
+                &raw.payload,
+                raw.width,
+                raw.height,
+                raw.version,
+                source_depth,
+            ) {
+                Ok(samples) => {
+                    spent += samples.len() * T::SIZE;
+                    *entry = ChannelEntry::Decoded(samples);
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        (spent, first_error)
+    }
+
+    /// Stage raw channel decodes without changing the store. Reserving the
+    /// full layer budget first keeps a failed decode atomic.
+    pub(crate) fn decode_raw(
+        &self,
+        source_depth: u16,
+        remaining: &mut Option<usize>,
+    ) -> Result<Vec<(ChannelKey, Vec<T>)>> {
+        let mut jobs = Vec::new();
+        for (key, raw) in self.raw_channels() {
+            crate::layered_file::charge_decoded_bitmap(remaining, raw.width, raw.height, T::SIZE)?;
+            let scratch = raw.width.saturating_mul(raw.height).saturating_mul(T::SIZE);
+            jobs.push(((key, raw), scratch));
+        }
+        let mut decoded = Vec::with_capacity(jobs.len());
+        crate::parallel::for_each_ordered(
+            jobs,
+            |(key, raw)| {
+                Ok((
+                    key,
+                    decompress_channel::<T>(
+                        raw.compression,
+                        &raw.payload,
+                        raw.width,
+                        raw.height,
+                        raw.version,
+                        source_depth,
+                    )?,
+                ))
+            },
+            |channel| {
+                decoded.push(channel);
+                Ok(())
+            },
+        )?;
+        Ok(decoded)
+    }
+
     /// Additional decoded-channel memory needed by a depth conversion.
     pub(crate) fn conversion_footprint<U: BitDepth>(
         &self,
@@ -307,20 +375,19 @@ pub fn decompress_channel<T: BitDepth>(
                     samples * T::SIZE
                 )));
             }
-            payload.to_vec()
+            return decode_be_bytes::<T>(payload).map_err(codec_error);
         }
         Compression::Rle => {
             let size_width = if version == Version::Psd { 2 } else { 4 };
             rle::decompress_scanlines(payload, width * T::SIZE, size_width, height)
                 .map_err(codec_error)?
         }
-        Compression::Zip => zip::decompress(payload, samples * T::SIZE).map_err(codec_error)?,
+        Compression::Zip => return T::inflate_be(payload, samples).map_err(codec_error),
         Compression::ZipPrediction => {
-            let inflated = zip::decompress(payload, samples * T::SIZE).map_err(codec_error)?;
-            return T::zip_prediction_decode(&inflated, width, height).map_err(codec_error);
+            return T::zip_prediction_decompress(payload, width, height).map_err(codec_error);
         }
     };
-    decode_be_bytes::<T>(&bytes).map_err(codec_error)
+    T::from_be_vec(bytes).map_err(codec_error)
 }
 
 /// Decode a 1-bit (bitmap mode) channel: eight pixels per byte, MSB first,
@@ -400,8 +467,9 @@ pub(crate) fn decompress_merged_channel<T: BitDepth>(
 /// Compress typed samples into `(codec, payload)` for one channel.
 ///
 /// Codec choice mirrors Photoshop/upstream: 16/32-bit always
-/// use ZIP prediction (32-bit never plain ZIP), 8-bit uses RLE when it beats
-/// the raw size, and an explicit override wins (except that 32-bit ZIP is
+/// use ZIP prediction (32-bit never plain ZIP), small 8-bit planes use RLE
+/// when it beats the raw size and large planes sample its benefit first.
+/// An explicit override wins (except that 32-bit ZIP is
 /// upgraded to ZIP prediction, as Photoshop insists).
 pub fn compress_channel<T: BitDepth>(
     data: &[T],
@@ -414,7 +482,7 @@ pub fn compress_channel<T: BitDepth>(
     // a typed write-time error, not a corrupt file (Photoshop reads a bare Raw
     // marker for the expected `width * height` samples as corrupt, and the
     // port's own reader would zero-fill it — silently mutating data).
-    if width * height != data.len() {
+    if width.checked_mul(height) != Some(data.len()) {
         return Err(PsdError::InvalidData {
             offset: 0,
             message: "channel sample count does not match its extents",
@@ -440,6 +508,31 @@ pub fn compress_channel<T: BitDepth>(
             // the channel turns out not to compress and is stored raw.
             let raw = be_bytes(data);
             let size_width = if version == Version::Psd { 2 } else { 4 };
+            // Automatic 8-bit compression samples dispersed rows before
+            // encoding a large plane. Near-incompressible data is stored raw,
+            // avoiding a full PackBits allocation and traversal. An explicit
+            // RLE override always encodes every row. Upstream always runs RLE
+            // here; this heuristic may trade a small size saving for latency.
+            if forced.is_none() && T::DEPTH == 8 && raw.len() >= 1024 * 1024 {
+                let rows = height.min(16);
+                let mut packed = Vec::new();
+                let mut sampled_bytes = 0usize;
+                for index in 0..rows {
+                    let row = if rows == 1 {
+                        0
+                    } else {
+                        index * (height - 1) / (rows - 1)
+                    };
+                    packed.clear();
+                    rle::pack_bits_compress_into(&raw[row * width..(row + 1) * width], &mut packed);
+                    sampled_bytes += packed.len() + size_width;
+                }
+                if sampled_bytes.saturating_mul(100)
+                    >= rows.saturating_mul(width).saturating_mul(99)
+                {
+                    return Ok((Compression::Raw, raw.into_owned()));
+                }
+            }
             let packed =
                 rle::compress_scanlines(&raw, width * T::SIZE, size_width).map_err(codec_error)?;
             if forced.is_none() && packed.len() >= raw.len() {
@@ -452,13 +545,10 @@ pub fn compress_channel<T: BitDepth>(
             Compression::Zip,
             zip::compress(&be_bytes(data)).map_err(codec_error)?,
         )),
-        Compression::ZipPrediction => {
-            let encoded = T::zip_prediction_encode(data, width, height).map_err(codec_error)?;
-            Ok((
-                Compression::ZipPrediction,
-                zip::compress(&encoded).map_err(codec_error)?,
-            ))
-        }
+        Compression::ZipPrediction => Ok((
+            Compression::ZipPrediction,
+            T::zip_prediction_compress(data, width, height).map_err(codec_error)?,
+        )),
     }
 }
 

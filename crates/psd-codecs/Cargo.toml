@@ -8,6 +8,8 @@ version.workspace = true
 [dependencies]
 thiserror.workspace = true
 rayon.workspace = true
+# Checked byte views let ZIP decode into the final aligned sample buffer.
+bytemuck.workspace = true
 zlib-rs = { workspace = true, optional = true }
 miniz_oxide = { workspace = true, optional = true }
 linflate = { workspace = true, optional = true }

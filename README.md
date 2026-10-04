@@ -163,11 +163,10 @@ composite, and replacement is transactional.
 - Rust 1.96 or newer
 - A 64-bit system; Linux, Windows or macOS
 
-The codecs are scalar code that LLVM auto-vectorizes, parallelized across
-scanlines with `rayon`; there is no hand-written AVX2 path. The vendored
-`psd-png` codec is the one exception: it carries a compile-time-selected SSE2
-`Paeth` reconstruction kernel, which is x86-64 baseline, and aarch64 NEON
-kernels for checksums — no runtime CPU feature detection anywhere.
+Layer codec jobs and large scanline workloads use `rayon`. Prediction and
+PNG kernels use runtime-dispatched portable SIMD through `fearless_simd`,
+with scalar fallbacks. ZIP codecs build in pure Rust; typed decode uses
+checked `bytemuck` byte views of the final sample buffers.
 
 ## Install
 
@@ -324,7 +323,12 @@ and codec crates pull in almost nothing.
 | `psd-core` | [`thiserror`](https://crates.io/crates/thiserror) 2.0 | MIT OR Apache-2.0 | Derive the `PsdError` enum |
 | `psd-core` | [`tracing`](https://crates.io/crates/tracing) 0.1 | MIT | `warn!` for recoverable anomalies |
 | `psd-core` | [`serde`](https://crates.io/crates/serde) 1.0 | MIT OR Apache-2.0 | Optional (`serde` feature) descriptor views |
-| `psd-codecs` | [`libdeflater`](https://crates.io/crates/libdeflater) 1.26 | Apache-2.0 | The only codec with byte-exact ZIP round trips |
+| `psd-codecs` | [`linflate`](https://crates.io/crates/linflate) 0.1 | MIT OR Apache-2.0 | Default byte-oriented ZIP inflate |
+| `psd-codecs` | [`zlib-rs`](https://crates.io/crates/zlib-rs) 0.6 | Zlib | ZIP deflate and direct typed inflate |
+| `psd-codecs` | [`miniz_oxide`](https://crates.io/crates/miniz_oxide) 0.9 | MIT OR Zlib OR Apache-2.0 | Optional ZIP backend |
+| `psd-codecs` | [`bytemuck`](https://crates.io/crates/bytemuck) 1.25 | Zlib OR Apache-2.0 OR MIT | Checked byte views for direct typed decode |
+| `psd-codecs` | [`fearless_simd`](https://crates.io/crates/fearless_simd) 1.0 | Apache-2.0 OR MIT | Portable prediction kernels |
+| `psd-codecs` | [`fearless_simd_macros`](https://crates.io/crates/fearless_simd_macros) 0.1 | Apache-2.0 OR MIT | Compile kernels for each SIMD backend |
 | `psd-codecs` | [`rayon`](https://crates.io/crates/rayon) 1.12 | MIT OR Apache-2.0 | Parallelism across scanlines and channels |
 | `psd-codecs` | [`thiserror`](https://crates.io/crates/thiserror) 2.0 | MIT OR Apache-2.0 | `CodecError` |
 | `psd` | [`memmap2`](https://crates.io/crates/memmap2) 0.9 | MIT OR Apache-2.0 | Memory-mapped reads |
@@ -352,38 +356,66 @@ LGPL-2.1-or-later` — an either/or choice, so the LGPL terms never apply.
 
 ## Performance
 
-Read → decode all layer channels → write, measured against the C++ upstream
-(v0.9.1, MSVC Release) on the same machine, warm file cache, same documents.
-*Decode* is upstream's per-layer `get_image_data()` against this port's
-explicit `decode_layer_pixels`; the port's default `LayeredFile::read`
-combines read + decode eagerly.
+Read → materialize layer pixels → write, measured against the C++ upstream
+(v0.9.1, MSVC Release) on the same machine. Large-document results are medians
+of five runs with a warm file cache, idle storage before each run and rotated
+implementation order. Lower is better; times are milliseconds.
 
-Real documents (milliseconds, lower is better; **bold** = faster):
+Upstream decodes PSD compression during `read` and stores pixels internally
+compressed; its `get_image_data()` extracts that internal storage. Rust's lazy
+read retains PSD streams, then `decode_all_layer_pixels()` decodes them. Compare
+**read + extract** together. Default Rust `LayeredFile::read` performs eager decode.
 
-| Document | Read C++ / Rust | Decode C++ / Rust | Write C++ / Rust |
+| Document | Read + extract C++ / Rust | Write C++ / Rust | Total C++ / Rust |
 |---|---|---|---|
-| `example.psd` (0.9 MB, 8-bit) | 32.5 / **0.31** | **1.07** / 2.02 | 16.7 / **2.8** |
-| `smart_object_no_warp.psd` (5.3 MB) | 34.3 / **2.6** | **2.8** / 6.7 | 245.7 / **5.2** |
-| `SmartObject.psd` (5.8 MB) | 115.5 / **7.1** | —¹ / 3.5 | 1953.6² / **4.7** |
-| `qual_rca_pinout.psd` (6 MB) | 35.7 / **3.2** | **3.1** / 4.7 | 19.9 / **8.7** |
+| `big8.psd` (435 MB, 8-bit) | 347.6 / **159.8** | 280.9 / **187.9** | 627.2 / **349.4** |
+| `big16.psd` (252 MB, 16-bit) | 274.8 / **196.0** | 596.7 / **468.6** | 871.5 / **665.2** |
 
-Synthetic large documents:
+The synthetic workloads contain 12 RGB+alpha layers at 4000×3000 (8-bit)
+and 10 at 2000×3000 (16-bit), with opaque alpha and no masks or effects. RGB
+samples use `g = 3*x + 5*y + 17*layer + 40*channel` and a 32-bit LCG seeded
+with `0x12345678`, updated by `state = state*1664525 + 1013904223` with wrapping
+arithmetic, in layer/channel/row/column order. Let `n = state >> 24`: 8-bit
+samples are `(g as u8) ^ (n & 15)`; 16-bit samples are `((g & 255) << 8) | n`.
+These specify the pixel workloads; encoded sizes depend on the writer/backend.
 
-| Document | Read C++ / Rust | Decode C++ / Rust | Write C++ / Rust |
-|---|---|---|---|
-| `big8.psd` (435 MB, 8-bit RLE) | ~220 / **~205** | **~142** / ~190 | **~290** / ~440 |
-| `big16.psd` (252 MB, 16-bit ZIP-pred.) | ~200 / **~113** | **~65** / ~1185 | **~770** / ~5200 |
+Against the previous Rust pipeline, total time falls from 915.8 to 349.4 ms
+(2.6×) for the large 8-bit document and from 6630.5 to 665.2 ms (10.0×) for
+16-bit. Default eager read takes 122.2 and 173.9 ms respectively. The large
+8-bit output is byte-identical to the previous writer; the 16-bit output is
+1.37% larger, with every decoded channel unchanged.
 
-¹ Upstream's `get_image_data()` does not decode smart-object layers, so it
-performed no pixel work on that file; the port decodes them.
-² Upstream re-embeds the smart-object payload through OpenImageIO on write;
-this port passes the linked bytes through verbatim.
+Small-document runs also improve: `example.psd` takes about 3.5 ms total versus
+6.4 ms previously and 42.1 ms upstream; `smart_object_file_no_warp.psd` takes
+8.8 ms versus 15.1 ms and 253.5 ms. These workloads include more pixel work in
+Rust: upstream extraction omits layer kinds outside `ImageLayer`. Upstream
+also re-embeds smart-object data through OpenImageIO on write; Rust preserves
+untouched linked bytes.
 
-Upstream parallelizes channel codec work across channels
-(`std::execution::par` over the channel table); this port currently
-decompresses and compresses channels serially, which is what the 16-bit
-ZIP-prediction numbers above isolate. On RLE-compressed data the two are
-already at parity.
+Heap allocation peaks (MiB; source file cache and thread stacks excluded):
+
+| Operation | Previous Rust | Current Rust |
+|---|---:|---:|
+| Eager read, large 8-bit | 572.3 | 549.5 |
+| Write, large 8-bit | 987.7 | 965.7 |
+| Eager read, large 16-bit | 477.2 | 458.4 |
+| Write, large 16-bit | 709.5 | 697.5 |
+| Bulk lazy extraction, large 16-bit | 493.2 | 538.3 |
+
+Bulk extraction trades bounded concurrent raw/decoded overlap for throughput.
+Jobs use an estimated 128 MiB codec workspace budget; this is separate from the
+pixel budget and is not a process-memory ceiling. Individual layer decoding
+remains atomic. Bulk decoding retains failed channels, releases successful ones
+and returns the first error in document order. A caller's Rayon pool controls
+available threads; small workloads stay sequential.
+
+Automatic compression samples large inputs: sixteen dispersed rows decide
+whether 8-bit RLE is worthwhile, and three ZIP windows compare default deflate
+with Huffman-only encoding. These are size estimates; heterogeneous documents
+can behave differently. An explicit RLE override bypasses its sampling policy.
+The writer still stages compressed channels before streaming them, and
+`to_bytes` also holds the returned file. Sustained disk contention can dominate
+write timings; the figures above describe these measured workloads.
 
 Reproduce the Rust side with:
 

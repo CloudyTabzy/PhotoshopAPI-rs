@@ -249,6 +249,91 @@ pub fn encode<T: DeltaSample>(data: &[T], width: usize, height: usize) -> Result
 /// enough to stay in cache.
 const BLOCK_SAMPLES: usize = 32 * 1024;
 
+/// Prediction-encode and compress integers a block at a time. Only the
+/// compressed result is retained at channel size; prediction uses small blocks.
+pub fn compress<T: DeltaSample>(data: &[T], width: usize, height: usize) -> Result<Vec<u8>> {
+    let mut scratch = Vec::new();
+    compress_blocks(data, width, height, |block, width, _, encoded| {
+        scratch.clear();
+        scratch.extend_from_slice(block);
+        T::delta_rows(&mut scratch, width);
+        encoded.resize(block.len() * T::SIZE, 0);
+        for (value, bytes) in scratch.iter().zip(encoded.chunks_exact_mut(T::SIZE)) {
+            value.write_be_into(bytes);
+        }
+        Ok(())
+    })
+}
+
+/// The f32 counterpart of [`compress`], including byte-plane prediction.
+pub fn compress_f32(data: &[f32], width: usize, height: usize) -> Result<Vec<u8>> {
+    compress_blocks(data, width, height, |block, width, _, encoded| {
+        encoded.resize(block.len() * 4, 0);
+        for (row, src) in encoded.chunks_mut(width * 4).zip(block.chunks(width)) {
+            kernels::deinterleave_f32_row(row, src, width);
+            kernels::delta_bytes_row(row);
+        }
+        Ok(())
+    })
+}
+
+fn compress_blocks<T: BeConvert>(
+    data: &[T],
+    width: usize,
+    height: usize,
+    mut encode: impl FnMut(&[T], usize, usize, &mut Vec<u8>) -> Result<()>,
+) -> Result<Vec<u8>> {
+    check_sample_count(data.len(), width, height)?;
+    #[cfg(feature = "zip-backend-miniz")]
+    {
+        if data.is_empty() {
+            return crate::zip::compress(&[]);
+        }
+        data.len()
+            .checked_mul(T::SIZE)
+            .ok_or(CodecError::InvalidInput("image dimensions overflow"))?;
+        let rows = (BLOCK_SAMPLES / width).max(1);
+        let mut block_bytes = Vec::new();
+        let mut encoded = Vec::with_capacity(data.len() * T::SIZE);
+        for block in data.chunks(rows * width) {
+            encode(block, width, block.len() / width, &mut block_bytes)?;
+            encoded.extend_from_slice(&block_bytes);
+        }
+        crate::zip::compress(&encoded)
+    }
+    #[cfg(any(feature = "zip-backend-zlib-rs", feature = "zip-backend-linflate"))]
+    {
+        if data.is_empty() {
+            return crate::zip::compress(&[]);
+        }
+        let bytes = data
+            .len()
+            .checked_mul(T::SIZE)
+            .ok_or(CodecError::InvalidInput("image dimensions overflow"))?;
+        let rows = (BLOCK_SAMPLES / width).max(1);
+        let mut sample = Vec::new();
+        let mut encoded = Vec::new();
+        if bytes >= 1024 * 1024 {
+            for first in [0, height / 2, height.saturating_sub(rows)] {
+                let last = first.saturating_add(rows).min(height);
+                encode(
+                    &data[first * width..last * width],
+                    width,
+                    last - first,
+                    &mut encoded,
+                )?;
+                sample.extend_from_slice(&encoded[..encoded.len().min(16 * 1024)]);
+            }
+        }
+        let mut encoder = crate::zip::StreamingEncoder::new(&sample, bytes)?;
+        for block in data.chunks(rows * width) {
+            encode(block, width, block.len() / width, &mut encoded)?;
+            encoder.push(&encoded)?;
+        }
+        encoder.finish()
+    }
+}
+
 /// Prediction-decode integer samples. Mirrors `RemovePredictionEncoding<T>`.
 pub fn decode<T: DeltaSample>(bytes: &[u8], width: usize, height: usize) -> Result<Vec<T>> {
     let row = row_bytes(width, T::SIZE)?;
@@ -256,6 +341,52 @@ pub fn decode<T: DeltaSample>(bytes: &[u8], width: usize, height: usize) -> Resu
     let mut work = decode_be_bytes::<T>(bytes)?;
     T::undelta_rows(&mut work, width);
     Ok(work)
+}
+
+/// Inflate and remove integer prediction in the final typed allocation.
+pub fn decompress<T: DeltaSample>(payload: &[u8], width: usize, height: usize) -> Result<Vec<T>> {
+    let samples = width
+        .checked_mul(height)
+        .ok_or(CodecError::InvalidInput("image dimensions overflow"))?;
+    let mut output = T::inflate_be(payload, samples)?;
+    if !output.is_empty() {
+        T::undelta_rows(&mut output, width);
+    }
+    Ok(output)
+}
+
+/// Inflate f32 byte planes into their final allocation, then reconstruct each
+/// row using a reusable byte buffer. No second full-channel buffer is needed.
+pub fn decompress_f32(payload: &[u8], width: usize, height: usize) -> Result<Vec<f32>> {
+    let samples = width
+        .checked_mul(height)
+        .ok_or(CodecError::InvalidInput("image dimensions overflow"))?;
+    let stride = row_bytes(width, 4)?;
+    let mut output = crate::zip::decompress_native::<f32>(payload, samples)?;
+    if output.is_empty() {
+        return Ok(output);
+    }
+    let level = Level::new();
+    let decode_rows = |rows: &mut [f32]| {
+        let mut scratch = vec![0u8; stride];
+        dispatch!(level, simd => {
+            for row in rows.chunks_mut(width) {
+                if scalar_forced() {
+                    scratch.copy_from_slice(bytemuck::cast_slice(row));
+                    decode_f32_scalar(&scratch, width, stride, row);
+                } else {
+                    kernels::scan_row_into(simd, bytemuck::cast_slice(row), &mut scratch);
+                    kernels::transpose_row(simd, row, &scratch, width);
+                }
+            }
+        });
+    };
+    if samples * 4 >= PARALLEL_MIN_BYTES {
+        output.par_chunks_mut(width * 64).for_each(decode_rows);
+    } else {
+        decode_rows(&mut output);
+    }
+    Ok(output)
 }
 
 /// Prediction-encode f32 samples: per-scanline byte de-interleave including
@@ -817,6 +948,62 @@ mod block_encode_tests {
                 "u8 {width}x{height}"
             );
         }
+    }
+
+    #[test]
+    fn streamed_prediction_preserves_every_encoded_byte_across_block_boundaries() {
+        for (width, height) in [
+            (1, 70_000),
+            (7, 10_001),
+            (4096, 19),
+            (BLOCK_SAMPLES + 5, 3),
+            (1024, 1024),
+        ] {
+            let wide = samples(width * height);
+            let packed = compress(&wide, width, height).unwrap();
+            let expected = encode(&wide, width, height).unwrap();
+            assert_eq!(
+                crate::zip::decompress(&packed, expected.len()).unwrap(),
+                expected
+            );
+            assert_eq!(decompress::<u16>(&packed, width, height).unwrap(), wide);
+            let narrow: Vec<_> = wide.iter().map(|&value| value as u8).collect();
+            let packed = compress(&narrow, width, height).unwrap();
+            let expected = encode(&narrow, width, height).unwrap();
+            assert_eq!(
+                crate::zip::decompress(&packed, expected.len()).unwrap(),
+                expected
+            );
+            assert_eq!(decompress::<u8>(&packed, width, height).unwrap(), narrow);
+            // Include non-finite floats: the codec preserves their bit patterns.
+            let floats: Vec<_> = wide
+                .iter()
+                .enumerate()
+                .map(|(index, &value)| {
+                    if index % 257 == 0 {
+                        f32::from_bits(0x7FC0_0001)
+                    } else {
+                        (value as f32 - 32768.0) / 1024.0
+                    }
+                })
+                .collect();
+            let packed = compress_f32(&floats, width, height).unwrap();
+            let expected = encode_f32(&floats, width, height).unwrap();
+            assert_eq!(
+                crate::zip::decompress(&packed, expected.len()).unwrap(),
+                expected
+            );
+            let decoded = decompress_f32(&packed, width, height).unwrap();
+            assert!(decoded
+                .iter()
+                .zip(&floats)
+                .all(|(actual, expected)| actual.to_bits() == expected.to_bits()));
+        }
+        assert_eq!(
+            crate::zip::decompress(&compress::<u8>(&[], 5, 0).unwrap(), 0).unwrap(),
+            []
+        );
+        assert!(compress(&[1u16, 2, 3], 2, 2).is_err());
     }
 
     #[test]

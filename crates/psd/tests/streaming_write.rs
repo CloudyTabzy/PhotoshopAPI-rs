@@ -314,3 +314,55 @@ fn write_replaces_the_target_only_after_the_document_is_written() {
 
     std::fs::remove_dir_all(&directory).unwrap();
 }
+
+#[test]
+fn concurrent_saves_use_distinct_temporaries_and_commit_complete_documents() {
+    let directory =
+        std::env::temp_dir().join(format!("psd-concurrent-write-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("document.psd");
+    let documents: Vec<_> = (1u8..=4)
+        .map(|value| {
+            let mut document = synthetic::<u8>(64, 2);
+            for id in document.flatten() {
+                let image = document.layer_mut(id).unwrap().image_mut().unwrap();
+                image
+                    .channels
+                    .insert(ChannelKey::color(0), vec![value; 64 * 64]);
+            }
+            document
+        })
+        .collect();
+    let expected: Vec<_> = documents
+        .iter()
+        .map(|document| document.to_bytes().unwrap())
+        .collect();
+    let barrier = std::sync::Barrier::new(documents.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = documents
+            .iter()
+            .map(|document| {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    document.write(path)
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+    });
+    assert!(expected.contains(&std::fs::read(&path).unwrap()));
+    // A failed final rename must also remove the temporary owned by that save.
+    let blocked = directory.join("directory.psd");
+    std::fs::create_dir(&blocked).unwrap();
+    assert!(documents[0].write(&blocked).is_err());
+    assert!(std::fs::read_dir(&directory).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains(".tmp-")));
+    std::fs::remove_dir_all(directory).unwrap();
+}

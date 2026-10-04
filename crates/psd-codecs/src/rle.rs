@@ -46,6 +46,20 @@ pub fn pack_bits_compress_into(data: &[u8], out: &mut Vec<u8>) -> usize {
     // bytes; reserving that bound once means the row never reallocates.
     out.reserve(data.len() + data.len() / MAX_PACKET_LEN + 2);
 
+    // Constant scanlines (notably opaque alpha) need only run packets. Fixed
+    // array equality lets LLVM compare many bytes at once, while preserving
+    // the upstream packet boundaries, including a one-byte final literal.
+    let byte = data[0];
+    let mut chunks = data.chunks_exact(32);
+    if chunks.by_ref().all(|chunk| chunk == [byte; 32])
+        && chunks.remainder().iter().all(|&value| value == byte)
+    {
+        for run in data.chunks(MAX_PACKET_LEN) {
+            write_run(out, run.len(), byte);
+        }
+        return out.len() - start;
+    }
+
     let mut run_len: usize = 0;
     let mut lit_len: usize = 0;
 
@@ -430,6 +444,23 @@ mod tests {
     #[test]
     fn wikipedia_example_compresses_byte_exact() {
         assert_eq!(pack_bits_compress(&WIKIPEDIA_DATA), WIKIPEDIA_ENCODED);
+    }
+
+    #[test]
+    fn constant_scanlines_preserve_packets_at_every_run_boundary() {
+        for len in [1, 2, 31, 32, 33, 127, 128, 129, 255, 256, 257, 4097] {
+            let data = vec![42; len];
+            let mut expected = Vec::new();
+            for _ in 0..len / 128 {
+                expected.extend_from_slice(&[129, 42]);
+            }
+            let tail = len % 128;
+            if tail != 0 {
+                expected.extend_from_slice(&[((257 - tail) & 255) as u8, 42]);
+            }
+            assert_eq!(pack_bits_compress(&data), expected, "length {len}");
+            assert_eq!(pack_bits_decompress(&expected, len).unwrap(), data);
+        }
     }
 
     #[test]

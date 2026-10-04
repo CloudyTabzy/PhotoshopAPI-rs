@@ -34,10 +34,25 @@ pub struct PhotoshopFile<'a> {
 impl<'a> PhotoshopFile<'a> {
     /// Read the four leading sections from the current reader position.
     pub fn read(reader: &mut BeReader) -> Result<Self> {
+        Self::read_with_channels(reader, |bytes| bytes.to_vec().into())
+    }
+
+    /// Read while borrowing compressed channel payloads from the input.
+    /// Metadata remains owned. This avoids staging a second copy of every
+    /// compressed channel before an eager document read decodes it.
+    pub fn read_borrowed(reader: &mut BeReader<'a>) -> Result<Self> {
+        Self::read_with_channels(reader, std::borrow::Cow::Borrowed)
+    }
+
+    fn read_with_channels<'data>(
+        reader: &mut BeReader<'data>,
+        payload: fn(&'data [u8]) -> std::borrow::Cow<'a, [u8]>,
+    ) -> Result<Self> {
         let header = FileHeader::read(reader)?;
         let color_mode_data = ColorModeData::read(reader)?;
         let image_resources = ImageResources::read(reader)?;
-        let layer_and_mask_info = LayerAndMaskInformation::read(reader, &header)?;
+        let layer_and_mask_info =
+            LayerAndMaskInformation::read_with_channels(reader, &header, payload)?;
         Ok(Self {
             header,
             color_mode_data,

@@ -26,6 +26,21 @@ pub trait BeConvert: Copy {
     fn as_bytes(_data: &[Self]) -> Option<&[u8]> {
         None
     }
+
+    /// Consume a decoded byte buffer. Byte samples retain the allocation;
+    /// wider samples convert into an aligned typed allocation.
+    fn from_be_vec(bytes: Vec<u8>) -> Result<Vec<Self>> {
+        decode_be_bytes(&bytes)
+    }
+
+    /// Inflate big-endian samples, using a final typed destination when the
+    /// implementation can expose a checked mutable byte view.
+    fn inflate_be(compressed: &[u8], samples: usize) -> Result<Vec<Self>> {
+        let bytes = samples
+            .checked_mul(Self::SIZE)
+            .ok_or(CodecError::InvalidInput("sample byte count overflows"))?;
+        Self::from_be_vec(crate::zip::decompress(compressed, bytes)?)
+    }
 }
 
 macro_rules! impl_be_convert_int {
@@ -46,6 +61,12 @@ macro_rules! impl_be_convert_int {
             #[inline]
             fn swap_be(self) -> Self {
                 self.swap_bytes()
+            }
+
+            fn inflate_be(compressed: &[u8], samples: usize) -> Result<Vec<Self>> {
+                let mut output = crate::zip::decompress_native::<Self>(compressed, samples)?;
+                decode_be_slice(&mut output);
+                Ok(output)
             }
         }
     };
@@ -78,6 +99,10 @@ impl BeConvert for u8 {
 
     fn as_bytes(data: &[Self]) -> Option<&[u8]> {
         Some(data)
+    }
+
+    fn from_be_vec(bytes: Vec<u8>) -> Result<Vec<Self>> {
+        Ok(bytes)
     }
 }
 
@@ -119,6 +144,12 @@ macro_rules! impl_be_convert_float {
             fn swap_be(self) -> Self {
                 <$t>::from_bits(<$bits>::swap_bytes(self.to_bits()))
             }
+
+            fn inflate_be(compressed: &[u8], samples: usize) -> Result<Vec<Self>> {
+                let mut output = crate::zip::decompress_native::<Self>(compressed, samples)?;
+                decode_be_slice(&mut output);
+                Ok(output)
+            }
         }
     };
 }
@@ -128,6 +159,9 @@ impl_be_convert_float!(f64, u64);
 
 /// In-place big-endian (on-disk) → native. Mirrors `endianDecodeBEArray`.
 pub fn decode_be_slice<T: BeConvert>(data: &mut [T]) {
+    if cfg!(target_endian = "big") {
+        return;
+    }
     for value in data.iter_mut() {
         *value = value.swap_be();
     }

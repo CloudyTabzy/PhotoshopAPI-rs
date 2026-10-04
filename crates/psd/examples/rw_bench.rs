@@ -1,6 +1,8 @@
 //! Read → decode → write benchmark mirroring the upstream C++ harness:
 //! per file, time a raw (structure-only) read, an explicit channel-decode
-//! pass (upstream's `get_image_data` equivalent), and a write. Also times
+//! pass, and a write. Compare read + extract: upstream's read already decodes
+//! PSD channels into its internally compressed store, whereas our lazy read
+//! retains the original streams. Also times
 //! the default eager `read`, which combines structure + decode.
 //!
 //! Usage: cargo run -p psd --release --example rw_bench --features image --
@@ -10,7 +12,7 @@
 //! total | eager | pixels.
 
 use psd::core::Result;
-use psd::{BitDepth, LayeredFile, LayerId, ReadOptions};
+use psd::{BitDepth, LayerId, LayeredFile, ReadOptions};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -27,24 +29,26 @@ fn file_depth(path: &Path) -> u16 {
 fn bench_one<T: BitDepth>(input: &Path, out_dir: &Path) -> Result<()> {
     let name = input.file_name().unwrap().to_string_lossy().into_owned();
     let row = |phase: &str, ms: f64| println!("{name},{phase},{ms:.2}");
+    let start = Instant::now();
 
     // Structure-only read (upstream `LayeredFile<T>::read` equivalent).
     let t = Instant::now();
-    let mut file = LayeredFile::<T>::read_with_options(
-        input,
-        ReadOptions::unlimited().with_raw_data(true),
-    )?;
+    let mut file =
+        LayeredFile::<T>::read_with_options(input, ReadOptions::unlimited().with_raw_data(true))?;
     row("read", t.elapsed().as_secs_f64() * 1e3);
 
     // Explicit channel decode (upstream per-layer `get_image_data()`).
     let t = Instant::now();
     let mut pixels = 0usize;
+    file.decode_all_layer_pixels()?;
     let ids: Vec<LayerId> = file.flatten();
     for id in ids {
-        file.decode_layer_pixels(id)?;
         if let Some(layer) = file.layer(id) {
             if let Some(store) = layer.channels() {
-                pixels += store.iter().map(|(_, samples)| samples.len()).sum::<usize>();
+                pixels += store
+                    .iter()
+                    .map(|(_, samples)| samples.len())
+                    .sum::<usize>();
             }
         }
     }
@@ -54,6 +58,7 @@ fn bench_one<T: BitDepth>(input: &Path, out_dir: &Path) -> Result<()> {
     let t = Instant::now();
     file.write(&out)?;
     row("write", t.elapsed().as_secs_f64() * 1e3);
+    row("total", start.elapsed().as_secs_f64() * 1e3);
 
     drop(file);
     let t = Instant::now();

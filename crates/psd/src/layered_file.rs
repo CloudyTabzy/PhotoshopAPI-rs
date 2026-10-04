@@ -39,9 +39,11 @@ const DIVIDER_NAME: &str = "</Layer group>";
 const DEFAULT_DPI: f32 = 72.0;
 
 /// A temporary path beside `path`, so replacing it is a rename within one
-/// filesystem. The process id keeps two writers from colliding; a leftover
-/// from a crashed process is overwritten, not read.
+/// filesystem. A process-local sequence keeps concurrent saves from sharing
+/// a temporary file, even when both writers target the same document path.
 fn temporary_sibling(path: &Path) -> Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
         .ok_or(PsdError::InvalidData {
@@ -49,7 +51,11 @@ fn temporary_sibling(path: &Path) -> Result<PathBuf> {
             message: "a document path needs a file name",
         })?
         .to_string_lossy();
-    Ok(path.with_file_name(format!(".{name}.tmp-{}", std::process::id())))
+    Ok(path.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )))
 }
 
 fn absolute_or_current_dir(path: &Path) -> Result<PathBuf> {
@@ -199,7 +205,45 @@ fn mask_channel_extents(
 /// Charge one retained channel plane before calling its decoder. This adapts
 /// a remaining-budget model used by independent readers to planar typed
 /// channels.
-fn charge_decoded_bitmap(
+fn layer_record_extents(record: &LayerRecord<'_>, version: Version) -> Result<(usize, usize)> {
+    let rect = Rect::new(record.top, record.left, record.bottom, record.right);
+    match read_rect_extents(rect, "layer", version) {
+        Ok(extents) => Ok(extents),
+        Err(PsdError::InvalidImageBounds { .. })
+            if record
+                .channels
+                .iter()
+                .filter(|info| !ChannelKey(info.index).is_mask())
+                .all(|info| info.size <= 2) =>
+        {
+            Ok((0, 0))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn channel_record_extents(
+    record: &LayerRecord<'_>,
+    key: ChannelKey,
+    empty: bool,
+    layer_extents: (usize, usize),
+    version: Version,
+) -> Result<(usize, usize)> {
+    if key.is_mask() {
+        let bounds = Rect::new(record.top, record.left, record.bottom, record.right);
+        let rect = mask_channel_rect(record.mask_data.as_ref(), key).unwrap_or(bounds);
+        let kind = if key == ChannelKey::REAL_USER_MASK {
+            "real mask"
+        } else {
+            "mask"
+        };
+        mask_channel_extents(rect, kind, version, empty)
+    } else {
+        Ok(layer_extents)
+    }
+}
+
+pub(crate) fn charge_decoded_bitmap(
     remaining: &mut Option<usize>,
     width: usize,
     height: usize,
@@ -565,7 +609,7 @@ impl<T: BitDepth> LayeredFile<T> {
         progress: &mut dyn FnMut(ProgressEvent<'_>),
     ) -> Result<Self> {
         let mut reader = BeReader::new(bytes);
-        let file = PhotoshopFile::read(&mut reader)?;
+        let file = PhotoshopFile::read_borrowed(&mut reader)?;
         let stored_merged_image = if file.layer_and_mask_info.layer_info.layer_records.is_empty() {
             let start = reader.position();
             // LayerInfo cannot express a negative zero layer count. For a
@@ -653,7 +697,7 @@ impl<T: BitDepth> LayeredFile<T> {
         };
         let mut remaining_bitmap_memory = options.total_memory_limit;
         document.build_layers(
-            &mut layer_and_mask_info.layer_info,
+            std::mem::take(&mut layer_and_mask_info.layer_info),
             header.version,
             options,
             &mut remaining_bitmap_memory,
@@ -666,7 +710,7 @@ impl<T: BitDepth> LayeredFile<T> {
 
     fn build_layers(
         &mut self,
-        info: &mut LayerInfo,
+        info: LayerInfo<'_>,
         version: Version,
         options: ReadOptions,
         remaining_bitmap_memory: &mut Option<usize>,
@@ -680,25 +724,66 @@ impl<T: BitDepth> LayeredFile<T> {
         }
 
         let total = info.layer_records.len();
-        let mut ids = Vec::with_capacity(total);
-        for index in 0..total {
-            let record = &info.layer_records[index];
-            // Move compressed bytes into lazy channel entries when requested;
-            // eager decoding consumes the same owned payloads without cloning.
-            let channel_data = std::mem::take(&mut info.channel_image_data[index]);
-            progress(ProgressEvent::Layer {
-                name: record.name.value(),
-                index,
-                total,
-            });
-            ids.push(self.build_layer(
-                record,
-                channel_data,
-                version,
-                options,
-                remaining_bitmap_memory,
-            )?);
+        let mut jobs = Vec::with_capacity(total);
+        // Reserve the complete decoded footprint before workers allocate.
+        // Geometry is shared with construction so mask and stub rules agree.
+        for (record, data) in info.layer_records.into_iter().zip(info.channel_image_data) {
+            let extents = layer_record_extents(&record, version)?;
+            let divider = record
+                .additional_layer_info
+                .as_ref()
+                .and_then(|blocks| blocks.get(TaggedBlockKey::LSCT))
+                .and_then(|block| block.data.get(..4))
+                .map(|bytes| {
+                    SectionDivider::from_raw(u32::from_be_bytes(bytes.try_into().unwrap()))
+                });
+            let mut scratch = 0usize;
+            for (channel_info, channel) in record.channels.iter().zip(&data.channels) {
+                let key = ChannelKey(channel_info.index);
+                let keep = match divider {
+                    Some(SectionDivider::BoundingSection | SectionDivider::Unknown(_)) => false,
+                    Some(SectionDivider::OpenFolder | SectionDivider::ClosedFolder) => {
+                        key.is_mask()
+                    }
+                    Some(SectionDivider::Any) | None => true,
+                };
+                if !keep {
+                    continue;
+                }
+                let (width, height) = channel_record_extents(
+                    &record,
+                    key,
+                    channel.data.is_empty(),
+                    extents,
+                    version,
+                )?;
+                if options.use_raw_data {
+                    scratch = scratch.saturating_add(channel.data.len());
+                } else {
+                    charge_decoded_bitmap(remaining_bitmap_memory, width, height, T::SIZE)?;
+                    scratch = scratch.max(width.saturating_mul(height).saturating_mul(T::SIZE));
+                }
+            }
+            jobs.push(((record, data), scratch));
         }
+        let source_depth = self.source_depth;
+        let mut ids = Vec::with_capacity(total);
+        crate::parallel::for_each_ordered(
+            jobs,
+            |(record, data)| {
+                Self::build_layer(record, data, version, options, &mut None, source_depth)
+            },
+            |layer| {
+                progress(ProgressEvent::Layer {
+                    name: &layer.name,
+                    index: ids.len(),
+                    total,
+                });
+                ids.push(self.layers.len());
+                self.layers.push(Some(layer));
+                Ok(())
+            },
+        )?;
 
         // Assign parents by walking the (bottom-to-top) record order in
         // reverse with a group stack: a group's start record follows its
@@ -736,18 +821,17 @@ impl<T: BitDepth> LayeredFile<T> {
     }
 
     fn build_layer(
-        &mut self,
-        record: &LayerRecord,
+        record: LayerRecord<'_>,
         channel_data: ChannelImageData<'_>,
         version: Version,
         options: ReadOptions,
         remaining_bitmap_memory: &mut Option<usize>,
-    ) -> Result<LayerId> {
-        let source_depth = self.source_depth;
+        source_depth: u16,
+    ) -> Result<Layer<T>> {
+        let layer_extents = layer_record_extents(&record, version)?;
         let blocks = record
             .additional_layer_info
-            .as_ref()
-            .map(|ali| ali.as_ref().clone())
+            .map(Cow::into_owned)
             .unwrap_or_default();
 
         // The unicode name ('luni') takes precedence over the pascal name.
@@ -794,20 +878,6 @@ impl<T: BitDepth> LayeredFile<T> {
         // to allocate, so a degenerate rectangle (an empty gradient-fill
         // layer with a 0 x -1 rectangle, say) is read as zero-area rather
         // than rejected. Photoshop opens these files.
-        let layer_extents = match read_rect_extents(layer_rect, "layer", version) {
-            Ok(extents) => extents,
-            Err(error @ PsdError::InvalidImageBounds { .. })
-                if record
-                    .channels
-                    .iter()
-                    .filter(|info| !ChannelKey(info.index).is_mask())
-                    .all(|info| info.size <= 2) =>
-            {
-                let _ = error;
-                (0, 0)
-            }
-            Err(error) => return Err(error),
-        };
         let is_group = matches!(
             divider,
             Some(SectionDivider::OpenFolder | SectionDivider::ClosedFolder)
@@ -944,21 +1014,20 @@ impl<T: BitDepth> LayeredFile<T> {
                 BlendMode::from_bytes(key.try_into().expect("four bytes"))
             });
 
-        self.layers.push(Some(Layer {
+        Ok(Layer {
             name,
             bounds: layer_rect,
             opacity: record.opacity,
             blend_mode,
             flags: record.flags,
             clipping: record.clipping,
-            mask: record.mask_data.clone(),
+            mask: record.mask_data,
             blocks,
-            blending_ranges: record.blending_ranges.clone(),
+            blending_ranges: record.blending_ranges,
             kind,
             compression: None,
             mask_compression: None,
-        }));
-        Ok(self.layers.len() - 1)
+        })
     }
 
     // ------------------------------------------------------------------
@@ -1082,19 +1151,7 @@ impl<T: BitDepth> LayeredFile<T> {
             let Some(channels) = layer.channels_mut() else {
                 return Ok(());
             };
-            let mut decoded = Vec::new();
-            for (key, raw) in channels.raw_channels() {
-                charge_decoded_bitmap(&mut remaining, raw.width, raw.height, T::SIZE)?;
-                let samples = decompress_channel::<T>(
-                    raw.compression,
-                    &raw.payload,
-                    raw.width,
-                    raw.height,
-                    raw.version,
-                    source_depth,
-                )?;
-                decoded.push((key, samples));
-            }
+            let decoded = channels.decode_raw(source_depth, &mut remaining)?;
             let decoded_count = decoded.len();
             for (key, samples) in decoded {
                 channels.insert(key, samples);
@@ -1105,6 +1162,54 @@ impl<T: BitDepth> LayeredFile<T> {
             self.remaining_bitmap_memory = remaining;
         }
         Ok(())
+    }
+
+    /// Decode all raw-backed layer and mask channels with bounded parallel
+    /// workspace. The complete pixel budget is checked before decoding starts.
+    /// Channels decode independently: failed channels stay raw, successful
+    /// channels release their payloads immediately. All channels are attempted;
+    /// the first error in arena and channel-key order is returned. Use
+    /// [`decode_layer_pixels`](Self::decode_layer_pixels) for an atomic layer decode.
+    pub fn decode_all_layer_pixels(&mut self) -> Result<()> {
+        let mut reserved = self.remaining_bitmap_memory;
+        let mut jobs = Vec::new();
+        for layer in self.layers.iter_mut().flatten() {
+            let Some(channels) = layer.channels() else {
+                continue;
+            };
+            let mut scratch = 0;
+            for (_, raw) in channels.raw_channels() {
+                charge_decoded_bitmap(&mut reserved, raw.width, raw.height, T::SIZE)?;
+                let size = raw.width.saturating_mul(raw.height).saturating_mul(T::SIZE);
+                scratch = scratch.max(size);
+            }
+            // Even zero-area raw channels must become decoded entries.
+            if channels.raw_channels().next().is_some() {
+                jobs.push((layer, scratch));
+            }
+        }
+        let source_depth = self.source_depth;
+        let remaining = &mut self.remaining_bitmap_memory;
+        let mut first_error = None;
+        crate::parallel::for_each_ordered(
+            jobs,
+            |layer| {
+                Ok(layer
+                    .channels_mut()
+                    .expect("prepared channel store")
+                    .decode_raw_in_place(source_depth))
+            },
+            |(bytes, error)| {
+                if let Some(remaining) = remaining {
+                    *remaining -= bytes;
+                }
+                if first_error.is_none() {
+                    first_error = error;
+                }
+                Ok(())
+            },
+        )?;
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Turn a source document's layerless merged image into an editable
@@ -1883,17 +1988,62 @@ impl<T: BitDepth> LayeredFile<T> {
             }
         }
 
-        let mut records = Vec::new();
-        let mut channel_data = Vec::new();
-        let total = self.count_records(&self.root_children);
-        let mut index = 0;
-        self.emit_records(
-            &self.root_children,
-            &mut records,
-            &mut channel_data,
-            &mut index,
-            total,
-            progress,
+        let mut plan = Vec::new();
+        self.plan_records(&self.root_children, &mut plan);
+        let total = plan.len();
+        let mut records = Vec::with_capacity(total);
+        let mut channel_data = Vec::with_capacity(total);
+        let jobs = plan
+            .into_iter()
+            .enumerate()
+            .map(|(index, layer)| {
+                let mut scratch = layer.and_then(Layer::channels).map_or(0, |channels| {
+                    channels
+                        .iter()
+                        .map(|(_, samples)| samples.len().saturating_mul(T::SIZE).saturating_mul(2))
+                        .max()
+                        .unwrap_or(0)
+                });
+                if let Some(layer) = layer.filter(|layer| {
+                    matches!(layer.kind, LayerKind::Image(_) | LayerKind::Text(_))
+                        && !layer
+                            .channels()
+                            .is_some_and(|channels| channels.contains(ChannelKey::ALPHA))
+                        && !(index == 0 && self.covers_canvas(layer))
+                }) {
+                    let (width, height) = read_rect_extents(layer.bounds, "layer", self.version)?;
+                    // Synthesized transparency is temporary storage, separate
+                    // from the channels already owned by the document.
+                    scratch = scratch.saturating_add(
+                        width
+                            .saturating_mul(height)
+                            .saturating_mul(std::mem::size_of::<T>()),
+                    );
+                }
+                Ok(((index, layer), scratch))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        crate::parallel::for_each_ordered(
+            jobs,
+            |(index, layer)| {
+                let (record, data) = match layer {
+                    Some(layer) => {
+                        self.build_record(layer, self.blocks_for_record(layer)?, index == 0)?
+                    }
+                    None => self.build_divider_record()?,
+                };
+                Ok((layer, record, data))
+            },
+            |(layer, record, data)| {
+                progress(ProgressEvent::Layer {
+                    name: layer.map_or(DIVIDER_NAME, |layer| layer.name.as_str()),
+                    index: records.len(),
+                    total,
+                });
+                records.push(record);
+                channel_data.push(data);
+                Ok(())
+            },
         )?;
 
         // Refresh DPI/ICC while preserving every other resource block. The
@@ -1979,120 +2129,41 @@ impl<T: BitDepth> LayeredFile<T> {
         // Compression can fail; it happens before any file is created.
         let mut file = self.to_photoshop_file_with_progress(progress)?;
         let temporary = temporary_sibling(path)?;
+        // Exclusive creation leaves an existing temporary file untouched. If
+        // it fails, nothing created by this save needs cleanup.
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
         let written = (|| -> Result<()> {
-            let sink = std::fs::File::create(&temporary)?;
             let mut sink = std::io::BufWriter::with_capacity(1 << 20, sink);
             file.write_to(&mut sink)?;
             sink.flush()?;
             Ok(())
         })();
-        match written {
-            Ok(()) => std::fs::rename(&temporary, path).map_err(PsdError::from),
-            Err(error) => {
-                let _ = std::fs::remove_file(&temporary);
-                Err(error)
-            }
+        let written =
+            written.and_then(|()| std::fs::rename(&temporary, path).map_err(PsdError::from));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temporary);
         }
+        written
     }
 
-    /// Number of records a subtree serializes to (groups gain a synthesized
-    /// divider when they lack one).
-    fn count_records(&self, children: &[LayerId]) -> usize {
-        let mut count = 0;
-        let mut previous_was_divider = false;
-        for &id in children {
-            match &self.slot(id).kind {
-                LayerKind::Group(group) => {
-                    if !previous_was_divider {
-                        count += 1;
-                    }
-                    count += self.count_records(&group.children) + 1;
-                    previous_was_divider = false;
-                }
-                LayerKind::SectionDivider(_) => {
-                    count += 1;
-                    previous_was_divider = true;
-                }
-                LayerKind::Image(_)
-                | LayerKind::Text(_)
-                | LayerKind::Adjustment(_)
-                | LayerKind::Shape(_) => {
-                    count += 1;
-                    previous_was_divider = false;
-                }
-            }
-        }
-        count
-    }
-
-    /// Emit records in on-disk order, synthesizing a bounding section divider
-    /// for every group that lacks one (Photoshop terminates a group's extent
-    /// with a `</Layer group>` record placed before its contents).
-    fn emit_records<'a>(
-        &'a self,
-        children: &[LayerId],
-        records: &mut Vec<LayerRecord<'a>>,
-        channel_data: &mut Vec<ChannelImageData<'a>>,
-        index: &mut usize,
-        total: usize,
-        progress: &mut dyn FnMut(ProgressEvent<'_>),
-    ) -> Result<()> {
+    /// Plan records in file order. `None` synthesizes a missing bounding
+    /// divider; codec jobs can then run independently without changing the tree.
+    fn plan_records<'a>(&'a self, children: &[LayerId], plan: &mut Vec<Option<&'a Layer<T>>>) {
         let mut previous_was_divider = false;
         for &id in children {
             let layer = self.slot(id);
-            match &layer.kind {
-                LayerKind::Group(group) => {
-                    if !previous_was_divider {
-                        let (record, data) = self.build_divider_record()?;
-                        progress(ProgressEvent::Layer {
-                            name: record.name.value(),
-                            index: *index,
-                            total,
-                        });
-                        *index += 1;
-                        records.push(record);
-                        channel_data.push(data);
-                    }
-                    self.emit_records(
-                        &group.children,
-                        records,
-                        channel_data,
-                        index,
-                        total,
-                        progress,
-                    )?;
-                    let (record, data) =
-                        self.build_record(layer, self.blocks_for_record(layer)?, *index == 0)?;
-                    progress(ProgressEvent::Layer {
-                        name: layer.name.as_str(),
-                        index: *index,
-                        total,
-                    });
-                    *index += 1;
-                    records.push(record);
-                    channel_data.push(data);
-                    previous_was_divider = false;
+            if let LayerKind::Group(group) = &layer.kind {
+                if !previous_was_divider {
+                    plan.push(None);
                 }
-                LayerKind::SectionDivider(_)
-                | LayerKind::Image(_)
-                | LayerKind::Text(_)
-                | LayerKind::Adjustment(_)
-                | LayerKind::Shape(_) => {
-                    let (record, data) =
-                        self.build_record(layer, self.blocks_for_record(layer)?, *index == 0)?;
-                    progress(ProgressEvent::Layer {
-                        name: layer.name.as_str(),
-                        index: *index,
-                        total,
-                    });
-                    *index += 1;
-                    records.push(record);
-                    channel_data.push(data);
-                    previous_was_divider = matches!(layer.kind, LayerKind::SectionDivider(_));
-                }
+                self.plan_records(&group.children, plan);
             }
+            plan.push(Some(layer));
+            previous_was_divider = matches!(layer.kind, LayerKind::SectionDivider(_));
         }
-        Ok(())
     }
 
     /// A record's tagged blocks: borrowed from the layer as-is when they

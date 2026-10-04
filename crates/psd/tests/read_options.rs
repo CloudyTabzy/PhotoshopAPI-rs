@@ -20,6 +20,107 @@ fn document_bytes(layer_count: usize) -> Vec<u8> {
     writer.into_inner()
 }
 
+#[test]
+fn borrowed_channel_parse_matches_owned_for_every_container_and_depth() {
+    for version in [Version::Psd, Version::Psb] {
+        let bytes = document_bytes_with_compressions(version);
+        for depth in [
+            psd::core::BitDepth::Eight,
+            psd::core::BitDepth::Sixteen,
+            psd::core::BitDepth::ThirtyTwo,
+        ] {
+            let mut source = PhotoshopFile::read(&mut BeReader::new(&bytes)).unwrap();
+            source.header.depth = depth;
+            let mut writer = BeWriter::new();
+            source.write(&mut writer).unwrap();
+            let input = writer.into_inner();
+            let owned = PhotoshopFile::read(&mut BeReader::new(&input)).unwrap();
+            let mut reader = BeReader::new(&input);
+            let borrowed = PhotoshopFile::read_borrowed(&mut reader).unwrap();
+            assert_eq!(borrowed, owned);
+            for layer in &borrowed.layer_and_mask_info.layer_info.channel_image_data {
+                for channel in &layer.channels {
+                    assert!(matches!(channel.data, std::borrow::Cow::Borrowed(_)));
+                    let start = channel.data.as_ptr() as usize;
+                    assert!(start >= input.as_ptr() as usize);
+                    assert!(start + channel.data.len() <= input.as_ptr() as usize + input.len());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn bulk_decode_matches_eager_pixels_and_reserves_the_whole_budget() {
+    let bytes = document_bytes_with_compressions(Version::Psb);
+    let eager = LayeredFile::<u8>::from_bytes(&bytes).unwrap();
+    let mut lazy = LayeredFile::<u8>::from_bytes_with_options(
+        &bytes,
+        ReadOptions::unlimited().with_raw_data(true),
+    )
+    .unwrap();
+    lazy.decode_all_layer_pixels().unwrap();
+    for (expected, actual) in eager.layers().zip(lazy.layers()) {
+        assert_eq!(expected.channels(), actual.channels());
+    }
+    let mut limited = LayeredFile::<u8>::from_bytes_with_options(
+        &bytes,
+        ReadOptions {
+            use_raw_data: true,
+            total_memory_limit: Some(511),
+        },
+    )
+    .unwrap();
+    let before = limited.to_bytes().unwrap();
+    assert!(limited.decode_all_layer_pixels().is_err());
+    assert_eq!(limited.to_bytes().unwrap(), before);
+}
+
+#[test]
+fn bulk_decode_retains_failed_channels_and_charges_only_successful_samples() {
+    let bytes = document_bytes_with_compressions(Version::Psd);
+    let mut source = PhotoshopFile::read(&mut BeReader::new(&bytes)).unwrap();
+    source
+        .layer_and_mask_info
+        .layer_info
+        .layer_records
+        .truncate(1);
+    source
+        .layer_and_mask_info
+        .layer_info
+        .channel_image_data
+        .truncate(1);
+    // The alpha channel remains valid; the color channel is a short raw stream.
+    let record = &mut source.layer_and_mask_info.layer_info.layer_records[0];
+    let color = record
+        .channels
+        .iter()
+        .position(|info| info.index == 0)
+        .unwrap();
+    record.channels[color].size = 3;
+    source.layer_and_mask_info.layer_info.channel_image_data[0].channels[color].data =
+        vec![1].into();
+    let mut writer = BeWriter::new();
+    source.write(&mut writer).unwrap();
+    let mut document = LayeredFile::<u8>::from_bytes_with_options(
+        writer.as_slice(),
+        ReadOptions {
+            use_raw_data: true,
+            total_memory_limit: Some(128),
+        },
+    )
+    .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            document.decode_all_layer_pixels(),
+            Err(PsdError::Compression(_))
+        ));
+        let channels = document.layers().next().unwrap().channels().unwrap();
+        assert!(channels.is_raw(ChannelKey::color(0)));
+        assert_eq!(channels.get(ChannelKey::ALPHA).unwrap(), [255; 64]);
+    }
+}
+
 fn document_bytes_with_compressions(version: Version) -> Vec<u8> {
     let codecs = [
         Compression::Raw,

@@ -37,6 +37,27 @@ pub trait BitDepth: BeConvert + Copy + PartialEq + Default + Send + Sync + 'stat
     /// Inverse of [`zip_prediction_encode`](Self::zip_prediction_encode).
     fn zip_prediction_decode(bytes: &[u8], width: usize, height: usize) -> CodecResult<Vec<Self>>;
 
+    /// Compress prediction blocks without retaining a full encoded plane.
+    fn zip_prediction_compress(data: &[Self], width: usize, height: usize) -> CodecResult<Vec<u8>> {
+        psd_codecs::zip::compress(&Self::zip_prediction_encode(data, width, height)?)
+    }
+
+    /// Inflate prediction directly into typed storage where supported.
+    fn zip_prediction_decompress(
+        payload: &[u8],
+        width: usize,
+        height: usize,
+    ) -> CodecResult<Vec<Self>> {
+        let len = width
+            .checked_mul(height)
+            .and_then(|samples| samples.checked_mul(Self::SIZE))
+            .ok_or(psd_codecs::CodecError::InvalidInput(
+                "image dimensions overflow",
+            ))?;
+        let bytes = psd_codecs::zip::decompress(payload, len)?;
+        Self::zip_prediction_decode(&bytes, width, height)
+    }
+
     /// Widens one 8-bit PNG sample into this depth, matching what the `image` crate's
     /// rgba8→rgba16 widening and `interleaved_to_planar` both produce.
     fn widen_eight(source: u8) -> Self;
@@ -75,6 +96,18 @@ impl BitDepth for u8 {
         prediction::encode::<u8>(data, width, height)
     }
 
+    fn zip_prediction_compress(data: &[Self], width: usize, height: usize) -> CodecResult<Vec<u8>> {
+        prediction::compress(data, width, height)
+    }
+
+    fn zip_prediction_decompress(
+        payload: &[u8],
+        width: usize,
+        height: usize,
+    ) -> CodecResult<Vec<Self>> {
+        prediction::decompress(payload, width, height)
+    }
+
     fn zip_prediction_decode(bytes: &[u8], width: usize, height: usize) -> CodecResult<Vec<Self>> {
         prediction::decode::<u8>(bytes, width, height)
     }
@@ -109,6 +142,18 @@ impl BitDepth for u16 {
         prediction::encode::<u16>(data, width, height)
     }
 
+    fn zip_prediction_compress(data: &[Self], width: usize, height: usize) -> CodecResult<Vec<u8>> {
+        prediction::compress(data, width, height)
+    }
+
+    fn zip_prediction_decompress(
+        payload: &[u8],
+        width: usize,
+        height: usize,
+    ) -> CodecResult<Vec<Self>> {
+        prediction::decompress(payload, width, height)
+    }
+
     fn zip_prediction_decode(bytes: &[u8], width: usize, height: usize) -> CodecResult<Vec<Self>> {
         prediction::decode::<u16>(bytes, width, height)
     }
@@ -139,6 +184,18 @@ impl BitDepth for f32 {
 
     fn zip_prediction_encode(data: &[Self], width: usize, height: usize) -> CodecResult<Vec<u8>> {
         prediction::encode_f32(data, width, height)
+    }
+
+    fn zip_prediction_compress(data: &[Self], width: usize, height: usize) -> CodecResult<Vec<u8>> {
+        prediction::compress_f32(data, width, height)
+    }
+
+    fn zip_prediction_decompress(
+        payload: &[u8],
+        width: usize,
+        height: usize,
+    ) -> CodecResult<Vec<Self>> {
+        prediction::decompress_f32(payload, width, height)
     }
 
     fn zip_prediction_decode(bytes: &[u8], width: usize, height: usize) -> CodecResult<Vec<Self>> {

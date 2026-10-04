@@ -12,6 +12,51 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.29] - 2026-10-04
+
+### Added
+
+- `LayeredFile::decode_all_layer_pixels` decodes all lazy layer and mask
+  channels with bounded parallel workspace. Its memory budget is checked
+  before decoding; successful channels release their compressed bytes, failed
+  channels remain raw, and the first error is reported in document order.
+  `decode_layer_pixels` retains its atomic behavior for individual layers.
+- `PhotoshopFile::read_borrowed` borrows compressed channel payloads while
+  owning metadata, including channels nested in 16/32-bit layer blocks.
+
+### Changed
+
+- Eager reads, bulk extraction and layer write preparation run independent
+  codec jobs in parallel, with an estimated 128 MiB workspace budget and a
+  sequential path for small documents. Layer construction moves metadata
+  instead of cloning it; eager reads avoid staging owned compressed payloads.
+- ZIP prediction streams reusable blocks into deflate for all supported
+  depths, removing the full encoded-plane allocation on the zlib-rs based
+  backends. Compression writes the complete framed stream in one buffer.
+- ZIP and prediction decode fill the final aligned `u16`/`f32` storage through
+  checked `bytemuck` byte views, eliminating a second full-channel allocation
+  on the zlib-rs based backends. Float prediction uses small reusable row buffers.
+- Large noisy ZIP inputs can use Huffman-only encoding when three sampled
+  windows predict a size within 2% of default deflate. Large automatic 8-bit
+  writes sample sixteen dispersed rows and store near-incompressible planes
+  raw; explicit RLE overrides still encode every row. These heuristics preserve
+  pixels and Photoshop framing but can change compressed bytes and file sizes.
+- The default ZIP backend uses zlib-rs for large literal-heavy streams and
+  linflate for other inputs. Constant PackBits scanlines use an analytic path
+  with the same packet boundaries. Raw reads and decoded 8-bit byte buffers
+  avoid redundant copies.
+- The read/write benchmark uses bulk extraction and reports total time.
+
+### Fixed
+
+- The linflate path validates zlib header fields before decoding, including
+  the compression method, window size, check bits and dictionary flag.
+- Channel write extent checks reject multiplication overflow.
+- In-place endian conversion is correctly a no-op on big-endian targets.
+- Concurrent saves to the same path use distinct, exclusively created
+  temporary files, avoiding shared-buffer corruption or accidental cleanup
+  of a temporary file owned by another save.
+
 ## [0.13.28] - 2026-10-05
 
 ### Changed
