@@ -331,6 +331,8 @@ other layer kinds, so the extracted pixel counts can differ.
 </p>
 
 Charts regenerate from the tables below via `docs/benchmarks/make_plots.py`.
+Phase-level detail, codec numbers, coverage notes and reproduction:
+[docs/benchmarks](docs/benchmarks/README.md).
 
 | Corpus document | Read + extract C++ / Rust | Write C++ / Rust | Total C++ / Rust |
 |---|---|---|---|
