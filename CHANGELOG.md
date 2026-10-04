@@ -12,6 +12,15 @@ v0.9.1 that this project ports.
 
 ## [Unreleased]
 
+## [0.13.31] - 2026-10-04
+
+### Changed
+
+- Re-ran the read/extract/write benchmark against the C++ upstream on the
+  same machine. The README now reports five-run results for four corpus files
+  and separates stable large-file read/extract times from disk-contended write
+  times, including the observed ranges.
+
 ## [0.13.30] - 2026-10-04
 
 ### Added

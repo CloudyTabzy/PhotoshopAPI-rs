@@ -356,21 +356,35 @@ LGPL-2.1-or-later` — an either/or choice, so the LGPL terms never apply.
 
 ## Performance
 
-Read → materialize layer pixels → write, measured against the C++ upstream
-(v0.9.1, MSVC Release) on the same machine. The Rust large-document results
-are medians of five runs with a warm file cache and alternating file order;
-the C++ results are from an earlier five-run session. Lower is better; times
-are milliseconds.
+Read → materialize layer pixels → write, measured on the same machine against
+the C++ upstream (v0.9.1, MSVC Release). The Rust binary was built from commit
+`d1328e5`: five runs per implementation and document, with a warm file cache,
+alternating implementation and file order, and a 1.5-second pause between runs.
+Times are medians in milliseconds; lower is better.
 
 Upstream decodes PSD compression during `read` and stores pixels internally
 compressed; its `get_image_data()` extracts that internal storage. Rust's lazy
 read retains PSD streams, then `decode_all_layer_pixels()` decodes them. Compare
-**read + extract** together. Default Rust `LayeredFile::read` performs eager decode.
+**read + extract** together. Default Rust `LayeredFile::read` performs eager
+decode. Upstream extraction visits `ImageLayer` objects; Rust also materializes
+other layer kinds, so the extracted pixel counts can differ.
 
-| Document | Read + extract C++ / Rust | Write C++ / Rust | Total C++ / Rust |
+| Corpus document | Read + extract C++ / Rust | Write C++ / Rust | Total C++ / Rust |
 |---|---|---|---|
-| `big8.psd` (435 MB, 8-bit) | 347.6 / **160.1** | 280.9 / **171.1** | 627.2 / **331.3** |
-| `big16.psd` (252 MB, 16-bit) | 274.8 / **200.4** | 596.7 / **343.3** | 871.5 / **546.2** |
+| `Compression_Mixed_8bit.psd` | 9.81 / **1.19** | 22.84 / **1.71** | 33.31 / **2.95** |
+| `CMYK_16.psd` | 79.59 / **5.37** | 548.67 / **15.10** | 627.44 / **20.58** |
+| `example.psd` | 29.03 / **1.80** | 17.03 / **1.78** | 46.18 / **3.75** |
+| `smart_object_file_no_warp.psd` | 28.87 / **5.20** | 222.13 / **3.92** | 251.00 / **9.02** |
+
+The large synthetic documents showed stable read plus extraction and highly
+variable writes. Parentheses give the full five-run write range, so the write
+medians and totals should not be read as a reliable throughput ranking under
+these storage conditions.
+
+| Synthetic document | Read + extract C++ / Rust | Write median C++ / Rust (range) | Total median C++ / Rust |
+|---|---|---|---|
+| `big8.psd` (435 MB, 8-bit) | 334.1 / **157.5** | 672.9 (286.2–4052.0) / 2670.9 (160.5–3866.6) | 1010.6 / 2828.6 |
+| `big16.psd` (252 MB, 16-bit) | 267.6 / **195.0** | 624.6 (595.3–1019.7) / 2375.2 (347.7–2579.6) | 896.0 / 2572.7 |
 
 The synthetic workloads contain 12 RGB+alpha layers at 4000×3000 (8-bit)
 and 10 at 2000×3000 (16-bit), with opaque alpha and no masks or effects. RGB
@@ -380,20 +394,13 @@ arithmetic, in layer/channel/row/column order. Let `n = state >> 24`: 8-bit
 samples are `(g as u8) ^ (n & 15)`; 16-bit samples are `((g & 255) << 8) | n`.
 These specify the pixel workloads; encoded sizes depend on the writer/backend.
 
-Against Rust 0.13.29 in separate five-run measurements on the same machine,
-the 8-bit total falls from 347.2 to 331.3 ms and the 16-bit total from 660.7
-to 546.2 ms. A 256 MiB writer workspace keeps enough 16-bit channel jobs in
-flight to offset the ZIP guard and streaming overhead. Both totals are below
-the previously measured C++ figures. Default eager read takes 115.8 and
-176.9 ms respectively. Decoded channels match their inputs. Write times vary
-with storage contention; the table reports medians, not worst cases.
-
-Small-document runs also improve: `example.psd` takes about 3.5 ms total versus
-6.4 ms previously and 42.1 ms upstream; `smart_object_file_no_warp.psd` takes
-8.8 ms versus 15.1 ms and 253.5 ms. These workloads include more pixel work in
-Rust: upstream extraction omits layer kinds outside `ImageLayer`. Upstream
-also re-embeds smart-object data through OpenImageIO on write; Rust preserves
-untouched linked bytes.
+In an earlier, quieter five-run Rust comparison, this pipeline completed the
+two synthetic files in 331.3 and 546.2 ms versus 347.2 and 660.7 ms on 0.13.29.
+The fresh cross-implementation run does not establish a large-file write lead:
+both writers encountered multi-second storage stalls. Default eager Rust reads
+in the fresh run took 114.7 and 171.5 ms respectively. Decoded channels match
+their inputs. Upstream re-embeds smart-object data through OpenImageIO on write;
+Rust preserves untouched linked bytes.
 
 Heap allocation peaks (MiB; source file cache and thread stacks excluded),
 comparing 0.13.29 with 0.13.30:
@@ -430,6 +437,10 @@ Reproduce the Rust side with:
 ```text
 cargo run -p psd --release --example rw_bench -- --out <dir> <file.psd> ...
 ```
+
+The C++ measurements used an argv-driven Release harness that times
+`LayeredFile<T>::read`, `get_image_data()` for each `ImageLayer`, and
+`LayeredFile<T>::write` to a separate output directory.
 
 ## Deliberate differences from upstream
 

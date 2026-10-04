@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "psd"
-version = "0.13.30"
+version = "0.13.31"
 dependencies = [
  "image",
  "memmap2",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "psd-codecs"
-version = "0.13.30"
+version = "0.13.31"
 dependencies = [
  "bytemuck",
  "fearless_simd",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "psd-companion"
-version = "0.13.30"
+version = "0.13.31"
 dependencies = [
  "psd-codecs",
  "psd-core",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "psd-core"
-version = "0.13.30"
+version = "0.13.31"
 dependencies = [
  "serde",
  "serde_json",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "psd-py"
-version = "0.13.30"
+version = "0.13.31"
 dependencies = [
  "numpy",
  "psd",
